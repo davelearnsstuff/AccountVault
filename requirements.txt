@@ -7,7 +7,7 @@
 
 # Direct
 PySide6==6.11.1
-cryptography==49.0.0
+cryptography==50.0.1
 argon2-cffi==25.1.0
 
 # Transitive — bump alongside their parent, not on their own.
