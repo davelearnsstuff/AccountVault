@@ -4,7 +4,7 @@ data/
 # Vaults and backups. A .vault is now the live vault itself as well as every
 # copy of one, so this line carries more than it used to: encrypted, but it is
 # the whole database and it is not something to push anywhere.
-*.vault
+#*.vault
 backups/
 
 # Anything the app exports. A CSV is not encrypted at all, which makes it the
