@@ -1,0 +1,19 @@
+# Pinned; Dependabot keeps them current (see .github/dependabot.yml).
+# start.bat prints this file when it offers to install, so keep it short.
+#
+# This file pins versions. requirements.lock pins the artifacts behind them and
+# is what actually gets installed — regenerate it with `python tools/genlock.py`
+# after any bump here, or CI fails.
+
+# Direct
+PySide6==6.11.1
+cryptography==49.0.0
+argon2-cffi==25.1.0
+
+# Transitive — bump alongside their parent, not on their own.
+PySide6_Addons==6.11.1
+PySide6_Essentials==6.11.1
+shiboken6==6.11.1
+cffi==2.1.0
+pycparser==3.0
+argon2-cffi-bindings==25.1.0

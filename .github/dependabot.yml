@@ -1,0 +1,33 @@
+# Dependabot opens a pull request when a pinned dependency in requirements.txt
+# falls behind, and flags any that picks up a published CVE.
+#
+# This is what makes pinning safe rather than harmful. Exact pins hold the app
+# on one version of cryptography and argon2-cffi forever; without something
+# watching for the next release, that is strictly worse than not pinning at
+# all. The pins are the control point, this is the process that keeps them
+# current, and neither is much use on its own.
+#
+# Dependabot edits requirements*.txt and knows nothing about requirements*.lock,
+# so its pull requests arrive with a stale lock and a red tick. That is the
+# intended shape of the failure, not an oversight: the hashes are what actually
+# gets installed, and a bump nobody re-hashed is a bump nobody verified. Run
+# `python tools/genlock.py` on the branch and commit the result.
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 3
+    groups:
+      # Qt ships these four in lockstep and pip requires their versions to
+      # match exactly, so they can only move together. Left ungrouped, one Qt
+      # release would arrive as four separate pull requests that each fail to
+      # resolve on their own.
+      pyside:
+        patterns:
+          - "PySide6*"
+          - "shiboken6"
+    # cryptography, cffi, pycparser and the argon2 packages are deliberately
+    # left ungrouped: they are what the vault's security actually rests on, and
+    # each one is worth seeing and reviewing by itself.

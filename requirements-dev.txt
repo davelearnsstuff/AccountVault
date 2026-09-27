@@ -1,0 +1,32 @@
+# Development only — not needed to run AccountVault.
+#
+# Kept out of requirements.txt deliberately: start.bat prints that file when it
+# offers to install, and someone who just wants to open their vault should not
+# be asked to install a test runner. Dependabot's pip ecosystem watches this
+# directory, so it picks this file up alongside requirements.txt.
+#
+#   python -m pip install --require-hashes -r requirements.lock -r requirements-dev.lock
+#   python -m pytest tests/
+#
+# The .lock files are the hash-pinned form of these two and are what CI
+# installs; see requirements.lock for how to regenerate them.
+#
+# Both files, not just this one: a handful of tests drive the widgets that
+# handle stored fields and secrets, so the suite needs PySide6. It is not
+# repeated here — one pin for Qt, in the file that owns it.
+#
+# The suite is weighted towards services/ and auth.py — the paths where a bug
+# destroys data that cannot be recovered. See README's Tests section.
+
+# Direct
+pytest==9.1.1
+
+# Transitive — bump alongside their parent, not on their own. Pinned for the
+# same reason requirements.txt pins its transitives: an unpinned dependency is
+# a version nobody chose, and a test run that passes on one machine and fails
+# on another is worth less than no test run at all.
+iniconfig==2.3.0
+packaging==26.3
+pluggy==1.6.0
+pygments==2.20.0
+colorama==0.4.6   # pytest's coloured output on Windows only

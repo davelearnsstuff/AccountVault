@@ -1,0 +1,49 @@
+# Runs the suite on every push and pull request.
+#
+# This is the half of the pinning story that was missing. .github/dependabot.yml
+# argues that exact pins are safe *because* something watches for the next
+# release — but Dependabot only opens the pull request. Without this, a bump to
+# cryptography or argon2-cffi could be merged with nothing having checked that
+# the vault still opens under it, which is the one thing the pins exist to
+# protect.
+#
+# Windows only, deliberately. It is the platform the app is developed and run
+# on, the only one where restrict_to_owner does real work (icacls and an ACL
+# rather than a mode bit), and the one whose CRLF handling the export tests are
+# actually about. A Linux job would need the Qt platform libraries installed
+# before the widget tests could load PySide6 at all; worth adding, but not worth
+# a red tick that means nothing.
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+          cache: pip
+
+      # The lock files, not the .txt ones: --require-hashes is the check
+      # start.bat now performs on a user's machine, so it is the one CI has to
+      # keep working. A version bump that lands without a regenerated lock
+      # fails here rather than at somebody's first install.
+      #
+      # pip is deliberately not upgraded first. That would fetch and run an
+      # unverified copy of the very tool about to do the verifying, and the pip
+      # setup-python ships is new enough for --require-hashes by many years.
+      - name: Install dependencies
+        run: python -m pip install --require-hashes -r requirements.lock -r requirements-dev.lock
+
+      - name: Run tests
+        run: python -m pytest tests/ -q

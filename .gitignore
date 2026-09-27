@@ -1,0 +1,40 @@
+# The old fixed vault location, still opened where it exists.
+data/
+
+# Vaults and backups. A .vault is now the live vault itself as well as every
+# copy of one, so this line carries more than it used to: encrypted, but it is
+# the whole database and it is not something to push anywhere.
+*.vault
+backups/
+
+# Anything the app exports. A CSV is not encrypted at all, which makes it the
+# one that must never reach a commit — it holds every password in the vault in
+# the clear, and a secret that has been pushed is not recoverable by deleting it
+# afterwards. The default save location is Documents, but the dialog remembers
+# wherever it was last used, and that can be here.
+*-details-*.csv
+*-history-*.csv
+*-export-*.csv
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# Sidecar (agent memory, plans, thinking)
+.sidecar/
+
+# assets/make_icon.py drops the 256px frame as a PNG beside the .ico every run,
+# for anything that wants one. The .ico is the artifact the app ships and is
+# tracked; this one is a by-product of regenerating it.
+assets/accountvault.png
+
+# Dev / OS
+.DS_Store
+Thumbs.db
+*.log
