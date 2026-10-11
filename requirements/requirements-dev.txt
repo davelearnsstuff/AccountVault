@@ -25,7 +25,7 @@ pytest==9.1.1
 # same reason requirements.txt pins its transitives: an unpinned dependency is
 # a version nobody chose, and a test run that passes on one machine and fails
 # on another is worth less than no test run at all.
-iniconfig==2.3.0
+iniconfig==2.3.1
 packaging==26.3
 pluggy==1.6.0
 pygments==2.20.0
