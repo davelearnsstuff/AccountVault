@@ -11,8 +11,8 @@
 
 import pytest
 
-import auth
-import encryption
+from core import auth
+from core import encryption
 from services import accounts as accounts_service
 
 from conftest import MASTER, make_account

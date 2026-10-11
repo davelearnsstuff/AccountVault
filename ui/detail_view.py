@@ -14,19 +14,21 @@ from PySide6.QtWidgets import (
     QSizePolicy, QVBoxLayout, QWidget,
 )
 
-from categories import (
-    DUE_CYCLE_KEY, LAPSED_AFTER_DAYS, account_category, due_date_level,
-    format_value, get_config, is_favorite, next_due_date, updated_age_level,
-    value_noun,
+from core.categories import (
+    DUE_CYCLE_KEY, account_category, due_date_level, format_value, get_config,
+    is_favorite, lapsed_after_days, next_due_date, normalize_category,
+    updated_age_level, value_noun,
 )
-from encryption import VaultLockedError
-from urls import normalize_url
+from core.encryption import VaultLockedError
+from core.urls import normalize_url
 from services import account_export
 from services import accounts as accounts_service
 from services import export_io
+from services.dashboard import LOWER_IS_BETTER
 from ui.theme import LEVEL_SUFFIX, level_object_name
 from ui.widgets import (
-    IconButton, ThemedIcon, export_save_path, field_label, reveal_toggle,
+    IconButton, ThemedIcon, export_save_path, field_label, plain_label,
+    plain_text, reveal_toggle,
 )
 
 MASK = '••••••••'
@@ -35,31 +37,23 @@ MASK = '••••••••'
 _COLUMNS = 2
 
 # A value wider than this wraps and claims the whole row; anything shorter is
-# pinned to its text so the Copy / Show button stays beside it. This is only
-# safe because DETAIL_MIN_WIDTH below forces the panel to always be wide
-# enough for two columns of this size — if that floor ever changes, this
-# threshold has to move with it.
+# pinned to its text so the Copy / Show button stays beside it. Only safe
+# because DETAIL_MIN_WIDTH keeps the panel wide enough for two such columns.
 _WRAP_OVER = 240
 
-# Margins the grid needs around and between its two columns (see show_account's
-# QVBoxLayout margins and _build_fields' horizontalSpacing), plus slack for the
-# enclosing QScrollArea's frame/scrollbar.
+# Margins around and between the grid's two columns, plus slack for the
+# enclosing QScrollArea's frame and scrollbar.
 _GRID_MARGIN = 40
 _GRID_GAP = 28
 _SCROLL_SLACK = 24
 
-# The narrowest the detail panel is ever allowed to get. main_window.py sets
-# this as the panel's minimum width so the splitter — whether auto-fit or
-# hand-dragged — can never shrink a pinned field's column below _WRAP_OVER.
+# The narrowest the detail panel may get; main_window sets it as the panel's
+# minimum width.
 DETAIL_MIN_WIDTH = _WRAP_OVER * _COLUMNS + _GRID_GAP + _GRID_MARGIN + _SCROLL_SLACK
 
 
 def _export_summary(result: dict, scope: str, noun: str, restricted: bool = True) -> str:
-    """What an export actually wrote, for the toast.
-
-    Counts rather than a bare 'Exported.', because the three scopes produce
-    very different files and the one that was written is worth confirming — an
-    account details file and a history file land under similar names."""
+    """What an export actually wrote, for the toast."""
     parts = []
     if scope != account_export.SCOPE_HISTORY:
         parts.append(f"{result['fields']} field{'s' if result['fields'] != 1 else ''}")
@@ -71,9 +65,8 @@ def _export_summary(result: dict, scope: str, noun: str, restricted: bool = True
     if result['unreadable']:
         notes.append(f"{result['unreadable']} unreadable entr"
                      f"{'ies' if result['unreadable'] != 1 else 'y'} left out")
-    # Worded as written-but-broken rather than left out, because that is what
-    # happened: unlike a history entry, a field that will not decrypt is still
-    # in the file, as its placeholder.
+    # Unlike a history entry, a field that will not decrypt is still in the
+    # file, as its placeholder.
     if result.get('unreadable_fields'):
         count = result['unreadable_fields']
         notes.append(f"{count} field{'s' if count != 1 else ''} could not be decrypted")
@@ -93,12 +86,12 @@ class DetailView(QWidget):
     favorite_toggled = Signal(dict, bool)   # account, the state asked for
     quick_update_requested = Signal(dict)
     touch_requested = Signal(dict)
+    navigate_requested = Signal(int)       # -1 previous, +1 next in the list
     copy_requested = Signal(str, str)      # value, field label
     history_changed = Signal()
     error = Signal(str)
     notice = Signal(str)
-    # Forwarded from the history table and raised by this pane's own export.
-    # A locked vault is the window's to answer — see BalanceHistory.locked.
+    # A locked vault is the window's to answer.
     locked = Signal()
 
     def __init__(self, theme: str, parent=None):
@@ -106,6 +99,11 @@ class DetailView(QWidget):
         self._theme = theme
         self._account = None
         self._content = None
+        self._prev_button = None
+        self._next_button = None
+        # Answers (has_previous, has_next). The list's order belongs to the
+        # window, so this pane asks rather than keeping a copy.
+        self._navigator = lambda: (False, False)
 
         # Rendering swaps a single content widget rather than rebuilding this
         # layout in place, so a redraw can never race a pending deletion.
@@ -114,20 +112,32 @@ class DetailView(QWidget):
         self._layout.setSpacing(0)
 
     def set_theme(self, theme: str):
-        """Re-renders in the new theme, unlike DashboardView.set_theme, which
-        only records it. The difference is what each redraw costs: this one
-        redraws the account already in hand, while the dashboard's would have to
-        read and decrypt every balance entry — and it is called at startup, with
-        the vault still locked."""
+        """Re-renders the account on show in the new theme."""
         self._theme = theme
         if self._account:
             self.show_account(self._account)
+
+    def set_navigator(self, navigator):
+        """Takes a callable answering (has_previous, has_next) for the account
+        on show."""
+        self._navigator = navigator
+
+    def refresh_navigation(self):
+        """Re-asks the navigator, for when the list changed order under the
+        account on show."""
+        if self._prev_button is None:
+            return
+        has_previous, has_next = self._navigator()
+        self._prev_button.setEnabled(has_previous)
+        self._next_button.setEnabled(has_next)
 
     def clear(self):
         self._account = None
         self._drop_content()
 
     def _drop_content(self):
+        self._prev_button = None
+        self._next_button = None
         if self._content is None:
             return
         self._layout.removeWidget(self._content)
@@ -150,7 +160,7 @@ class DetailView(QWidget):
         layout.addLayout(self._build_fields(account, config))
 
         if any(f['key'] == 'current_balance' for f in config['fields']) and account.get('id'):
-            layout.addWidget(self._build_history(account['id'], value_noun(category)))
+            layout.addWidget(self._build_history(account['id'], category))
 
         layout.addStretch(1)
         self._layout.addWidget(self._content)
@@ -158,14 +168,13 @@ class DetailView(QWidget):
     # -- header ------------------------------------------------------------
 
     def _build_header(self, account: dict, config: dict) -> QVBoxLayout:
-        title = QLabel(account.get(config['name_field']) or f"Untitled {config['item_label']}")
+        title = plain_label(account.get(config['name_field'])
+                            or f"Untitled {config['item_label']}")
         title.setObjectName('DetailTitle')
         title.setWordWrap(True)
 
-        # The pin sits on the title line rather than among the actions below,
-        # because it is a property of the account rather than something done to
-        # it — and because the actions row is where the buttons that change
-        # stored fields live, which this does not.
+        # The pin is a property of the account, so it sits on the title line
+        # rather than among the actions that change stored fields.
         pinned = is_favorite(account)
         star = IconButton(
             'star-filled' if pinned else 'star',
@@ -178,22 +187,36 @@ class DetailView(QWidget):
         star.clicked.connect(
             lambda: self.favorite_toggled.emit(account, not pinned))
 
+        # Previous / next ahead of the name, so stepping through a list is one
+        # spot to click repeatedly.
+        self._prev_button = self._nav_arrow('chevron-left', 'Previous account', -1)
+        self._next_button = self._nav_arrow('chevron-right', 'Next account', 1)
+
+        # A strip one line tall keeps the arrows level with the title's first
+        # line, rather than riding above it.
+        title.ensurePolished()
+        arrows = QWidget()
+        arrows.setFixedHeight(max(title.fontMetrics().height(),
+                                  self._prev_button.sizeHint().height()))
+        arrows_layout = QHBoxLayout(arrows)
+        arrows_layout.setContentsMargins(0, 0, 0, 0)
+        arrows_layout.setSpacing(8)
+        arrows_layout.addWidget(self._prev_button, 0, Qt.AlignVCenter)
+        arrows_layout.addWidget(self._next_button, 0, Qt.AlignVCenter)
+
         title_row = QHBoxLayout()
         title_row.setSpacing(8)
+        title_row.addWidget(arrows, 0, Qt.AlignTop)
+        title_row.addSpacing(4)
         title_row.addWidget(title, 1)
         title_row.addWidget(star, 0, Qt.AlignTop)
 
-        # The actions sit on their own row under the name, left-aligned with the
-        # fields below them, so the title has the full width to wrap into and
-        # they never drift out to the far edge of a wide panel.
         actions = QHBoxLayout()
         actions.setSpacing(8)
 
         keys = {f['key'] for f in config['fields']}
         has_balance, has_due = 'current_balance' in keys, 'due_date' in keys
         if has_balance or has_due:
-            # Named after what this category actually tracks, so Income offers
-            # its annual pay rather than a 'balance' it has no concept of.
             noun = value_noun(account.get('_category') or account.get('category'))
             fields = ([noun.lower()] if has_balance else []) + (['due date'] if has_due else [])
             actions.addWidget(self._action(
@@ -214,9 +237,8 @@ class DetailView(QWidget):
             tooltip='Save this account to a CSV file — details, history, or both',
         ))
 
-        # Always on screen, disabled until the account is closed. Hiding it kept
-        # the rule invisible: nothing said why an account could not be deleted,
-        # or what to do about it. A greyed button with a reason teaches it.
+        # Always on screen, disabled until the account is closed, with a tooltip
+        # that says why.
         closed = bool(account.get('closed'))
         delete = self._action(
             'Delete', lambda: self.delete_requested.emit(account),
@@ -235,7 +257,15 @@ class DetailView(QWidget):
         header.setSpacing(10)
         header.addLayout(title_row)
         header.addLayout(actions)
+        self.refresh_navigation()
         return header
+
+    def _nav_arrow(self, icon: str, label: str, step: int) -> IconButton:
+        button = IconButton(icon, label, role='subtle', size=18, label=label)
+        button.setObjectName('NavIcon')
+        button.setFixedWidth(34)
+        button.clicked.connect(lambda: self.navigate_requested.emit(step))
+        return button
 
     @staticmethod
     def _action(text: str, slot, tooltip: str = '') -> QPushButton:
@@ -260,21 +290,17 @@ class DetailView(QWidget):
         cycle = account.get(DUE_CYCLE_KEY)
         for field in self._ordered_fields(config):
             value = account.get(field['key'])
-            # A recurring due date is stored as an anchor — what repeats is its
-            # day of the month — so the pane shows the occurrence still ahead
-            # rather than whichever month the user last typed in. A one-off is
-            # its own next occurrence, so this leaves it exactly as it was.
+            # A recurring due date shows the occurrence still ahead, not the
+            # anchor on file.
             if field['key'] == 'due_date':
                 value = next_due_date(value, cycle) or value
-            # Blank optional fields would only clutter the view; a blank required
-            # name still shows so the gap is visible.
+            # Blank optional fields are skipped; a blank required name still
+            # shows, so the gap is visible.
             if not field.get('required') and (value is None or value == ''):
                 continue
 
-            # Long text gets the full width, on its own row. The field is told
-            # so, because how its value is sized has to match the row it lands
-            # in: a whole row is only worth taking if the value spreads across
-            # it rather than being pinned to the text it happens to hold.
+            # Long text gets its own full-width row, and is told so, because the
+            # value is sized differently there.
             full_width = bool(field.get('type') == 'textarea' or field.get('multiline'))
             widget = self._build_field(field, value, full_width)
             if full_width:
@@ -293,8 +319,8 @@ class DetailView(QWidget):
 
     @staticmethod
     def _ordered_fields(config: dict) -> list:
-        """Website sits immediately after the name so the link is always in the
-        same spot, whatever order the category declares its fields in."""
+        """Website sits immediately after the name, whatever order the category
+        declares, so the link is always in the same spot."""
         fields = list(config['fields'])
         website = next((f for f in fields if f['key'] == 'website'), None)
         if website is None:
@@ -307,9 +333,7 @@ class DetailView(QWidget):
         return fields
 
     def _build_field(self, field: dict, value, full_width: bool = False) -> QWidget:
-        """Builds one field's label / value block. full_width says the caller has
-        given this field the whole grid row, so its value wraps freely instead of
-        being pinned to the width of the text it happens to show."""
+        """Builds one field's label / value block."""
         container = QWidget()
         layout = QVBoxLayout(container)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -331,46 +355,28 @@ class DetailView(QWidget):
             display = self._link_value(value)
             fills = self._size_value(display, full_width)
         else:
-            display = QLabel(format_value(value, field))
+            display = plain_label(format_value(value, field))
             display.setTextInteractionFlags(Qt.TextSelectableByMouse)
             level = self._age_level(field, value)
             if level in LEVEL_SUFFIX:
-                # Object name, not an inline colour, so the value repaints when
-                # the theme changes — see the note above LEVEL_COLORS' removal
-                # in ui/theme.py. Which levels get one is LEVEL_SUFFIX's to say,
-                # so this pane and the account list cannot drift apart on it.
+                # By object name, so the colour follows the theme.
                 display.setObjectName(level_object_name('Level', level))
             elif level == 'lapsed':
-                # Deliberately left in the ordinary text colour. A date this far
-                # past is a record that was never rolled forward, not a payment
-                # anyone can make today, and dressing it in the same red as a
-                # bill due on Tuesday is what taught people to stop reading the
-                # colour. The tooltip carries what the colour no longer says.
+                # Left in the ordinary colour: a date this far gone is a record
+                # never rolled forward, not a payment due this week. The tooltip
+                # says what the colour does not.
                 display.setToolTip(
-                    f'More than {LAPSED_AFTER_DAYS} days past and never rolled '
+                    f'More than {lapsed_after_days()} days past and never rolled '
                     f'forward. Set Repeats to Monthly, or edit the date.'
                 )
             fills = self._size_value(display, full_width)
 
         if field.get('copy'):
-            # Closes over the decrypted value, not over what the label is
-            # currently showing, so Copy works while a sensitive field is still
-            # masked. That is the point of offering it on card, account and
-            # routing numbers: the value reaches the clipboard without ever
-            # being put on screen.
-            #
-            # It is also the private path — along with the Ctrl+B / Ctrl+Shift+C
-            # shortcuts, which route through the same copy_to_clipboard and get
-            # the same protection. Those fields had no Copy button on the
-            # reasoning that a number nobody can copy is a number nobody can
-            # leak — but the values are exactly the ones
-            # people retype into a form, and the labels are selectable, so the
-            # real workflow was Show, drag-select, Ctrl+C. That route never
-            # touches _secret_mime, so the value landed in the Windows
-            # clipboard-history pane, synced to the cloud clipboard where that
-            # is on, and was never cleared by the timer. Withholding the button
-            # did not prevent the copy; it just made every copy the unprotected
-            # kind.
+            # Closes over the decrypted value, so Copy works while a sensitive
+            # field is still masked: the value reaches the clipboard — with the
+            # clipboard-history opt-out and the auto-clear — without ever being
+            # put on screen. Withholding the button would only push people to
+            # Show, select and Ctrl+C, which gets none of that protection.
             copy = QPushButton('Copy')
             copy.setObjectName('Small')
             copy.setAccessibleName(f"Copy {field['label']}")
@@ -380,15 +386,13 @@ class DetailView(QWidget):
             buttons.append(copy)
 
         if fills:
-            # Long text owns the full row, so its buttons go up beside the field
-            # label — trailing them would strand them at the far right edge.
+            # A full-row value puts its buttons up beside the field label.
             for button in buttons:
                 label_row.addWidget(button)
             label_row.addStretch(1)
             row.addWidget(display, 1)
         else:
-            # Short value: buttons sit right after the text, and the stretch
-            # holds the spare width so nothing drifts to the column edge.
+            # A short value keeps its buttons right after the text.
             label_row.addStretch(1)
             row.addWidget(display)
             for button in buttons:
@@ -401,9 +405,7 @@ class DetailView(QWidget):
 
     @classmethod
     def _size_value(cls, label: QLabel, full_width: bool) -> bool:
-        """Sizes a value label and reports whether it takes the whole row. A
-        field the grid has already given the full row always does, whatever its
-        text currently measures; anything else is decided by the text."""
+        """Sizes a value label and reports whether it takes the whole row."""
         if full_width:
             cls._wrap_label(label)
             return True
@@ -419,15 +421,11 @@ class DetailView(QWidget):
     @classmethod
     def _fit_label(cls, label: QLabel) -> bool:
         """Sizes a value label to its text and reports whether it needs the whole
-        row (True) or just fits (False). Only for values shown in full — a masked
-        one has no text worth measuring until it's revealed.
+        row (True) or just fits (False).
 
-        A word-wrapped QLabel reports a heuristic width well below its text's
-        real single-line width, so leaving wrapping on for everything makes
-        short values wrap early and long ones claim too little. Short values
-        therefore don't wrap at all and are pinned to their exact text width,
-        which is what lets a following button sit right beside them; only
-        genuinely long text wraps, and that takes the full row."""
+        A word-wrapped QLabel reports a width well below its text's real width,
+        so short values do not wrap at all and are pinned to their exact width;
+        only genuinely long text wraps, and takes the full row."""
         natural = label.fontMetrics().horizontalAdvance(label.text())
         fills = natural > _WRAP_OVER
         if fills:
@@ -438,35 +436,27 @@ class DetailView(QWidget):
         return fills
 
     def _age_level(self, field: dict, value) -> str:
-        """How urgent a dated field is. An instance method, not a static one:
-        staleness now reads its thresholds from the category, so grading a field
-        needs to know which account it belongs to."""
+        """How urgent a dated field is, by the account's own category."""
         if not value:
             return ''
+        category = account_category(self._account or {})
         if field['key'] == 'due_date':
-            # Already resolved to the next occurrence by the caller, so the
-            # cycle is spent and what is left is a plain date to grade.
-            return due_date_level(value, None)
+            # Already resolved to the next occurrence by the caller.
+            return due_date_level(value, None, category)
         if field['key'] == 'last_updated':
-            return updated_age_level(value, account_category(self._account or {}))
+            return updated_age_level(value, category)
         return ''
 
     def _sensitive_value(self, field: dict, value) -> tuple[QLabel, QPushButton]:
-        """The masked value label and its Show/Hide toggle. The value always
-        takes the full width it is given, unlike the fields sized from their
-        text: the mask is short and fixed-length whatever it hides, so measuring
-        it pins the row to a sliver the revealed secret then has to wrap inside
-        — and the reveal is far too late to re-lay the row out around it.
+        """The masked value label and its Show/Hide toggle.
 
-        Wrapping from the start is also what keeps a masked field's on-screen
-        width independent of the real secret's length, so it can't leak a length
-        hint before the user ever clicks Show."""
+        Always full width: measuring the fixed-length mask would pin the row to
+        a sliver the revealed secret then has to wrap inside. It also keeps the
+        on-screen width from hinting at the secret's length."""
         real = '' if value is None else str(value)
-        display = QLabel(MASK if real else '—')
+        display = plain_label(MASK if real else '—')
         display.setObjectName('MaskedValue')
         display.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        # The mask reads aloud as a run of bullet characters, which says nothing
-        # about what the field is or that it is deliberately concealed.
         display.setAccessibleName(f"{field['label']}: hidden" if real
                                   else f"{field['label']}: empty")
 
@@ -476,8 +466,6 @@ class DetailView(QWidget):
             display.setText(format_value(real, field) if shown
                             else (MASK if real else '—'))
             display.setObjectName('' if shown else 'MaskedValue')
-            # The value says whether it is currently readable; reveal_toggle
-            # moves the button's own name to match.
             display.setAccessibleName(
                 f"{field['label']}: {'shown' if shown else 'hidden'}" if real
                 else f"{field['label']}: empty"
@@ -486,56 +474,45 @@ class DetailView(QWidget):
             display.style().unpolish(display)
             display.style().polish(display)
 
-        # The button, its labels and the auto-re-mask timer are shared with the
-        # account form — see widgets.reveal_toggle. Parented to the label so the
-        # timer dies with the row rather than firing into a deleted widget.
+        # Parented to the label so the re-mask timer dies with the row.
         return display, reveal_toggle(field['label'], on_change, parent=display)
 
     def _link_value(self, value) -> QLabel:
         """A website value, opened in the desktop browser when clicked.
 
-        Qt's own rich-text link handling rather than an assignment over the
-        instance's mousePressEvent. That assignment shadowed the bound method on
-        one object, which bypasses event delivery for every other button and
-        modifier, kept the closure alive on the widget, and left the label
-        unreachable by keyboard. linkActivated gives the same click, plus focus
-        and Enter, and openExternalLinks stays off so nothing is dispatched to
-        the OS without passing through normalize_url first."""
+        Qt's rich-text link handling, with the text and URL escaped, so the
+        label is reachable by keyboard; openExternalLinks stays off so nothing
+        reaches the OS without passing normalize_url first."""
         url = normalize_url(value)
+        if not url:
+            # Refused by normalize_url (a script-ish scheme): plain text, no link.
+            label = plain_label(str(value))
+            label.setObjectName('LinkValue')
+            label.setWordWrap(True)
+            return label
+
         label = QLabel()
         label.setObjectName('LinkValue')
         label.setWordWrap(True)
-        if not url:
-            # Refused by normalize_url (a script-ish scheme) — shown as the
-            # plain text it is, with no way to follow it.
-            label.setText(str(value))
-            return label
-
         label.setText(f'<a href="{escape(url, quote=True)}">{escape(str(value))}</a>')
         label.setTextFormat(Qt.RichText)
         label.setOpenExternalLinks(False)
         label.setTextInteractionFlags(
             Qt.LinksAccessibleByMouse | Qt.LinksAccessibleByKeyboard)
         label.setCursor(Qt.PointingHandCursor)
-        label.setToolTip(f'Open {url}')
+        label.setToolTip(plain_text(f'Open {url}'))
         label.linkActivated.connect(lambda target: QDesktopServices.openUrl(QUrl(target)))
         return label
 
     # -- export ------------------------------------------------------------
 
     def _export_account(self, account: dict, config: dict):
-        """Writes one account to a plaintext CSV, at a scope the user picks.
-
-        Lives here rather than beside the history table because two of the three
-        scopes cover the whole account. The dialog owns the choice and the
-        warning that goes with it; this only carries out what it returns."""
+        """Writes one account to a plaintext CSV, at a scope the user picks."""
         from ui.dialogs import ExportAccountDialog
 
         category = account.get('_category') or account.get('category')
         noun = value_noun(category)
-        # Categories with no balance field have no history section on screen and
-        # none to offer here either — see show_account, which builds the two on
-        # the same condition.
+        # Categories with no balance field have no history to offer.
         has_history = any(f['key'] == 'current_balance' for f in config['fields'])
 
         dialog = ExportAccountDialog(self, noun, has_history)
@@ -551,25 +528,16 @@ class DetailView(QWidget):
         if not path:
             return
 
-        # Decrypted after the file dialog closes, not before. A native file
-        # picker is outside Qt's modal stack, so the idle lock cannot dismiss
-        # one; rendering first left this account's password decrypted in a local
-        # for as long as the dialog was open and then wrote it to disk even if
-        # the vault had locked meanwhile. Reading here puts both calls behind
-        # require_session, so a lock during the dialog raises instead.
-        #
-        # Re-read rather than trusting the dict on screen either way: it was
-        # loaded when the account was opened, and a Quick Update since then
-        # would otherwise export a figure the detail view is no longer showing.
+        # Read after the file dialog closes, not before: the native picker is
+        # outside Qt's modal stack, so the vault can lock while it is open, and
+        # reading here puts that behind require_session. Re-read rather than
+        # trusted, so a Quick Update since the account was opened is included.
         entries = []
         try:
             fresh = accounts_service.get_account(account['id'])
             if scope != account_export.SCOPE_ACCOUNT:
                 entries = accounts_service.list_balance_history(account['id'])
         except VaultLockedError:
-            # The case this ordering exists to catch: the idle lock can fire
-            # while the native file picker is up, and it must lock the window
-            # rather than report itself as a failed export in a toast.
             self.locked.emit()
             return
         except Exception as exc:
@@ -588,16 +556,18 @@ class DetailView(QWidget):
 
     # -- balance history ---------------------------------------------------
 
-    def _build_history(self, account_id: int, noun: str) -> QWidget:
+    def _build_history(self, account_id: int, category: str | None) -> QWidget:
         from ui.history_table import BalanceHistory
 
-        history = BalanceHistory(account_id, self._theme, noun)
+        history = BalanceHistory(
+            account_id, self._theme, value_noun(category),
+            higher_is_better=normalize_category(category or '') not in LOWER_IS_BETTER,
+        )
         history.changed.connect(self.history_changed.emit)
         history.error.connect(self.error.emit)
         history.locked.connect(self.locked.emit)
-        # After the connections, never in its constructor: the first load reads
-        # the vault, and a lock found there has to reach the window rather than
-        # be emitted into a signal nothing is listening to yet.
+        # After the connections: the first load can find the vault locked, and
+        # that has to reach the window.
         history.reload()
         return history
 
@@ -605,15 +575,9 @@ class DetailView(QWidget):
 class BulkView(QWidget):
     """The detail pane when more than one account is selected.
 
-    Replaces the single-account view rather than sitting beside it: with several
-    rows highlighted there is no one record the pane could be showing, and
-    picking the first would make the actions here look like they applied to it
-    alone.
-
-    Every action is one the whole selection can take without opening anything:
-    the full form edits one account at a time by nature, and Delete is left out
-    entirely — it is irreversible, and a mis-shift-click is exactly the way to
-    select more than you meant."""
+    Every action is one the whole selection can take without opening anything.
+    Delete is left out: a mis-shift-click is exactly how to select more than you
+    meant."""
 
     close_requested = Signal(bool)      # True to close, False to reopen
     category_requested = Signal(str)
@@ -708,18 +672,13 @@ class BulkView(QWidget):
 
 
 class PlaceholderView(QWidget):
-    """The detail pane with no account on it.
-
-    Four states rather than one, because "Select an account to view details" is
-    wrong advice in three of them: a new vault has nothing to select, an empty
-    category has nothing to select, and a search that found nothing has nothing
-    to select. Only the fourth — a populated list with no row picked — is
-    actually asking the user to choose."""
+    """The detail pane with no account on it, in four states: a new vault, an
+    empty category, a search with no results, and a list with nothing chosen.
+    Only the last is asking the user to select something."""
 
     add_requested = Signal()
 
-    # Wide enough for a readable measure, narrow enough not to sprawl across a
-    # maximised window.
+    # Wide enough for a readable measure, narrow enough not to sprawl.
     _TEXT_WIDTH = 380
 
     def __init__(self, parent=None):
@@ -727,7 +686,8 @@ class PlaceholderView(QWidget):
 
         self._icon = ThemedIcon('lock', role='accent', size=48)
 
-        self._title = QLabel()
+        # Titles carry search text and custom category names.
+        self._title = plain_label()
         self._title.setObjectName('PlaceholderTitle')
         self._title.setAlignment(Qt.AlignCenter)
         self._title.setWordWrap(True)
@@ -772,9 +732,7 @@ class PlaceholderView(QWidget):
             widget.setText(text)
             widget.setVisible(bool(text))
         self._icon.setVisible(icon)
-        # The whole pane is one announcement for a screen reader, so it carries
-        # the message rather than leaving four separate labels to be stitched
-        # together in whatever order they happen to be read.
+        # One announcement for a screen reader, in reading order.
         self.setAccessibleName(' '.join(p for p in (title, body, hint) if p))
 
     def show_prompt(self):
@@ -793,14 +751,12 @@ class PlaceholderView(QWidget):
         )
 
     def show_empty_list(self, message: str, can_add: bool = True):
-        """A category with nothing in it. The message is the same wording the
-        list itself shows, so the two panes cannot drift apart."""
+        """A category with nothing in it, in the same words the list uses."""
         self._set(title=message, action='Add one' if can_add else '')
 
     def show_no_results(self, query: str):
         self._set(
             title=f'No accounts match “{query}”',
-            body='Search covers names, usernames, websites and notes. It never '
-                 'looks at passwords, card numbers or other secrets.',
+            body='Search covers names, usernames and websites. It never looks '
+                 'at passwords, card numbers, notes or other secrets.',
         )
-

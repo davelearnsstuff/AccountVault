@@ -1,6 +1,6 @@
 # -----------------------------------------------------------------------------
 # tests/test_attention.py
-# The Needs Attention verdict and the dashboard's month-over-month delta.
+# The Needs Attention verdict and the dashboard's change lines.
 #
 # Both are pure functions over data the vault already holds, so they are tested
 # directly rather than through the widgets that show them.
@@ -11,15 +11,16 @@ import datetime
 
 import pytest
 
-from categories import (
-    LAPSED_AFTER_DAYS, attention_counts, attention_level, due_date_level,
-    is_recurring, needs_attention, next_due_date,
+from core.categories import (
+    LAPSED_AFTER_DAYS, attention_counts, attention_level, cycle_of,
+    due_date_level, needs_attention, next_due_date,
 )
-from services.dashboard import month_over_month
-# Presentation only — how the delta is worded and which colour it takes. Both
+from services.dashboard import change_across, trailing_window
+# Presentation only — how the delta is worded and which colour it takes. All
 # are pure functions of the numbers above, so they cost nothing to check here
-# and neither one touches a widget.
-from ui.dashboard_view import _delta_object_name, _delta_text
+# and none of them touches a widget.
+from ui.dashboard_view import _basis_text
+from ui.ranges import day_name, delta_object_name, delta_text, month_name
 
 
 def days_away(days: int) -> str:
@@ -125,7 +126,7 @@ def test_an_account_with_no_dates_is_quiet():
     (None, False),
 ])
 def test_is_recurring_reads_the_stored_cycle(cycle, expected):
-    assert is_recurring(cycle) is expected
+    assert (cycle_of(cycle) is not None) is expected
 
 
 def test_a_one_off_is_its_own_next_occurrence():
@@ -164,14 +165,14 @@ def test_a_month_end_anchor_does_not_creep_backwards():
 def test_a_recurring_date_can_never_lapse():
     """Which is the whole point of recording the cycle: the app rolls it
     forward, so there is no such thing as one nobody rolled forward."""
-    assert due_date_level(days_away(-700), 'Monthly') != 'lapsed'
-    assert due_date_level(days_away(-4000), 'Monthly') != 'lapsed'
+    assert due_date_level(days_away(-700), 'Monthly', STALE_CATEGORY) != 'lapsed'
+    assert due_date_level(days_away(-4000), 'Monthly', STALE_CATEGORY) != 'lapsed'
 
 
 def test_a_long_dead_one_off_reads_as_lapsed_rather_than_urgent():
-    assert due_date_level(days_away(-(LAPSED_AFTER_DAYS + 1)), '') == 'lapsed'
+    assert due_date_level(days_away(-(LAPSED_AFTER_DAYS + 1)), '', STALE_CATEGORY) == 'lapsed'
     # Still inside the window is still a bill someone can act on today.
-    assert due_date_level(days_away(-LAPSED_AFTER_DAYS), '') == 'danger'
+    assert due_date_level(days_away(-LAPSED_AFTER_DAYS), '', STALE_CATEGORY) == 'danger'
 
 
 def test_a_lapsed_date_still_lists():
@@ -234,41 +235,119 @@ def test_empty_vault_counts_zero():
 
 # -- dashboard delta ----------------------------------------------------------
 
-def test_delta_compares_the_last_two_months():
-    change, fraction = month_over_month([100.0, 150.0])
+def test_a_range_window_holds_the_month_it_is_measured_from():
+    """A year is this month last year to this month, so 13 readings, and a
+    month is two. Twelve readings would measure "vs last year" from eleven
+    months ago."""
+    series = list(range(30))
+    assert trailing_window(series, 1) == [28, 29]
+    assert len(trailing_window(series, 12)) == 13
+    assert trailing_window(series, 12)[0] == 17
+
+
+def test_a_window_longer_than_the_history_is_all_of_it():
+    assert trailing_window([1.0, 2.0, 3.0], 24) == [1.0, 2.0, 3.0]
+    assert trailing_window([1.0, 2.0, 3.0], None) == [1.0, 2.0, 3.0]
+
+
+def test_delta_runs_from_the_first_reading_to_the_last():
+    change, fraction, start = change_across([100.0, 120.0, 150.0])
     assert change == 50.0
     assert fraction == pytest.approx(0.5)
+    assert start == 0
 
 
 def test_delta_needs_two_readings():
-    assert month_over_month([]) is None
-    assert month_over_month([100.0]) is None
-    assert month_over_month([None, None]) is None
+    assert change_across([]) is None
+    assert change_across([100.0]) is None
+    assert change_across([None, None]) is None
 
 
 def test_delta_ignores_months_after_the_last_reading():
-    """A series can trail off into None; the comparison is the last real pair."""
-    change, fraction = month_over_month([100.0, 120.0, None, None])
+    """A series can trail off into None; the comparison is the last reading."""
+    change, _, _ = change_across([100.0, 120.0, None, None])
     assert change == 20.0
 
 
-def test_delta_refuses_a_gap_immediately_before_the_latest():
+def test_delta_starts_where_the_chart_does():
+    """A category first recorded partway through the window is measured from
+    that first reading, the point its chart begins on."""
+    change, _, start = change_across([None, None, 400.0, 500.0])
+    assert change == 100.0
+    assert start == 2
+
+
+def test_one_month_with_a_gap_before_the_latest_has_nothing_to_compare():
     """Carrying across a hole would invent a month-over-month that never was."""
-    assert month_over_month([100.0, None, 150.0]) is None
+    assert change_across(trailing_window([100.0, None, 150.0], 1)) is None
 
 
 def test_delta_percentage_is_undefined_from_zero():
-    change, fraction = month_over_month([0.0, 500.0])
+    change, fraction, _ = change_across([0.0, 500.0])
     assert change == 500.0
     assert fraction is None
-    assert '%' not in _delta_text(change, fraction)
+    assert '%' not in delta_text(change, fraction, 'vs last month')
 
 
 def test_delta_percentage_uses_magnitude_for_negative_bases():
     """Going from -200 to -100 is a 50% improvement, not -50%."""
-    change, fraction = month_over_month([-200.0, -100.0])
+    change, fraction, _ = change_across([-200.0, -100.0])
     assert change == 100.0
     assert fraction == pytest.approx(0.5)
+
+
+def months_from(first: str, count: int) -> list[str]:
+    """`count` month keys starting at `first`."""
+    year, month = int(first[:4]), int(first[5:7])
+    keys = []
+    for _ in range(count):
+        keys.append(f"{year:04d}-{month:02d}")
+        month += 1
+        if month > 12:
+            month, year = 1, year + 1
+    return keys
+
+
+@pytest.mark.parametrize('months, expected', [
+    (1, 'vs last month'),
+    (3, 'vs 3 months ago'),
+    (6, 'vs 6 months ago'),
+    (12, 'vs last year'),
+    (24, 'vs 2 years ago'),
+])
+def test_a_full_window_is_named_by_its_range(months, expected):
+    assert _basis_text(months, months_from('2024-01', months + 1), 0) == expected
+
+
+def test_a_short_history_names_the_month_it_starts_in():
+    """Eight months of history under 1Y must not claim a year."""
+    keys = months_from('2026-02', 9)
+    assert _basis_text(12, keys, 0) == 'since Feb 2026'
+
+
+def test_a_late_first_reading_names_its_own_month():
+    """A full-length window whose category was first recorded partway in."""
+    keys = months_from('2025-10', 13)
+    assert _basis_text(12, keys, 4) == 'since Feb 2026'
+
+
+def test_all_history_always_names_its_first_month():
+    assert _basis_text(None, months_from('2021-03', 40), 0) == 'since Mar 2021'
+
+
+def test_day_names_are_spelled_out():
+    """A balance history is dated to the day, so its "since" says which one."""
+    assert day_name('2025-03-04') == 'Mar 4, 2025'
+    assert day_name('2025-12-31T09:15:00') == 'Dec 31, 2025'
+    assert day_name('2025-13-01') == '2025-13-01'
+    assert day_name('not a date') == 'not a date'
+
+
+def test_month_names_are_spelled_out():
+    assert month_name('2021-03') == 'Mar 2021'
+    assert month_name('2026-12') == 'Dec 2026'
+    # Anything else is left as it came rather than misnamed.
+    assert month_name('2021-13') == '2021-13'
 
 
 @pytest.mark.parametrize('change, higher_is_better, expected', [
@@ -280,20 +359,20 @@ def test_delta_percentage_uses_magnitude_for_negative_bases():
     (0.0,    False, 'DeltaFlat'),
 ])
 def test_delta_colour_follows_the_outcome_not_the_sign(change, higher_is_better, expected):
-    assert _delta_object_name(change, higher_is_better) == expected
+    assert delta_object_name(change, higher_is_better) == expected
 
 
 def test_delta_text_reads_as_a_sentence():
-    assert _delta_text(1204.0, 0.023) == '▲ $1,204.00 (2.3%) vs last month'
-    assert _delta_text(-50.5, -0.1) == '▼ $50.50 (10.0%) vs last month'
-    assert _delta_text(0.0, 0.0) == '■ $0.00 (0.0%) vs last month'
+    assert delta_text(1204.0, 0.023, 'vs last month') == '▲ $1,204.00 (2.3%) vs last month'
+    assert delta_text(-50.5, -0.1, 'vs last year') == '▼ $50.50 (10.0%) vs last year'
+    assert delta_text(0.0, 0.0, 'since Mar 2021') == '■ $0.00 (0.0%) since Mar 2021'
 
 
 def test_absurd_percentages_are_dropped_but_the_amount_survives():
     """A month starting near zero yields a correct, useless ratio like 2846%."""
-    text = _delta_text(183566.45, 28.46)
+    text = delta_text(183566.45, 28.46, 'vs last month')
     assert '%' not in text
     assert '$183,566.45' in text
     assert text.startswith('▲')
     # Just inside the threshold still shows.
-    assert '%' in _delta_text(100.0, 9.9)
+    assert '%' in delta_text(100.0, 9.9, 'vs last month')

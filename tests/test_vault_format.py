@@ -16,9 +16,9 @@ import sqlite3
 
 import pytest
 
-import auth
-import database
-import encryption
+from core import auth
+from core import database
+from core import encryption
 from conftest import MASTER, corrupt, make_account, raw_column
 from services import accounts as accounts_service
 

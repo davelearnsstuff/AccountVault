@@ -2,57 +2,45 @@
 # services/account_import.py
 # A table of accounts read into records ready for the vault.
 #
-# The half of the door that was missing. The app could write its accounts out
-# three ways — the whole-vault CSV, the per-account file, the balance history —
-# and had no way at all to take any of them back, or to take a spreadsheet, or
-# an export from whatever the user was keeping their passwords in before. The
-# only route in was typing.
+# Reads this app's own CSV export, another password manager's, or a
+# spreadsheet. Nothing here touches the database: it works out which column is
+# which and returns the rows worth keeping plus a reason for every one it
+# dropped. The caller shows both and only then writes — the same contract
+# services/history_io holds.
 #
-# Nothing here touches the database. It reads text, works out which column is
-# which, and returns the rows worth keeping plus a reason for every one it
-# dropped. The caller shows both and only then writes, so a misread column is
-# visible while declining is still free — the same contract services/history_io
-# holds, for the same reason, and this module deliberately mirrors its shape so
-# that the two dialogs built on them can behave alike.
+# Unlike history, where a date looks like a date, an account is a dozen columns
+# of free text, and nothing about 'jsmith' says whether it is a username or a
+# security answer. So the header row is required, and a column it cannot name
+# is dropped and reported rather than guessed at — a wrong guess here files a
+# password under 'notes'.
 #
-# Where this one differs is what it does with a column it cannot place. History
-# is two columns and the parser can find them by looking at the values: a date
-# looks like a date. An account is a dozen columns of free text, and no amount
-# of looking at 'jsmith' says whether it is a username or a security answer.
-# So the header row is required, and a column it cannot name is dropped and
-# reported rather than guessed at or swept into extra_data — a guess here does
-# not produce a visibly wrong chart, it files a password under 'notes'.
-#
-# One value is completed rather than read: a row with no category is filed
-# under the category the user picks in the dialog, which is stated up front
-# rather than inferred.
+# A row with no category is filed under the category the user picks in the
+# dialog.
 # -----------------------------------------------------------------------------
 
 import csv
 import re
 from collections import Counter
 
-from categories import (
+from core.categories import (
     CATEGORY_CONFIG, FAVORITE_KEY, GENERIC_CONFIG, normalize_category,
 )
+from core.encryption import is_unreadable
 from services import export_io
-from services.export_io import INTERNAL_KEYS
+from services.accounts import MAX_LENGTHS, is_reserved_category
+from services.export_io import INTERNAL_KEYS, undefuse
 
-# Accounts accepted from a single import. Well past any real password manager's
-# export, and low enough that the wrong file picked by accident cannot fill a
-# vault with rows that then have to be deleted one at a time.
+# Accounts accepted from a single import — well past any real password
+# manager's export, and low enough that the wrong file cannot flood a vault.
 MAX_ROWS = 2000
 
-# Refuses a file larger than this rather than reading it. An account is a few
-# hundred bytes of text, so anything past this is the wrong file.
+# An account is a few hundred bytes of text, so anything past this is the
+# wrong file.
 MAX_FILE_BYTES = 5 * 1024 * 1024
 
 _DELIMITERS = ('\t', ',', ';', '|')
 
-# The column every row must have. Without a name there is nothing to call the
-# account in the list, and services.accounts._require_name would reject it at
-# the write anyway — better to say so in the preview, per row, than to fail the
-# whole import on row 400.
+# The column every row must have.
 NAME_KEY = 'name'
 
 # Reason codes for a dropped row, and how they are worded to the user.
@@ -62,26 +50,23 @@ REASONS = {
     'repeat':    'repeated in the file',
     'empty':     'nothing in the row',
     'limit':     f'past the {MAX_ROWS:,}-row limit',
+    'too_long':  'a value too long to store',
+    'reserved':  'a category name the app reserves',
 }
 
-# The two fields read as a yes/no rather than as text. Everything else the
-# vocabulary below recognises is stored as the string in the cell.
+# The two fields read as a yes/no rather than as text.
 _BOOLEAN_KEYS = frozenset({'closed', FAVORITE_KEY})
 
-# Fields no column may ever be read into, whatever it is headed.
-#
-# The floor is export_io.INTERNAL_KEYS — the same keys no export writes a
-# column for — so a key that stops being exportable stops being importable in
-# the same edit rather than in a second one somebody has to remember.
-#
-# 'last_updated' is added on top, and it is the one that needs explaining: it
-# is declared as a field by every category, so the vocabulary below would
-# otherwise pick it up. The stamp says when the record was last known good, and
-# it drives the staleness half of Needs Attention. An imported record was last
-# known good the moment it arrived, so reading the file's date would let a
-# three-year-old export land pre-aged — every account of it in Needs Attention
-# on the day it was imported, for a reason the user cannot act on. The insert
-# stamps today instead, which is the claim that is actually true.
+# Fields whose cell is kept exactly as written. Every other cell is trimmed,
+# which rescues a hand-typed "Chase, jsmith" — but a password with a leading or
+# trailing space is a different password, and trimming it would import one that
+# does not log in.
+_VERBATIM_KEYS = frozenset({'password'})
+
+# Fields no column may ever be read into. On top of the keys no export writes:
+# 'last_updated', which every category declares. An imported record was last
+# known good the moment it arrived; reading the file's stamp would land an old
+# export pre-aged in Needs Attention.
 _NEVER_IMPORTED = INTERNAL_KEYS | {'last_updated'}
 
 _TRUE_WORDS = frozenset({'1', 'true', 'yes', 'y', 'on', 'closed', 'favourite',
@@ -89,13 +74,7 @@ _TRUE_WORDS = frozenset({'1', 'true', 'yes', 'y', 'on', 'closed', 'favourite',
 _FALSE_WORDS = frozenset({'0', 'false', 'no', 'n', 'off', 'open', ''})
 
 # Header spellings other tools write, mapped onto this app's field keys. Read
-# on the way in and never written on the way out, exactly like
-# categories.CATEGORY_ALIASES.
-#
-# The set is deliberately small and covers what the common exports actually
-# head their columns: 'url'/'uri' for a website, 'title' for a name, 'folder'
-# or 'group' for what this app calls a category, 'note' for notes. Anything
-# past that is a column this module declines to name — see the header note.
+# on the way in, never written.
 _HEADER_ALIASES = {
     'url': 'website', 'uri': 'website', 'web site': 'website',
     'login uri': 'website', 'site': 'website', 'link': 'website',
@@ -124,11 +103,9 @@ class AccountImportError(Exception):
 # -----------------------------------------------------------------------------
 # Header vocabulary
 #
-# Built once from the category schemas rather than written out again, so a
-# field added to a category is importable the moment it exists. Both spellings
-# of every field are accepted — its stored key and the label the app shows it
-# under — because a file is as likely to have come out of this app's own export
-# (keys) as out of a person reading the screen (labels).
+# Built from the category schemas, so a new field is importable the moment it
+# exists. Both a field's key and its label are accepted: a file is as likely to
+# come from this app's export (keys) as from a person reading the screen.
 # -----------------------------------------------------------------------------
 
 def _normalize_header(text) -> str:
@@ -144,8 +121,6 @@ def _build_vocabulary() -> dict:
             key = field['key']
             if key in _NEVER_IMPORTED:
                 continue
-            # The key wins over a label that normalizes to the same string,
-            # which is the common case ('name' / 'Name') and not a conflict.
             vocabulary.setdefault(_normalize_header(field['label']), key)
             vocabulary[_normalize_header(key)] = key
 
@@ -153,9 +128,7 @@ def _build_vocabulary() -> dict:
     for key in ('category', 'closed', FAVORITE_KEY):
         vocabulary[_normalize_header(key)] = key
 
-    # Aliases last, and only where they do not displace a real field name. A
-    # category that ever declares a field called 'type' or 'email' should keep
-    # it rather than have the alias table quietly redirect the column.
+    # Aliases last, and never over a real field name.
     for alias, key in _HEADER_ALIASES.items():
         if key in _NEVER_IMPORTED:
             continue
@@ -175,36 +148,24 @@ def field_key(header) -> str | None:
 # Value reading
 # -----------------------------------------------------------------------------
 
-def undefuse(value) -> str:
-    """Undoes the leading apostrophe services/export_io.defuse adds.
-
-    That apostrophe is the documented "this cell is text" marker, added so a
-    password beginning with '=' is shown by a spreadsheet rather than executed.
-    A spreadsheet consumes it on display but a file read as text still carries
-    it, so without this a vault's own export re-imported every such password
-    one character longer than it really is — and the account would then not log
-    in, with nothing on screen to say why.
-
-    Exactly one apostrophe, and only in front of a character that needed it.
-    A password that genuinely starts with an apostrophe is left alone."""
-    text = '' if value is None else str(value)
-    if text[:1] == "'" and text[1:2] in ('=', '+', '-', '@', '\t', '\r'):
-        return text[1:]
-    return text
-
-
 def read_boolean(value) -> bool | None:
-    """A yes/no cell as a bool, or None when it says neither.
-
-    None matters: a 'Closed' column holding something this does not recognise
-    must leave the account open rather than guess, and a caller that cannot
-    tell "false" from "unreadable" would have no way to make that choice."""
+    """A yes/no cell as a bool, or None when it says neither — so an
+    unrecognised 'Closed' cell leaves the account open rather than guessing."""
     text = str(value or '').strip().lower()
     if text in _TRUE_WORDS:
         return True
     if text in _FALSE_WORDS:
         return False
     return None
+
+
+def _cell(raw: str, key: str) -> str:
+    """One cell's value as stored: un-defused, and trimmed unless it is a
+    password. A password of nothing but spaces reads as empty."""
+    if key in _VERBATIM_KEYS:
+        value = undefuse(raw)
+        return value if value.strip() else ''
+    return undefuse(raw.strip()).strip()
 
 
 # -----------------------------------------------------------------------------
@@ -214,23 +175,23 @@ def read_boolean(value) -> bool | None:
 def _read_rows(text: str, delimiter: str) -> list[tuple[int, str, list[str]]]:
     """(line number, original line, fields) for every line that holds something.
 
-    Whole-document parsing rather than line by line, unlike history_io: an
-    account's notes field routinely holds newlines, and a quoted value spanning
-    several lines is exactly what this app's own export writes for one. The
-    line number is taken from the reader afterwards so a reported row is still
-    one the user can count to.
-    """
+    Fields are as the CSV reader returned them, untrimmed — see _cell.
+
+    Whole-document parsing, unlike history_io: an account's notes routinely hold
+    newlines, and this app's own export writes them as quoted multi-line
+    values. The line number comes from the reader, so a reported row is one the
+    user can count to."""
     rows = []
     reader = csv.reader(text.splitlines(True), delimiter=delimiter)
     try:
         for fields in reader:
-            fields = [f.strip() for f in fields]
-            if not any(fields):
+            trimmed = [f.strip() for f in fields]
+            if not any(trimmed):
                 continue
-            rows.append((reader.line_num, delimiter.join(fields)[:200], fields))
+            rows.append((reader.line_num, delimiter.join(trimmed)[:200], fields))
     except csv.Error:
         # A malformed quote leaves this layout unusable; another delimiter may
-        # still read the file, and _plan scores them all.
+        # still read the file.
         return []
     return rows
 
@@ -238,10 +199,9 @@ def _read_rows(text: str, delimiter: str) -> list[tuple[int, str, list[str]]]:
 def _map_headers(labels: list[str]) -> dict:
     """{column index: field key} for the headings this module can name.
 
-    A field claimed by two columns keeps the first. The second is reported as
-    ignored rather than silently overwriting, because a file with both 'Name'
-    and 'Account Name' means one of them is not the name and the user is the
-    only one who knows which."""
+    A field claimed by two columns keeps the first; the second is reported as
+    ignored, since only the user knows which of 'Name' and 'Account Name' is
+    really the name."""
     mapping = {}
     taken = set()
     for index, label in enumerate(labels):
@@ -256,14 +216,9 @@ def _map_headers(labels: list[str]) -> dict:
 def _plan(text: str) -> dict:
     """The delimiter that names the most columns.
 
-    Scored on mapped headings rather than on row count, which is what makes a
-    separator that is really part of the data lose: splitting a file of
-    'Chase Visa, jsmith, hunter2' on the comma yields three named columns, and
-    splitting it on the semicolon yields one column named nothing.
-
-    A plan with no name column is still returned. It is the honest answer to a
-    file whose first row is data rather than headings, and the caller says so
-    in those words instead of importing a header as an account."""
+    Scored on mapped headings rather than row count, so a separator that is
+    really part of the data loses. A plan with no name column is still
+    returned, and the caller says the first row has to be headings."""
     best = {'rows': [], 'labels': [], 'mapping': {}, 'delimiter': ''}
     for delimiter in _DELIMITERS:
         rows = _read_rows(text, delimiter)
@@ -272,8 +227,8 @@ def _plan(text: str) -> dict:
         mapping = _map_headers(rows[0][2])
         if len(mapping) <= len(best['mapping']):
             continue
-        best = {'rows': rows[1:], 'labels': rows[0][2], 'mapping': mapping,
-                'delimiter': delimiter}
+        best = {'rows': rows[1:], 'labels': [label.strip() for label in rows[0][2]],
+                'mapping': mapping, 'delimiter': delimiter}
     return best
 
 
@@ -282,10 +237,9 @@ def _plan(text: str) -> dict:
 # -----------------------------------------------------------------------------
 
 def _existing_keys(existing) -> set:
-    """(category, name) of what the vault already holds, lowercased.
-
-    The pair, not the name alone: 'Chase' filed under Banking and 'Chase' filed
-    under Credit Cards are two accounts, and most people have both."""
+    """(category, name) of what the vault already holds, lowercased. The pair,
+    not the name alone: 'Chase' under Banking and under Credit Cards are two
+    accounts."""
     keys = set()
     for account in existing or []:
         name = str(account.get('name') or '').strip().lower()
@@ -301,27 +255,30 @@ def _row_values(fields: list[str], mapping: dict) -> dict:
     for index, key in mapping.items():
         if index >= len(fields):
             continue
-        values[key] = undefuse(fields[index]).strip()
+        values[key] = _cell(fields[index], key)
     return values
+
+
+def _too_long(row: dict) -> bool:
+    return any(len(str(row.get(key) or '')) > limit
+               for key, limit in MAX_LENGTHS.items())
 
 
 def prepare(text: str, existing=None, default_category: str = 'Websites') -> dict:
     """Reads a table of accounts into records ready for the vault.
 
-    Returns {rows, skipped, reasons, mapped, ignored, categories, has_header},
-    where rows is a list of flat account dicts in file order —
+    Returns {rows, skipped, reasons, mapped, ignored, categories, has_header,
+    unreadable}, where rows is a list of flat account dicts in file order —
     services.accounts.create_accounts takes them as they are.
 
-    `existing` is what the vault already holds: a row matching one by category
-    and name is dropped, which makes importing the same file twice a no-op
-    rather than a doubled vault. Rows repeating each other inside the file are
-    dropped the same way, on the grounds that a file listing one account twice
-    still describes one account.
-    """
+    A row matching an account in `existing` by category and name is dropped, so
+    importing the same file twice adds nothing; rows repeating each other in
+    the file are dropped the same way. A cell holding the "⚠ unreadable"
+    placeholder (an export from a vault with damaged fields) is left blank and
+    counted in `unreadable`."""
     text = str(text or '')
-    # The same ceiling read_file applies, enforced here too so it covers pasted
-    # text — which never goes through read_file, and which _plan then parses
-    # four times over while it works out the layout.
+    # Also enforced here so it covers pasted text, which never goes through
+    # read_file.
     if len(text.encode('utf-8', 'ignore')) > MAX_FILE_BYTES:
         raise AccountImportError(
             'That is too much text to be an account list — paste a smaller range.')
@@ -336,44 +293,56 @@ def prepare(text: str, existing=None, default_category: str = 'Websites') -> dic
                     if index not in mapping and label],
         'categories': Counter(),
         'has_header': NAME_KEY in mapping.values(),
+        'unreadable': 0,
     }
     if not result['has_header']:
         return result
 
-    # Two sets rather than one. `stored` never grows, so it still answers
-    # "was this already in the vault" after `seen` has absorbed the rows read
-    # so far — which is what tells a file imported twice apart from a file
-    # that lists an account twice.
+    # `stored` never grows, so it still tells "already in the vault" apart from
+    # "repeated in the file" after `seen` has absorbed the rows read so far.
     stored = _existing_keys(existing)
     seen = set(stored)
     default_category = str(default_category or 'Websites').strip() or 'Websites'
 
     def drop(number: int, line: str, reason: str):
         result['reasons'][reason] += 1
-        # Only the first few are kept: the summary counts them all, and the
-        # list is there to show what a bad row looks like, not to reproduce
-        # the file.
+        # The summary counts them all; the list only shows what a bad row looks
+        # like.
         if len(result['skipped']) < 12:
             result['skipped'].append(
                 {'line': number, 'text': line[:120], 'reason': reason})
 
     for number, line, fields in plan['rows']:
         values = _row_values(fields, mapping)
+        unreadable = [key for key, value in values.items() if is_unreadable(value)]
+        for key in unreadable:
+            values[key] = ''
 
         name = values.pop(NAME_KEY, '')
         if not name:
-            # A row of separators with a stray cell in it is not worth
-            # reporting as a failed account; one with real content is.
             drop(number, line, 'empty' if not any(values.values()) else 'no_name')
             continue
 
         category = normalize_category(values.pop('category', '').strip()) or default_category
+        if is_reserved_category(category):
+            drop(number, line, 'reserved')
+            continue
+
+        row = {'name': name, 'category': category}
+        for field, value in values.items():
+            if field in _BOOLEAN_KEYS:
+                # An unreadable flag leaves the account open and unpinned.
+                if read_boolean(value):
+                    row[field] = True
+                continue
+            if value != '':
+                row[field] = value
+        if _too_long(row):
+            drop(number, line, 'too_long')
+            continue
+
         key = (category.lower(), name.lower())
         if key in seen:
-            # Told apart on purpose. 'Already in this vault' is the file being
-            # imported twice and means nothing was lost; 'repeated in the file'
-            # is the file itself listing an account twice, which the user may
-            # want to look at.
             drop(number, line, 'duplicate' if key in stored else 'repeat')
             continue
         seen.add(key)
@@ -382,18 +351,7 @@ def prepare(text: str, existing=None, default_category: str = 'Websites') -> dic
             drop(number, line, 'limit')
             continue
 
-        row = {'name': name, 'category': category}
-        for field, value in values.items():
-            if field in _BOOLEAN_KEYS:
-                flag = read_boolean(value)
-                # An unreadable flag leaves the account open and unpinned,
-                # which is what a row that never carried the column gets.
-                if flag:
-                    row[field] = True
-                continue
-            if value != '':
-                row[field] = value
-
+        result['unreadable'] += len(unreadable)
         result['categories'][category] += 1
         result['rows'].append(row)
 
@@ -415,15 +373,17 @@ def summarise(result: dict) -> str:
     categories = result['categories']
     spread = (f"{len(categories)} categories" if len(categories) > 1
               else next(iter(categories), ''))
-    return f"{len(rows):,} account{'s' if len(rows) != 1 else ''}, {spread}."
+    text = f"{len(rows):,} account{'s' if len(rows) != 1 else ''}, {spread}."
+    unreadable = result.get('unreadable', 0)
+    if unreadable:
+        text += (f" {unreadable:,} value{'s' if unreadable != 1 else ''} marked "
+                 f"unreadable will be left blank.")
+    return text
 
 
 def columns_summary(result: dict) -> str:
-    """Which headings were read as what, and which were left out.
-
-    Named rather than counted. This module decides where every value in the
-    file lands, and a column read as the wrong field has to be visible before
-    the Import button is pressed rather than found later in an account."""
+    """Which headings were read as what, and which were left out — named, so a
+    column read as the wrong field is visible before Import is pressed."""
     parts = []
     mapped = result['mapped']
     if mapped:

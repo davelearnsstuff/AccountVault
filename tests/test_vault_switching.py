@@ -11,13 +11,15 @@
 # -----------------------------------------------------------------------------
 
 import pytest
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QFileDialog, QMessageBox
 
-import auth
-import database
-import encryption
-import preferences
-import vaultfile
+from core import auth
+from core import database
+from core import encryption
+from core import preferences
+from core import vaultfile
 from conftest import MASTER, _destroy, make_account
 from services import accounts as accounts_service
 
@@ -122,6 +124,117 @@ def test_a_missing_extension_is_added(window, tmp_path, monkeypatch):
     assert database.DB_PATH.suffix == database.VAULT_SUFFIX
 
 
+# -- the demo vault -----------------------------------------------------------
+
+@pytest.fixture
+def demo_box(monkeypatch):
+    """The password box each demo build shows, kept rather than run: exec()
+    would block the test."""
+    from ui import dialogs
+
+    shown = []
+    monkeypatch.setattr(dialogs.DemoVaultDialog, 'exec', lambda self: shown.append(self))
+    return shown
+
+
+def test_the_demo_vault_waits_at_the_login_screen(window, tmp_path, monkeypatch, demo_box):
+    """Setting the password installs the key. Going in on it opened the vault
+    without the password ever being typed."""
+    demo = tmp_path / 'springfield.vault'
+    pick(monkeypatch, demo)
+    answer(monkeypatch, QMessageBox.Yes)
+
+    window._create_demo_vault_dialog()
+
+    assert database.DB_PATH == demo
+    assert not auth.is_unlocked()
+    assert window.screens.currentWidget() is window.login_screen
+
+
+def test_the_demo_vault_unlocks_with_the_password_it_shows(window, tmp_path, monkeypatch,
+                                                           demo_box):
+    """The box is the only place the app says what the password is. If it and
+    the build ever disagree, the demo cannot be opened at all."""
+    pick(monkeypatch, tmp_path / 'springfield.vault')
+    answer(monkeypatch, QMessageBox.Yes)
+
+    window._create_demo_vault_dialog()
+    password = demo_box[0].password
+    window._handle_login(password.text())
+
+    assert password.textInteractionFlags() & Qt.TextSelectableByMouse
+    assert window.screens.currentWidget() is window.main_screen
+    assert len(accounts_service.list_accounts()) > 20
+
+
+def test_the_demo_password_copies_like_any_other_secret(window, tmp_path, monkeypatch,
+                                                        demo_box):
+    """Through copy_to_clipboard, so it is kept out of clipboard history and
+    cleared on the same timer as a password copied from an account."""
+    from tools import make_demo_vault
+
+    pick(monkeypatch, tmp_path / 'springfield.vault')
+    answer(monkeypatch, QMessageBox.Yes)
+
+    window._create_demo_vault_dialog()
+    demo_box[0].copy_button.click()
+
+    assert QGuiApplication.clipboard().text() == make_demo_vault.PASSWORD
+    assert window._clipboard_timer.isActive()
+
+
+def test_the_demo_vault_never_overwrites_a_file(window, tmp_path, monkeypatch):
+    make_account(name='Irreplaceable')
+    existing = database.DB_PATH
+    before = existing.read_bytes()
+    pick(monkeypatch, existing)
+    answer(monkeypatch, QMessageBox.No)
+
+    window._create_demo_vault_dialog()
+
+    assert existing.read_bytes() == before
+
+
+@pytest.mark.parametrize('kind', ['vault', 'other file'])
+def test_a_name_in_use_says_to_delete_the_file_first(window, tmp_path, monkeypatch, kind):
+    """The refusal says why and what to do. "Already a vault, open it?" alone
+    left people answering Yes to replace it and getting nowhere."""
+    if kind == 'vault':
+        target = database.DB_PATH
+    else:
+        target = tmp_path / 'notes.vault'
+        target.write_text('not a vault')
+
+    said = []
+
+    def record(parent, title, text, *rest):
+        said.append(text)
+        return QMessageBox.No
+
+    monkeypatch.setattr(QMessageBox, 'question', staticmethod(record))
+    monkeypatch.setattr(QMessageBox, 'warning', staticmethod(record))
+    pick(monkeypatch, target)
+
+    window._create_demo_vault_dialog()
+
+    assert 'never overwrites' in said[0]
+    assert 'delete the file yourself first' in said[0]
+
+
+def test_the_demo_builder_refuses_a_path_in_use(tmp_path):
+    """The builder's own check, behind the dialog's: the script calls it with
+    whatever path it was given."""
+    from tools import make_demo_vault
+
+    taken = tmp_path / 'taken.vault'
+    taken.write_bytes(b'somebody else')
+
+    with pytest.raises(FileExistsError):
+        make_demo_vault.build_vault(taken)
+
+    assert taken.read_bytes() == b'somebody else'
+
+
 # -- opening ------------------------------------------------------------------
 
 def test_a_file_that_is_not_a_vault_never_reaches_setup(window, tmp_path):
@@ -184,8 +297,10 @@ def test_switching_drops_the_decrypted_account_cache(window, tmp_path):
 
 
 def test_switching_clears_the_account_list_on_screen(window, tmp_path):
+    from ui.account_list import ALL
+
     make_account(name='First Vault Account')
-    window.load_category('all')
+    window.load_category(ALL)
     assert window.account_list.count() > 0
     second = _second_vault(tmp_path)
 

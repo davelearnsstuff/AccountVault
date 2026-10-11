@@ -13,8 +13,8 @@ import json
 
 import pytest
 
-import database
-import encryption
+from core import database
+from core import encryption
 from conftest import corrupt, corrupt_column, make_account, raw_column
 from services import account_export, accounts as accounts_service
 from services import csv_export as backup_service
@@ -208,7 +208,7 @@ def test_a_legacy_slug_secure_note_is_still_excluded(vault):
     _set_category(account['id'], 'securenotes')
 
     assert dashboard_service.monthly_summary() == {
-        'months': [], 'categories': {}, 'net_worth': []}
+        'months': [], 'categories': {}, 'net_worth': [], 'accounts': {}}
 
 
 def test_websites_is_excluded_from_net_worth(vault):
@@ -289,7 +289,7 @@ def test_a_pasted_wall_of_text_is_refused_rather_than_parsed_five_times(vault):
 # -- category helpers ---------------------------------------------------------
 
 def test_a_split_scheme_cannot_smuggle_javascript_past_the_url_check(vault):
-    from urls import normalize_url
+    from core.urls import normalize_url
 
     assert normalize_url('javascript:alert(1)') == ''
     assert normalize_url('java\tscript:alert(1)') == ''
@@ -299,7 +299,7 @@ def test_a_split_scheme_cannot_smuggle_javascript_past_the_url_check(vault):
 
 
 def test_ordinary_urls_are_left_alone(vault):
-    from urls import normalize_url
+    from core.urls import normalize_url
 
     assert normalize_url('https://example.com') == 'https://example.com'
     assert normalize_url('example.com') == 'https://example.com'
@@ -310,7 +310,7 @@ def test_ordinary_urls_are_left_alone(vault):
 def test_the_due_cycle_schemas_use_the_declared_key(vault):
     """The constant existed to stop the literal being written twice, and the
     schemas wrote it anyway."""
-    from categories import CATEGORY_CONFIG, DUE_CYCLE_KEY
+    from core.categories import CATEGORY_CONFIG, DUE_CYCLE_KEY
 
     for name in ('Credit Cards', 'Loans', 'Utilities'):
         keys = [f['key'] for f in CATEGORY_CONFIG[name]['fields']]
@@ -318,7 +318,7 @@ def test_the_due_cycle_schemas_use_the_declared_key(vault):
 
 
 def test_one_spelling_of_a_whole_number_everywhere(vault):
-    from categories import trim_number
+    from core.categories import trim_number
 
     assert history_io.canonical_amount(5.0) == '5'
     assert history_io.canonical_amount(5.25) == '5.25'

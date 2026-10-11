@@ -26,9 +26,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # a property a single test file can hold on its own.
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
-import auth              # noqa: E402
-import database          # noqa: E402
-import encryption        # noqa: E402
+from core import auth              # noqa: E402
+from core import database          # noqa: E402
+from core import encryption        # noqa: E402
 from services import accounts as accounts_service  # noqa: E402
 
 MASTER = 'correct horse battery staple'
@@ -39,15 +39,22 @@ NEW_MASTER = 'a different long passphrase'
 def reset_login_state():
     """Clears the in-memory half of the login rate limiter around every test.
 
-    The lockout deadline and the escalation counter are module globals that
-    outlive a database: without this, one test's failed logins lock the next
-    one out, and the escalation counter makes the wait longer every time. The
-    persisted half goes with the throwaway database and needs no help."""
-    auth._lockout_deadline_monotonic = 0.0
-    auth._lockout_count = 0
+    The lockout deadline and the escalation counter outlive a database: without
+    this, one test's failed logins lock the next one out. The persisted half
+    goes with the throwaway database."""
+    auth.reset_rate_limit_memory()
     yield
-    auth._lockout_deadline_monotonic = 0.0
-    auth._lockout_count = 0
+    auth.reset_rate_limit_memory()
+
+
+@pytest.fixture(autouse=True)
+def isolated_app_data(tmp_path_factory, monkeypatch):
+    """Points the per-user data directory — the vault registry, the error log —
+    at a throwaway one for every test, so nothing in the suite can write to the
+    real one. A test that needs its own sets it again."""
+    home = tmp_path_factory.mktemp('appdata')
+    monkeypatch.setattr(database, 'app_data_dir', lambda: home)
+    return home
 
 
 @pytest.fixture

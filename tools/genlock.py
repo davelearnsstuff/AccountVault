@@ -1,8 +1,8 @@
 """Generate hash-pinned lock files from requirements*.txt.
 
-Covers win_amd64 and manylinux x86_64 across the Python versions start.bat might
-find, so --require-hashes does not turn into "works only on the machine that
-generated it".
+Covers win_amd64 and manylinux x86_64 across the Python versions
+AccountVault_Windows.bat might find, so --require-hashes does not turn into
+"works only on the machine that generated it".
 """
 import hashlib
 import pathlib
@@ -20,10 +20,12 @@ PLATFORM_SETS = [
     ['manylinux_2_34_x86_64', 'manylinux_2_28_x86_64',
      'manylinux2014_x86_64', 'manylinux_2_17_x86_64'],
 ]
-# What start.bat might find. Most wheels here are abi3 or pure Python and cover
-# all four with one artifact; cffi builds per version, hence the sweep.
+# What AccountVault_Windows.bat might find. Most wheels here are abi3 or pure
+# Python and cover all four with one artifact; cffi builds per version, hence
+# the sweep.
 PYTHONS = ['3.11', '3.12', '3.13', '3.14']
 PY = sys.executable
+REQUIREMENTS = pathlib.Path(__file__).resolve().parent.parent / 'requirements'
 
 
 def pins(path):
@@ -43,7 +45,7 @@ def collect(reqs, dest):
         for version in PYTHONS:
             flags = sum((['--platform', tag] for tag in tags), [])
             subprocess.run(
-                [PY, '-m', 'pip', 'download', *sum((['-r', r] for r in reqs), []),
+                [PY, '-m', 'pip', 'download', *sum((['-r', str(r)] for r in reqs), []),
                  '-d', str(dest), '--only-binary=:all:', '--no-deps',
                  *flags, '--python-version', version, '-q'],
                 check=False, capture_output=True, text=True,
@@ -87,7 +89,7 @@ def build(reqs, out_path, header):
             lines.append('')
 
     pathlib.Path(out_path).write_text('\n'.join(lines), encoding='utf-8')
-    print(f'{out_path}: {len(lines)} lines, '
+    print(f'{pathlib.Path(out_path).name}: {len(lines)} lines, '
           f'{sum(1 for line in lines if line.startswith("    --hash"))} hashes'
           + (f'  MISSING: {missing}' if missing else ''))
 
@@ -113,7 +115,7 @@ RUNTIME_HEADER = '''# Hash-pinned install list — generated, do not edit by han
 #
 # Install with:
 #
-#     python -m pip install --require-hashes -r requirements.lock
+#     python -m pip install --require-hashes -r requirements/requirements.lock
 '''
 
 DEV_HEADER = '''# Hash-pinned dev install list — generated, do not edit by hand.
@@ -127,5 +129,7 @@ DEV_HEADER = '''# Hash-pinned dev install list — generated, do not edit by han
 '''
 
 if __name__ == '__main__':
-    build(['requirements.txt'], 'requirements.lock', RUNTIME_HEADER)
-    build(['requirements-dev.txt'], 'requirements-dev.lock', DEV_HEADER)
+    build([REQUIREMENTS / 'requirements.txt'],
+          REQUIREMENTS / 'requirements.lock', RUNTIME_HEADER)
+    build([REQUIREMENTS / 'requirements-dev.txt'],
+          REQUIREMENTS / 'requirements-dev.lock', DEV_HEADER)

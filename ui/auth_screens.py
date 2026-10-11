@@ -1,11 +1,8 @@
 # -----------------------------------------------------------------------------
 # ui/auth_screens.py
-# The three pre-unlock screens: choosing a vault, creating one, and unlocking it.
-#
-# The chooser is the newest of the three and the reason the other two changed.
-# Once there can be more than one vault, "enter your master password" is an
-# ambiguous request — so both of the others name the file they are talking
-# about, and the login screen offers a way back here.
+# The three pre-unlock screens: choosing a vault, creating one, and unlocking
+# it. With more than one vault possible, the setup and login screens name the
+# file they are about, and the login screen offers a way back to the chooser.
 # -----------------------------------------------------------------------------
 
 from pathlib import Path
@@ -16,10 +13,11 @@ from PySide6.QtWidgets import (
     QPushButton, QVBoxLayout, QWidget,
 )
 
-import auth
-import database
-import vaultfile
-from ui.widgets import IconButton, ThemedIcon, password_field, password_requirements
+from core import auth
+from core import vaultfile
+from ui.widgets import (
+    IconButton, ThemedIcon, password_field, password_requirements, plain_label,
+)
 
 
 class _AuthScreen(QWidget):
@@ -28,7 +26,6 @@ class _AuthScreen(QWidget):
     def __init__(self, subtitle: str, parent=None):
         super().__init__(parent)
 
-        # The same padlock as the nav bar and the window icon.
         logo = QHBoxLayout()
         logo.addStretch(1)
         logo.addWidget(ThemedIcon('lock', role='accent', size=44))
@@ -43,18 +40,15 @@ class _AuthScreen(QWidget):
         self.subtitle.setAlignment(Qt.AlignCenter)
         self.subtitle.setWordWrap(True)
 
-        # Which vault this screen is about. Hidden until there is something to
-        # say, so a single-vault user never sees a line they do not need — and
-        # present the moment there is more than one, because "enter your master
-        # password" stops being a complete sentence as soon as the answer
-        # depends on which file is open.
-        self.vault_caption = QLabel()
+        # Which vault this screen is about, hidden until there is one to name.
+        self.vault_caption = plain_label()
         self.vault_caption.setObjectName('AuthVault')
         self.vault_caption.setAlignment(Qt.AlignCenter)
         self.vault_caption.setWordWrap(True)
         self.vault_caption.hide()
 
-        self.error = QLabel()
+        # Errors quote file names and exception text.
+        self.error = plain_label()
         self.error.setObjectName('ErrorLabel')
         self.error.setAlignment(Qt.AlignCenter)
         self.error.setWordWrap(True)
@@ -96,11 +90,8 @@ class _AuthScreen(QWidget):
         self.error.hide()
 
     def set_vault(self, path):
-        """Names the vault this screen is about.
-
-        The filename is shown and the full path is the tooltip: several vaults
-        can share a basename, but the basename is what the user thinks of it as
-        and the card is 400px wide."""
+        """Names the vault this screen is about: the filename, with the full
+        path as the tooltip."""
         if not path:
             self.vault_caption.hide()
             return
@@ -111,8 +102,6 @@ class _AuthScreen(QWidget):
 
     @staticmethod
     def _password_field(placeholder: str) -> QLineEdit:
-        """widgets.password_field at the height these screens use. The two auth
-        screens and the four dialogs all build one; only the height differs."""
         return password_field(placeholder, min_height=36)
 
 
@@ -146,9 +135,6 @@ class SetupScreen(_AuthScreen):
     def _submit(self):
         self.clear_error()
         password = self.password.text()
-        # Report what the validator actually returned. Restating a single rule
-        # here means every rule added to it later fails with the wrong message,
-        # which is exactly what happened when the space rule arrived.
         errors = auth.validate_password_strength(password)
         if errors:
             self.show_error('Master ' + ', '.join(errors) + '.')
@@ -166,15 +152,13 @@ class SetupScreen(_AuthScreen):
 
 
 class ChooserScreen(_AuthScreen):
-    """Shown when no vault is open: at a first-ever launch, and whenever the
-    recorded one has been moved, renamed or deleted.
-
-    Never reached by falling back from a vault that would not open — the app
-    says which vault and why, here, rather than quietly opening a different one.
-    """
+    """Shown when no vault is open: at a first launch, and whenever the recorded
+    one has moved. It says which vault and why, rather than quietly opening a
+    different one."""
 
     open_requested = Signal()
     create_requested = Signal()
+    demo_requested = Signal()
     recent_activated = Signal(str)
     forget_requested = Signal(str)
     clear_requested = Signal()
@@ -197,6 +181,21 @@ class ChooserScreen(_AuthScreen):
         self.recent_label.setObjectName('AuthSubtitle')
         self.recent_label.hide()
 
+        # The same request as the context menu's Clear recent vaults, out where
+        # it can be found. Forgets paths only; no vault file is touched.
+        self.clear_button = QPushButton('Clear')
+        self.clear_button.setObjectName('Small')
+        self.clear_button.setAccessibleName('Clear recent vaults')
+        self.clear_button.setToolTip('Forget the vaults listed here. The files '
+                                     'themselves are left where they are.')
+        self.clear_button.clicked.connect(self.clear_requested.emit)
+        self.clear_button.hide()
+
+        recent_header = QHBoxLayout()
+        recent_header.addWidget(self.recent_label)
+        recent_header.addStretch(1)
+        recent_header.addWidget(self.clear_button)
+
         open_button = QPushButton('Open Vault…')
         open_button.setObjectName('Primary')
         open_button.setMinimumHeight(38)
@@ -206,48 +205,54 @@ class ChooserScreen(_AuthScreen):
         create_button.setMinimumHeight(38)
         create_button.clicked.connect(self.create_requested.emit)
 
+        # Ghost, under the two real choices: a way to look around, not a third
+        # kind of vault.
+        demo_button = QPushButton('Create Demo Vault…')
+        demo_button.setObjectName('Ghost')
+        demo_button.setMinimumHeight(38)
+        demo_button.setToolTip('A new vault full of made-up accounts, to try the app with.')
+        demo_button.clicked.connect(self.demo_requested.emit)
+
         quit_button = IconButton('power', role='ghost', text='Quit', size=15)
         quit_button.setObjectName('Ghost')
         quit_button.setMinimumHeight(38)
         quit_button.clicked.connect(self.quit_requested.emit)
 
-        self.form.addWidget(self.recent_label)
+        self.form.addLayout(recent_header)
         self.form.addWidget(self.recent)
         self.form.addWidget(open_button)
         self.form.addWidget(create_button)
+        self.form.addWidget(demo_button)
         self.form.addWidget(quit_button)
 
     def reset(self, notice: str = ''):
         """Redraws the recent list and shows why we are here, if there is a why.
 
-        Every entry's status is read from disk on each pass rather than cached:
-        a drive gets unplugged between one launch and the next, and a list that
-        remembered last week's answer would offer a vault that is not there."""
+        Every entry's status is read from disk on each pass — a drive gets
+        unplugged between launches — concurrently and with a time limit, so a
+        dead network share cannot freeze the screen."""
         self.clear_error()
         if notice:
             self.show_error(notice)
 
         self.recent.clear()
         paths = vaultfile.recent()
-        for path in paths:
-            status = database.inspect_vault(path)
+        for path, status in zip(paths, vaultfile.probe_all(paths)):
             item = QListWidgetItem(Path(path).name)
             item.setData(Qt.UserRole, str(path))
             if status == 'ok':
                 item.setToolTip(str(path))
             else:
-                # Shown greyed rather than dropped. A vault that silently
-                # vanishes off this list reads as data that has been lost; one
-                # that is listed as unavailable reads as a drive to plug in.
+                # Listed greyed rather than dropped: a vault that vanishes off
+                # the list reads as lost, one marked unavailable as a drive to
+                # plug in.
                 item.setText(f"{Path(path).name}  —  {_SHORT_STATUS.get(status, 'unavailable')}")
                 item.setToolTip(vaultfile.describe(status, path))
                 item.setFlags(item.flags() & ~Qt.ItemIsEnabled)
             self.recent.addItem(item)
 
-        # With remembering off there are no paths, but the list still has to be
-        # on screen: the switch that turns it back on lives in its context menu,
-        # and a list that hid itself the moment it emptied would be a one-way
-        # door. The placeholder is what the user right-clicks to get back.
+        # With remembering off there are no paths, but the list stays on screen:
+        # the switch to turn it back on is in its context menu.
         remembering = vaultfile.remembering()
         if not remembering:
             item = QListWidgetItem('Not remembering recent vaults')
@@ -258,29 +263,20 @@ class ChooserScreen(_AuthScreen):
         showing = bool(paths) or not remembering
         self.recent.setVisible(showing)
         self.recent_label.setVisible(showing)
+        self.clear_button.setVisible(bool(paths))
 
     def _activate(self, item: QListWidgetItem):
         if item and item.flags() & Qt.ItemIsEnabled:
             self.recent_activated.emit(item.data(Qt.UserRole))
 
     def _context_menu(self, point):
-        """Remove-from-list, a way to empty it, and a way to stop keeping it.
-
-        Only ever touches the list. Nothing on this screen deletes a vault
-        file — forgetting where one is and destroying it are not two clicks
-        that belong next to each other.
-
-        Turning remembering off also empties the list, which is the point of
-        the switch rather than a side effect: leaving the paths on disk and
-        merely declining to show them would keep the file that names them."""
+        """Remove-from-list, empty the list, stop keeping it. Nothing here
+        touches a vault file."""
         self._build_context_menu(point).exec(self.recent.mapToGlobal(point))
 
     def _build_context_menu(self, point) -> QMenu:
-        """The menu itself, wired but not shown.
-
-        Separate from _context_menu because exec() is a modal event loop: the
-        tests can ask what this screen offers, and in which state, without one
-        of them opening a menu that never closes."""
+        """The menu itself, wired but not shown, so tests can inspect it without
+        a modal event loop."""
         menu = QMenu(self)
         item = self.recent.itemAt(point)
         if item is not None and item.data(Qt.UserRole):
@@ -300,8 +296,8 @@ class ChooserScreen(_AuthScreen):
         return menu
 
 
-# The listed form of a status, for an entry that is 400px wide and already
-# carries the full sentence as its tooltip.
+# A status in a few words, for an entry that carries the full sentence as its
+# tooltip.
 _SHORT_STATUS = {
     'missing': 'not found',
     'unavailable': 'drive not available',

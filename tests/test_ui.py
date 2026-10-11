@@ -15,7 +15,8 @@ import pytest
 
 from PySide6.QtWidgets import QLineEdit
 
-from conftest import _destroy, make_account
+from conftest import _destroy, corrupt, make_account
+from core import database
 from services import accounts as accounts_service
 
 
@@ -243,7 +244,7 @@ def test_a_url_with_markup_in_it_is_escaped(vault, qt_app):
 def test_the_attention_dict_carries_every_key_it_is_read_for(qt_app):
     """MainWindow's initialiser spelled the shape out by hand and left 'lapsed'
     off the list, which _attention_hint reads."""
-    from categories import attention_counts
+    from core.categories import attention_counts
 
     counts = attention_counts([])
     for key in ('total', 'due', 'stale', 'lapsed', 'urgent'):
@@ -251,7 +252,7 @@ def test_the_attention_dict_carries_every_key_it_is_read_for(qt_app):
 
 
 def test_compact_money_matches_the_axis_it_replaced(qt_app):
-    from categories import format_money_compact
+    from core.categories import format_money_compact
 
     assert format_money_compact(950) == '$950'
     assert format_money_compact(1200) == '$1.2k'
@@ -480,13 +481,165 @@ def test_adding_a_history_entry_writes_the_canonical_amount(vault, qt_app):
     table.deleteLater()
 
 
+def _change_column(account_id: int) -> list[str]:
+    from PySide6.QtWidgets import QTableWidget
+    from ui.history_table import BalanceHistory
+
+    history = BalanceHistory(account_id, 'dark', 'Balance')
+    history.reload()
+    table = history.findChild(QTableWidget)
+    changes = [table.item(row, 2).text() for row in range(table.rowCount())]
+    history.deleteLater()
+    return changes
+
+
+def test_the_history_table_shows_each_entrys_change_from_the_one_before(vault, qt_app):
+    account = make_account(category='Banking', name='Chequing')
+    for amount, recorded_at in (('1000', '2024-01-05'), ('1250.50', '2024-02-05'),
+                                ('1100', '2024-03-05'), ('1150', '2024-03-05')):
+        accounts_service.add_balance_entry(account['id'], amount, recorded_at)
+
+    # Newest first. The second March entry has no step of its own to show, and
+    # the first March one is measured against February, not against its twin.
+    assert _change_column(account['id']) == ['—', '-$150.50', '+$250.50', '—']
+
+
+def test_a_change_beside_an_undecryptable_entry_is_left_blank(vault, qt_app):
+    """Neither the entry that will not decrypt nor the one measured against it
+    can show a figure, and the newer one must not reach past it to an older
+    entry and pass a two-step move off as one."""
+    account = make_account(category='Banking', name='Chequing')
+    for amount, recorded_at in (('100', '2024-01-05'), ('200', '2024-02-05'),
+                                ('300', '2024-03-05')):
+        accounts_service.add_balance_entry(account['id'], amount, recorded_at)
+
+    with database.connect() as db:
+        row = db.execute(
+            "SELECT id, balance FROM balance_history "
+            "WHERE account_id = ? AND recorded_at LIKE '2024-02-05%'",
+            (account['id'],)).fetchone()
+        db.execute("UPDATE balance_history SET balance = ? WHERE id = ?",
+                   (corrupt(row['balance']), row['id']))
+
+    assert _change_column(account['id']) == ['', '', '—']
+
+
+def _change_line(widget):
+    """The one change line in a widget, or None."""
+    from PySide6.QtWidgets import QLabel
+    lines = [label for label in widget.findChildren(QLabel)
+             if label.objectName().startswith('Delta')]
+    assert len(lines) <= 1
+    return lines[0] if lines else None
+
+
+def _file_entries(account_id: int, *entries):
+    """(amount, days ago) pairs, filed as balance history."""
+    from datetime import date, timedelta
+    for amount, days in entries:
+        accounts_service.add_balance_entry(
+            account_id, amount, (date.today() - timedelta(days=days)).isoformat())
+
+
+def test_the_history_change_line_follows_the_range(vault, qt_app, monkeypatch):
+    """Measured from what the account held when the range began: the last
+    entry on or before that day, not the first one inside the range."""
+    from datetime import date, timedelta
+    from ui.history_table import BalanceHistory
+    from ui.ranges import day_name
+
+    monkeypatch.setattr(BalanceHistory, '_range_months', 12)
+    account = make_account(category='Banking', name='Chequing')
+    _file_entries(account['id'], ('1000', 500), ('1500', 200), ('1800', 20))
+    first = day_name((date.today() - timedelta(days=500)).isoformat())
+
+    history = BalanceHistory(account['id'], 'dark', 'Balance')
+    history.reload()
+    assert _change_line(history).text() == '▲ $800.00 (80.0%) vs last year'
+
+    history._set_range(1)
+    assert _change_line(history).text() == '▲ $300.00 (20.0%) vs last month'
+
+    # Two years reach past the first entry, so the line says where it starts.
+    history._set_range(24)
+    assert _change_line(history).text() == f'▲ $800.00 (80.0%) since {first}'
+
+    history._set_range(None)
+    assert _change_line(history).text() == f'▲ $800.00 (80.0%) since {first}'
+    history.deleteLater()
+
+
+def test_the_history_range_carries_over_to_the_next_account(vault, qt_app, monkeypatch):
+    """Stepping between accounts compares the same window."""
+    from PySide6.QtWidgets import QPushButton
+    from ui.history_table import BalanceHistory
+
+    monkeypatch.setattr(BalanceHistory, '_range_months', 12)
+    first = make_account(category='Banking', name='Chequing')
+    second = make_account(category='Banking', name='Savings')
+    _file_entries(first['id'], ('100', 120), ('200', 10))
+    _file_entries(second['id'], ('300', 120), ('400', 10))
+
+    history = BalanceHistory(first['id'], 'dark', 'Balance')
+    history.reload()
+    history._set_range(3)
+    history.deleteLater()
+
+    following = BalanceHistory(second['id'], 'dark', 'Balance')
+    following.reload()
+    checked = [b.text() for b in following.findChildren(QPushButton) if b.isChecked()]
+    assert checked == ['3M']
+    assert _change_line(following).text().endswith('vs 3 months ago')
+    following.deleteLater()
+
+
+def test_a_figure_with_nothing_filed_in_the_range_has_held(vault, qt_app, monkeypatch):
+    """No entry in the past month means the balance has not moved in it, which
+    is a change of nothing rather than no answer."""
+    from ui.history_table import BalanceHistory
+
+    monkeypatch.setattr(BalanceHistory, '_range_months', 1)
+    account = make_account(category='Banking', name='Chequing')
+    _file_entries(account['id'], ('100', 200), ('250', 90))
+
+    history = BalanceHistory(account['id'], 'dark', 'Balance')
+    history.reload()
+
+    assert _change_line(history).text() == '■ $0.00 (0.0%) vs last month'
+    history.deleteLater()
+
+
+@pytest.mark.parametrize('category, expected', [
+    ('Loans', 'DeltaGood'),        # a debt paid down
+    ('Utilities', 'DeltaGood'),    # a smaller bill
+    ('Banking', 'DeltaBad'),       # savings spent
+])
+def test_a_falling_figure_is_good_news_only_for_a_debt_or_a_bill(
+        vault, qt_app, monkeypatch, category, expected):
+    """Through the detail view, which is what decides it from the category."""
+    from ui.detail_view import DetailView
+    from ui.history_table import BalanceHistory
+
+    monkeypatch.setattr(BalanceHistory, '_range_months', 12)
+    account = make_account(category=category, name='Falling')
+    _file_entries(account['id'], ('900', 400), ('700', 10))
+
+    view = DetailView('dark')
+    view.show_account(accounts_service.get_account(account['id']))
+
+    line = _change_line(view)
+    assert line.text().startswith('▼')
+    assert line.objectName() == expected
+    view.deleteLater()
+
+
 # -- a locked vault is the window's to answer, not a toast --------------------
 
 def test_the_history_table_reports_a_locked_vault_as_a_lock(vault, qt_app):
     """These paths caught VaultLockedError with a bare `except Exception` and
     emitted it as an error, so the pane went on showing the decrypted account
     until the idle tick happened to catch up."""
-    import encryption
+    from core import encryption
     from ui.history_table import BalanceHistory
 
     account = make_account(category='Banking', name='Chequing')
@@ -508,10 +661,12 @@ def test_the_window_locks_itself_when_the_detail_pane_finds_the_vault_locked(
         window, qt_app):
     """The signal is only useful if it is wired: DetailView.locked has to reach
     MainWindow._handle_vault_locked, the same handler _attempt uses."""
-    import auth as auth_module
+    from core import auth as auth_module
+
+    from ui.account_list import ALL
 
     make_account(name='Chequing', category='Banking')
-    window.load_category('all')
+    window.load_category(ALL)
     assert window.accounts
 
     window.detail_view.locked.emit()
@@ -590,10 +745,112 @@ def test_the_readme_viewer_still_opens_an_ordinary_link(qt_app, monkeypatch):
     assert [url.toString() for url in opened] == ['https://example.com/docs']
 
 
+# -- the document viewer's find bar ----------------------------------------------
+
+@pytest.fixture
+def document(qt_app, tmp_path):
+    from ui.dialogs import DocumentDialog
+
+    path = tmp_path / 'doc.md'
+    path.write_text('# Vault\n\nOpen the vault. Lock the VAULT.\n\n'
+                    '| Where | What |\n|---|---|\n| vault | key |\n', encoding='utf-8')
+    dialog = DocumentDialog(None, 'Test', path)
+    yield dialog
+    dialog.deleteLater()
+
+
+def test_find_counts_matches_in_any_case_including_headings_and_tables(document):
+    document.search.setText('vault')
+
+    assert document._count.text() == '1 of 4'
+    assert len(document.view.extraSelections()) == 4
+
+
+def test_enter_and_shift_enter_step_through_matches_and_wrap(document):
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    document.search.setText('vault')
+    QTest.keyClick(document.search, Qt.Key_Return)
+    assert document._count.text() == '2 of 4'
+
+    QTest.keyClick(document.search, Qt.Key_Return, Qt.ShiftModifier)
+    QTest.keyClick(document.search, Qt.Key_Return, Qt.ShiftModifier)
+    assert document._count.text() == '4 of 4'
+
+    QTest.keyClick(document.search, Qt.Key_Return)
+    assert document._count.text() == '1 of 4'
+
+
+def test_enter_in_the_find_bar_does_not_close_the_window(document):
+    """A dialog presses its default button on Enter. Here that is Close, so a
+    search that stepped by returnPressed would also have dismissed the window."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    finished = []
+    document.finished.connect(finished.append)
+    document.search.setText('vault')
+    QTest.keyClick(document.search, Qt.Key_Return)
+
+    assert finished == []
+
+
+def test_typing_more_keeps_the_current_match(document):
+    """Narrowing a search should not throw the reader back to the top."""
+    document.search.setText('vau')
+    document._step(1)
+    document._step(1)
+    assert document._count.text() == '3 of 4'
+
+    document.search.setText('vault')
+
+    assert document._count.text() == '3 of 4'
+
+
+def test_a_search_with_no_matches_says_so(document):
+    document.search.setText('zzz')
+
+    assert document._count.text() == 'No matches'
+    assert document.view.extraSelections() == []
+    assert not document._next.isEnabled()
+
+
+def test_escape_clears_the_search_before_it_closes_the_window(document):
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    finished = []
+    document.finished.connect(finished.append)
+    document.search.setText('vault')
+
+    QTest.keyClick(document.search, Qt.Key_Escape)
+    assert document.search.text() == ''
+    assert document.view.extraSelections() == []
+    assert finished == []
+
+    QTest.keyClick(document.view, Qt.Key_Escape)
+    assert len(finished) == 1
+
+
+@pytest.mark.parametrize('name', ['ReadmeDialog', 'DesignDocumentDialog'])
+def test_each_document_in_the_manage_menu_is_there_to_open(qt_app, name):
+    """The menu entries name files by path. A rename of either file would leave
+    its window open on an error message, and nothing else would notice."""
+    from ui import dialogs
+
+    dialog = getattr(dialogs, name)(None)
+
+    assert dialog.PATH.is_file()
+    assert 'Could not read' not in dialog.view.toPlainText()
+    dialog.deleteLater()
+
+
 def test_an_export_defaults_somewhere_other_than_the_application_directory(qt_app):
     """A bare filename is resolved against the working directory, which for a
-    launch through start.bat is the folder the code lives in — so the default
-    place to write a CSV of every password was inside the git repository."""
+    launch through AccountVault_Windows.bat is the folder the code lives in — so
+    the default place to write a CSV of every password was inside the git
+    repository."""
     from pathlib import Path
     from ui.widgets import export_save_path
 

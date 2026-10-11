@@ -2,29 +2,18 @@
 # services/history_io.py
 # The text form of one account's balance history, in both directions.
 #
-# Nothing here touches the database. Reading, it takes text the user got from
-# somewhere else — a bank's CSV export, a spreadsheet column, a table copied off
-# a statement — works out which column is the date and which is the money, and
-# returns the rows worth keeping plus a reason for every one it dropped. The
-# caller shows both and only then writes, so a misread column is visible while
-# declining is still free.
+# Nothing here touches the database. Reading, it takes a bank's CSV, a
+# spreadsheet column or a table copied off a statement, works out which column
+# is the date and which is the money, and returns the rows worth keeping plus a
+# reason for every one it dropped. The caller shows both and only then writes.
 #
-# Writing, it renders the entries back out as a CSV holding dates and figures
-# and nothing else. Both directions live here so the round trip is one file's
-# problem: the export writes the format the import is surest of, and a test
-# holds the two to it.
+# Writing, it renders entries as a CSV of dates and figures and nothing else,
+# in the format the import is surest of.
 #
-# The parsing is deliberately forgiving about format and strict about meaning:
-# it will read '01/05/24', 'Jan 5, 2024' and '2024-01-05 00:00:00' as the same
-# day, but a row it is unsure of is reported, not invented — history drives the
-# account's current balance, so a fabricated entry does not just sit there
-# looking wrong, it changes what the account says it holds.
-#
-# One date is completed rather than read, and only because it is unambiguous
-# about what it means and silent only about precision: 'YYYY-MM' is filed on
-# the 1st of that month. A bare year, 'Jan 2024' and '01/2024' are all still
-# refused — the first cannot name a month at all, and the other two would have
-# to be read as a month before the same rule could apply to them.
+# Forgiving about format, strict about meaning: '01/05/24', 'Jan 5, 2024' and
+# '2024-01-05 00:00:00' are the same day, but a row it is unsure of is reported,
+# not invented — history drives the account's current balance. The one date
+# completed rather than read is 'YYYY-MM', filed on the 1st.
 # -----------------------------------------------------------------------------
 
 import csv
@@ -33,7 +22,7 @@ import io
 import re
 from collections import Counter
 
-from categories import DEFAULT_VALUE_NOUN, parse_money, trim_number
+from core.categories import DEFAULT_VALUE_NOUN, parse_money, trim_number
 from services import export_io
 from services.export_io import defuse
 
@@ -200,13 +189,9 @@ def parse_amount(value) -> float | None:
         negative, text = True, text[:-1].strip()
 
     # '1200,00' is a decimal comma, not a thousands separator: no amount
-    # written the US way ever groups two digits. Without this parse_money
-    # strips the comma and the figure silently arrives a hundred times too big.
-    #
-    # Tested against the figure with its currency symbol and spacing removed,
-    # not against the raw text. Matching the raw text meant '1200,00' was
-    # caught but '€1200,00' — which is how the statements that write a decimal
-    # comma actually spell it — was not, and went through as 120000.
+    # written the US way groups two digits, and parse_money would strip the
+    # comma and read a figure a hundred times too big. Tested with the currency
+    # symbol removed, so '€1200,00' is caught too.
     bare = _MONEY_STRIP_FOR_COMMA.sub('', text)
     if _DECIMAL_COMMA.fullmatch(bare):
         text = bare.replace(',', '.')
@@ -272,16 +257,11 @@ def _noun_words(noun: str) -> tuple[str, ...]:
 def _is_header(fields: list[str]) -> bool:
     """Whether a first row is naming the columns rather than holding data.
 
-    A row with a date in it is data, always. Without one it used to be taken as
-    a header unconditionally — which silently swallowed a real row whose date
-    this module could not read, dropping it with no entry in `skipped` and no
-    reason shown, in a module whose whole contract is that a row it is unsure
-    of is reported rather than invented.
-
-    So a dateless row is a header only if it also looks like one: either it
-    carries no readable amount (nothing of value to lose) or one of its cells
-    names a column. 'Opening Balance, 1200.00' is data with an unreadable
-    date; 'Statement Date, Balance' is a header."""
+    A row with a date in it is data, always. A dateless row is a header only if
+    it also looks like one — no readable amount, or a cell naming a column — so
+    a real row with an unreadable date is reported as skipped rather than
+    silently swallowed. 'Opening Balance, 1200.00' is data; 'Statement Date,
+    Balance' is a header."""
     if any(parse_date(field) for field in fields):
         return False
     if not any(parse_amount(field) is not None for field in fields):
@@ -549,12 +529,7 @@ def skipped_summary(result: dict) -> str:
 
 
 def read_file(path) -> str:
-    """The text of a chosen history file.
-
-    The reading itself — the size cap and the encoding fallback — is
-    export_io.read_text, shared with the account importer, which needs exactly
-    the same thing and used to carry a second copy of it. The error type stays
-    this module's, because every caller here catches it by name."""
+    """The text of a chosen history file. See export_io.read_text."""
     try:
         return export_io.read_text(path, MAX_FILE_BYTES, 'balance history')
     except export_io.PlaintextReadError as exc:

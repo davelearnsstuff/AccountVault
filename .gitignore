@@ -4,7 +4,7 @@ data/
 # Vaults and backups. A .vault is now the live vault itself as well as every
 # copy of one, so this line carries more than it used to: encrypted, but it is
 # the whole database and it is not something to push anywhere.
-#*.vault
+*.vault
 backups/
 
 # Anything the app exports. A CSV is not encrypted at all, which makes it the
@@ -28,6 +28,13 @@ env/
 
 # Sidecar (agent memory, plans, thinking)
 .sidecar/
+
+# Per-machine Claude Code permissions. They name local paths and grant
+# prompt-free commands, so they are nobody else's to inherit.
+.claude/settings.local.json
+
+# Windows shortcuts hold absolute paths to one machine.
+*.lnk
 
 # assets/make_icon.py drops the 256px frame as a PNG beside the .ico every run,
 # for anything that wants one. The .ico is the artifact the app ships and is

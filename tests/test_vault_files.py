@@ -13,9 +13,9 @@ import sqlite3
 
 import pytest
 
-import auth
-import database
-import vaultfile
+from core import auth
+from core import database
+from core import vaultfile
 from conftest import MASTER, make_account
 
 
@@ -388,6 +388,31 @@ def test_the_placeholder_row_cannot_be_opened_as_a_vault(chooser):
     chooser._activate(chooser.recent.item(0))
 
     assert opened == []
+
+
+def test_the_clear_button_shows_only_when_there_is_something_to_clear(chooser, tmp_path):
+    chooser.reset()
+    assert chooser.clear_button.isHidden()
+
+    vaultfile.remember(tmp_path / 'a.vault')
+    chooser.reset()
+    assert not chooser.clear_button.isHidden()
+
+    # Off leaves the placeholder row up, and nothing behind it to clear.
+    vaultfile.set_remembering(False)
+    chooser.reset()
+    assert chooser.clear_button.isHidden()
+
+
+def test_the_clear_button_asks_for_what_the_menu_item_does(chooser, tmp_path):
+    vaultfile.remember(tmp_path / 'a.vault')
+    chooser.reset()
+
+    cleared = []
+    chooser.clear_requested.connect(lambda: cleared.append(True))
+    chooser.clear_button.click()
+
+    assert cleared == [True]
 
 
 def _remember_action(chooser, point=None):

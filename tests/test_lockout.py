@@ -13,8 +13,8 @@ import time
 
 import pytest
 
-import auth
-import database
+from core import auth
+from core import database
 from conftest import MASTER
 
 WRONG = 'not the master password at all'

@@ -1,47 +1,47 @@
 # -----------------------------------------------------------------------------
-# vaultfile.py
+# core/vaultfile.py
 # Which vault the app opens, and the ones it has opened before.
 #
-# This is the only piece of AccountVault state that does not live inside a
-# vault, and it cannot: reading it is how the app answers "which vault?", which
-# is a question asked before any vault is open. So it sits beside them instead,
-# in the per-user application data directory.
+# The only AccountVault state that does not live inside a vault — it answers
+# "which vault?" before any vault is open — so it sits in the per-user
+# application data directory.
 #
 # Everything here is advisory. A registry that is absent, truncated, or full of
-# nonsense has to leave the app at the chooser screen — never stop it starting,
-# and never send it somewhere it should not write. Nothing in this file raises
-# on bad input; it returns the empty answer and lets the user pick.
+# nonsense leaves the app at the chooser screen; nothing in this file raises on
+# bad input.
 #
-# What it stores is metadata in the clear: the paths, and nothing else. A vault
-# called `divorce-accounts.vault` says something to anyone who reads this file,
-# which is why there is a way to turn the list off and a way to clear it, and
-# why no count, size or summary of a vault's contents is ever recorded here.
+# It stores paths in the clear and nothing else. A vault called
+# `divorce-accounts.vault` says something to anyone who reads the file, which is
+# why the list can be turned off and cleared.
 # -----------------------------------------------------------------------------
 
 import json
 import os
+import threading
+import time
 from pathlib import Path
 
-import database
-from database import VAULT_SUFFIX
+from core import database
+from core.database import VAULT_SUFFIX
 
-# How many vaults the list remembers. Small on purpose: this is a way back to
-# the two or three vaults somebody actually uses, not a history of everything
-# they have ever opened.
+# How many vaults the list remembers.
 MAX_RECENT = 8
 
 _REGISTRY_NAME = 'vaults.json'
 _VERSION = 1
 
-# Set to point the app at one vault and keep it there. Ahead of everything
-# below, because it is how a second profile is kept deliberately apart and how
-# the test suite and the tooling stay off the real vault.
+# Set to point the app at one vault and keep it there — a separate profile, or
+# the tests and tooling staying off the real vault.
 ENV_OVERRIDE = 'ACCOUNTVAULT_DB'
+
+# How long a status check may take before the vault is reported unavailable. A
+# path on an unreachable share otherwise blocks for as long as the network takes
+# to give up, with the window frozen.
+PROBE_SECONDS = 3.0
 
 
 def registry_path() -> Path:
-    # Through the module rather than a name bound at import, so that
-    # redirecting the application data directory redirects this too.
+    # Through the module, so redirecting the data directory redirects this too.
     return database.app_data_dir() / _REGISTRY_NAME
 
 
@@ -50,11 +50,8 @@ def registry_path() -> Path:
 # -----------------------------------------------------------------------------
 
 def _read() -> dict:
-    """The stored registry, or an empty one.
-
-    Every failure lands on the same answer. A registry that will not parse is
-    not worth a message: the chooser screen it falls back to is the same screen
-    a first-ever launch sees, and it is already the right thing to show."""
+    """The stored registry, or an empty one. Every failure lands on the same
+    answer: the chooser screen a first launch sees."""
     try:
         with open(registry_path(), 'r', encoding='utf-8') as handle:
             data = json.load(handle)
@@ -64,16 +61,12 @@ def _read() -> dict:
 
 
 def _write(data: dict) -> bool:
-    """Stores the registry, owner-only. False if it could not be written.
-
-    Best effort by design — a read-only profile or a full disk costs the user
-    their recent list, which is a convenience, and must not cost them a launch.
-    """
+    """Stores the registry, owner-only. False if it could not be written — a
+    read-only profile costs the recent list, never a launch."""
     path = registry_path()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        # Created restricted rather than restricted afterwards, so the list of
-        # where somebody keeps their vaults is never briefly world-readable.
+        # Created restricted rather than restricted afterwards.
         fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
         with os.fdopen(fd, 'w', encoding='utf-8') as handle:
             json.dump(data, handle, indent=2)
@@ -88,11 +81,8 @@ def _write(data: dict) -> bool:
 # -----------------------------------------------------------------------------
 
 def normalize(path) -> Path:
-    """The absolute path, with the symlinks and the '..' taken out.
-
-    strict=False throughout: a vault on an unplugged drive still has to
-    normalize to the same thing it did when it was there, or unplugging the
-    drive would silently add a second entry for the same vault."""
+    """The absolute path, with symlinks and '..' taken out. strict=False, so a
+    vault on an unplugged drive normalizes the same as when it was there."""
     try:
         return Path(path).expanduser().resolve(strict=False)
     except OSError:
@@ -100,11 +90,8 @@ def normalize(path) -> Path:
 
 
 def _key(path) -> str:
-    """What makes two paths the same vault.
-
-    Case-folded, because Windows treats `Vault.vault` and `vault.VAULT` as one
-    file and a list that disagreed would show the same vault twice — once for
-    each way the user happened to have typed it."""
+    """What makes two paths the same vault. Case-folded on Windows, which treats
+    `Vault.vault` and `vault.VAULT` as one file."""
     return os.path.normcase(str(normalize(path)))
 
 
@@ -112,16 +99,40 @@ def same_file(first, second) -> bool:
     return _key(first) == _key(second)
 
 
+def probe(path, timeout: float = PROBE_SECONDS) -> str:
+    """database.inspect_vault, giving up after `timeout` seconds with
+    'unavailable'. See probe_all."""
+    return probe_all([path], timeout)[0]
+
+
+def probe_all(paths, timeout: float = PROBE_SECONDS) -> list:
+    """inspect_vault for each path, concurrently, within one shared deadline.
+
+    Each check runs on a daemon thread: one stuck on a dead share is abandoned
+    rather than joined, and cannot hold up the app exiting."""
+    paths = list(paths)
+    results = [None] * len(paths)
+
+    def check(index, path):
+        results[index] = database.inspect_vault(path)
+
+    workers = [threading.Thread(target=check, args=(index, path), daemon=True)
+               for index, path in enumerate(paths)]
+    for worker in workers:
+        worker.start()
+    deadline = time.monotonic() + timeout
+    for worker in workers:
+        worker.join(max(0.0, deadline - time.monotonic()))
+    return [status or 'unavailable' for status in results]
+
+
 # -----------------------------------------------------------------------------
 # The recent list
 # -----------------------------------------------------------------------------
 
 def recent() -> list:
-    """The vaults most recently opened, newest first.
-
-    Paths only, exactly as recorded. Whether each one is still there is
-    database.inspect_vault's question, asked at the moment the list is drawn
-    rather than cached here — a drive gets unplugged between launches."""
+    """The vaults most recently opened, newest first. Paths only; whether each
+    is still there is asked when the list is drawn."""
     if not remembering():
         return []
     stored = _read().get('recent')
@@ -141,12 +152,8 @@ def recent() -> list:
 
 
 def remember(path) -> bool:
-    """Moves a vault to the front of the list, adding it if it is new.
-
-    Called once a vault has actually opened, never when one is merely picked: a
-    file the user chose and then failed to unlock has not earned the top of the
-    list, and one that turned out not to be a vault at all does not belong on it
-    at any position."""
+    """Moves a vault to the front of the list, adding it if it is new. Called
+    once a vault has actually opened, never when one is merely picked."""
     if not remembering():
         return False
     path = normalize(path)
@@ -168,21 +175,14 @@ def clear() -> bool:
 
 
 def remembering() -> bool:
-    """Whether the recent list is being kept at all.
-
-    Off is a real setting rather than a synonym for "empty": somebody sharing a
-    machine can want the app to stop writing down where their vault is without
-    also wanting to answer the question again every launch — which is why
-    turning it off clears the list rather than just hiding it."""
+    """Whether the recent list is being kept at all."""
     return _read().get('remember_recent', True) is not False
 
 
 def set_remembering(enabled: bool) -> bool:
-    """Turns the recent list on or off, clearing it on the way out.
-
-    Clearing on disable is the point of the switch. Leaving the stored paths in
-    place and merely declining to show them would keep the file that names them
-    on disk, which is the thing somebody turning this off is trying to avoid."""
+    """Turns the recent list on or off. Turning it off clears the stored paths,
+    which is the point: someone switching it off wants the file that names their
+    vault gone, not hidden."""
     data = {**_read(), 'version': _VERSION, 'remember_recent': bool(enabled)}
     if not enabled:
         data['recent'] = []
@@ -197,16 +197,13 @@ def startup_path(argv_path=None):
     """The vault to open on launch, or None to ask.
 
     In order: a path on the command line, the environment override, the vault
-    opened last, and then the two places vaults lived before anybody got to
-    choose. The legacy pair are adopted without asking and without a message —
-    nobody should have to go and find their own vault because the app changed
-    how it stores the location.
+    opened last, then the two places vaults lived before anybody got to choose
+    (adopted silently).
 
-    Returns a path that exists. A recorded vault whose file has since moved
-    deliberately does *not* fall through to the next candidate: the user is told
-    it is missing and offered the chooser, because silently opening a different
-    vault instead is how somebody concludes their data is gone.
-    """
+    The first three are returned whether or not the file is still there: a
+    recorded vault that has moved is reported as missing rather than silently
+    replaced by a different vault. The legacy locations are only returned if
+    they hold a vault."""
     if argv_path:
         return Path(argv_path).expanduser()
 
@@ -232,11 +229,8 @@ def suggested_name() -> str:
 
 
 def describe(status: str, path) -> str:
-    """A sentence for a status database.inspect_vault returned.
-
-    Written to say what to do next rather than what went wrong — every one of
-    these is read by somebody looking at a file picker, deciding whether to try
-    again or pick something else."""
+    """A sentence for a status inspect_vault returned, worded to say what to do
+    next."""
     name = Path(path).name
     return {
         'missing': f"{name} is no longer at that location. It may have been "

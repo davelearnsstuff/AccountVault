@@ -4,6 +4,8 @@
 #
 #   python tools/make_demo_vault.py [path]
 #
+# The vault chooser's Create Demo Vault… button runs the same build_vault.
+#
 # Everything in it is fictional and deliberately recognisable as such: it is a
 # middle-aged Springfield household, one main income, a mortgage most of the way
 # through its life, two car loans, credit-card balances coming down, retirement
@@ -13,15 +15,19 @@
 #
 # What it exercises, on purpose:
 #
-#   * all eight built-in categories, with at least six accounts in each
+#   * all nine built-in categories, with at least six accounts in each but
+#     Property, which holds the house and the two cars the loans are against
 #   * 31 months of balance history per money account, so the net-worth trend,
-#     the per-category sparklines and the month-over-month figure all have a
-#     run of readings behind them rather than two points
+#     the per-category sparklines and every dashboard range, 2Y included, have
+#     a run of readings behind them rather than two points
 #   * the four due-date cycles, including bills due this week and one one-off
 #     that lapsed months ago
 #   * accounts that have gone stale at four different rates, so Needs Attention
 #     is populated for both of its reasons
 #   * pinned accounts, closed accounts, and a category the app does not ship
+#   * every contribution period, one amount left without a period, and two
+#     accounts nobody pays into, so the dashboard's investing section shows
+#     every kind of row it has
 #
 # It is a tool, not a fixture: the tests build their own vaults and never touch
 # this. Re-running it against an existing path refuses rather than overwrites,
@@ -40,17 +46,20 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import auth                                       # noqa: E402
-import database                                   # noqa: E402
-from categories import trim_number                # noqa: E402
+from core import auth                                       # noqa: E402
+from core import database                                   # noqa: E402
+from core.categories import trim_number                # noqa: E402
 from services import accounts as accounts_service  # noqa: E402
 
 PASSWORD = 'EatMyShorts123!@#'
-DEFAULT_PATH = Path(__file__).resolve().parent.parent / 'demo' / 'springfield.vault'
+# Relative, so a run with no path writes to the current directory. The vault
+# chooser's button only takes the name from it, as the suggestion in its dialog.
+DEFAULT_PATH = Path('springfield.vault')
 
 # The history window. 31 monthly readings ending in the current month, which is
-# long enough for the trend chart to have a shape and short enough that the
-# x-axis labels stay readable.
+# long enough for the trend chart to have a shape, more than the 25 the 2Y range
+# shows so that All still shows more, and short enough that the x-axis labels
+# stay readable.
 MONTHS = 31
 
 # Fixed so two runs produce the same vault. The wobble this drives is cosmetic —
@@ -392,7 +401,8 @@ def build() -> list[tuple[dict, object]]:
     # -- Investments ----------------------------------------------------------
     add('Investments', {'start': 52000, 'end': 71400, 'shape': 'vol', 'day': 28},
         name='Nuclear Plant 401(k)', institution='Springfield Nuclear Power Plant',
-        account_number='401K-7G-0042', account_type='401k', contribution_amount='310',
+        account_number='401K-7G-0042', account_type='401k', contribution_amount='102',
+        contribution_period='Every 2 Weeks',
         username='hjs.employee', password='Sector-7G-R3tirement!',
         website='https://sncplan.example.com',
         notes='6% with a 3% match. Vested. The single biggest thing they own.',
@@ -401,6 +411,7 @@ def build() -> list[tuple[dict, object]]:
     add('Investments', {'start': 16500, 'end': 24800, 'shape': 'vol', 'day': 27},
         name="Marge's Roth IRA", institution='Springfield Mutual',
         account_number='IRA-558820', account_type='Roth IRA', contribution_amount='200',
+        contribution_period='Monthly',
         username='marge.b.simpson', password='Roth-IRA-Bouff4nt-2020!',
         website='https://springfieldmutual.example.com',
         notes='Opened with pretzel-wagon money. Contributed to every month since.')
@@ -408,6 +419,7 @@ def build() -> list[tuple[dict, object]]:
     add('Investments', {'start': 8200, 'end': 15600, 'shape': 'vol', 'day': 25},
         name="Lisa's 529 College Savings", institution='Springfield Education Trust',
         account_number='529-LMS-0008', account_type='Other', contribution_amount='150',
+        contribution_period='Monthly',
         username='marge.b.simpson', password='529-Saxoph0ne-Scholar!',
         website='https://springfieldedtrust.example.com',
         notes='Target is an out-of-state private university. Current pace: not that.')
@@ -422,7 +434,8 @@ def build() -> list[tuple[dict, object]]:
 
     add('Investments', {'start': 5800, 'end': 9400, 'shape': 'vol', 'wobble': 0.05, 'day': 14},
         name='Springfield Mutual Brokerage', institution='Springfield Mutual',
-        account_number='BRK-441002', account_type='Brokerage', contribution_amount='100',
+        account_number='BRK-441002', account_type='Brokerage', contribution_amount='25',
+        contribution_period='Weekly',
         username='homer.j.simpson', password='Br0kerage-Hold-The-Line!',
         website='https://springfieldmutual.example.com',
         notes='Taxable account. Three funds and one very bad stock tip from Lenny.')
@@ -447,10 +460,37 @@ def build() -> list[tuple[dict, object]]:
 
     add('Investments', {'start': 12000, 'end': 19200, 'shape': 'vol', 'day': 29},
         name='Springfield Index Fund', institution='Springfield Mutual',
-        account_number='IDX-770033', account_type='IRA', contribution_amount='125',
+        account_number='IDX-770033', account_type='IRA', contribution_amount='1500',
+        contribution_period='Yearly',
         username='marge.b.simpson', password='Index-Fund-Bor1ng-Good!',
         website='https://springfieldmutual.example.com',
         notes="Marge's idea. Quietly the best-performing thing in the house.")
+
+    # -- Property -------------------------------------------------------------
+    # Revalued a few times a year rather than monthly, as a house or a car is.
+    # Each sits against its loan, so net worth counts the asset as well as the
+    # debt on it.
+    add('Property', flat_series(None, [
+            ('268000', behind(905)), ('272500', behind(720)), ('276000', behind(540)),
+            ('281000', behind(360)), ('285500', behind(180)), ('289500', behind(25))]),
+        name='742 Evergreen Terrace', property_type='Home',
+        username='homer.j.simpson', password='Mmm-Pr0perty-T4xes!',
+        website='https://springfieldassessor.example.com',
+        notes="The county's figure. It has not noticed the treehouse.", favorite=True)
+
+    add('Property', flat_series(None, [
+            ('9400', behind(900)), ('8400', behind(545)), ('7300', behind(180)),
+            ('7000', behind(30))]),
+        name='Pink Sedan', property_type='Vehicle',
+        username='marge.b.simpson', password='Pink-S3dan-Bluebook!',
+        website='https://springfielddmv.example.com',
+        notes='Worth more to this family than to any dealer in town.')
+
+    add('Property', flat_series(None, [
+            ('27500', behind(900)), ('24300', behind(545)), ('21200', behind(180)),
+            ('19800', behind(35))]),
+        name='Canyonero', property_type='Vehicle',
+        notes='Twelve yards long, two lanes wide. Depreciating at about the same scale.')
 
     # -- Income ---------------------------------------------------------------
     add('Income', flat_series(None, [
@@ -757,13 +797,23 @@ def _backdate(account_id: int, last_updated: str, date_added: str):
     accounts_service.invalidate_cache()
 
 
-def main() -> int:
-    path = Path(sys.argv[1]).expanduser() if len(sys.argv) > 1 else DEFAULT_PATH
-    if path.suffix != database.VAULT_SUFFIX:
-        path = path.with_suffix(database.VAULT_SUFFIX)
+def build_vault(path) -> dict:
+    """Builds the demo vault at `path` and leaves it open and unlocked, as
+    creating a vault does. Returns how many accounts went into each category,
+    and how many of them are pinned and closed.
+
+    Raises FileExistsError for a path already in use. The check is here rather
+    than in either caller, so the script and the app's button both keep it.
+    """
+    global TODAY
+    # Re-read on every build, not trusted from import time: the app imports
+    # this once and may still be running tomorrow, and a vault built a day out
+    # of step has every due date and stale account one day off.
+    TODAY = datetime.date.today()
+
+    path = Path(path)
     if path.exists():
-        print(f'{path} already exists. Delete it first, or name another file.')
-        return 1
+        raise FileExistsError(f'{path} already exists. Delete it first, or name another file.')
 
     path.parent.mkdir(parents=True, exist_ok=True)
     database.open_vault(path, create=True)
@@ -806,12 +856,26 @@ def main() -> int:
     if closed:
         accounts_service.set_closed(closed, True)
 
+    return {'categories': counts, 'pinned': len(pinned), 'closed': len(closed)}
+
+
+def main() -> int:
+    path = Path(sys.argv[1]).expanduser() if len(sys.argv) > 1 else DEFAULT_PATH
+    if path.suffix != database.VAULT_SUFFIX:
+        path = path.with_suffix(database.VAULT_SUFFIX)
+    try:
+        summary = build_vault(path)
+    except FileExistsError as exc:
+        print(exc)
+        return 1
+
+    counts = summary['categories']
     print(f'\nWrote {path}')
     print(f'Master password: {PASSWORD}\n')
     for category, count in sorted(counts.items()):
         print(f'  {category:<16} {count}')
-    print(f'\n  {"pinned":<16} {len(pinned)}')
-    print(f'  {"closed":<16} {len(closed)}')
+    print(f'\n  {"pinned":<16} {summary["pinned"]}')
+    print(f'  {"closed":<16} {summary["closed"]}')
     print(f'  {"total":<16} {sum(counts.values())}')
     return 0
 

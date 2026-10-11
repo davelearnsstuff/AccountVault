@@ -20,8 +20,8 @@ import datetime
 import io
 import re
 
-from categories import DEFAULT_VALUE_NOUN, account_category, get_config
-from encryption import is_unreadable
+from core.categories import DEFAULT_VALUE_NOUN, account_category, get_config
+from core.encryption import is_unreadable
 from services import history_io
 from services.export_io import INTERNAL_KEYS, defuse
 
@@ -29,25 +29,13 @@ SCOPE_ALL = 'all'
 SCOPE_ACCOUNT = 'account'
 SCOPE_HISTORY = 'history'
 
-# Fields never written from the schema or the record's own keys.
-#
-# The floor — id, date_added, _category, _match — is export_io.INTERNAL_KEYS,
-# shared with the whole-vault CSV export so that a new piece of bookkeeping
-# cannot be excluded from one file and leak from the other.
-#
-# 'category' and 'closed' are added on top because they *are* written, just not
-# from this loop: account_rows adds them by name, at the top and bottom of the file
-# respectively, so listing them here is what stops a second copy appearing in
-# the middle. Nothing in CATEGORY_CONFIG declares either as a field today, so
-# the guard in account_rows is currently unreachable — it is kept because it is
-# the enforcement point, and a schema gaining a 'date_added' field should not
-# be what decides whether one gets exported.
+# Fields never written from the schema or the record's own keys: the keys no
+# export writes, plus 'category' and 'closed', which account_rows writes by name
+# at the top and bottom of the file.
 _INTERNAL = INTERNAL_KEYS | {'category', 'closed'}
 
-# Anything a filesystem would reject or read as a path. Applied to the account
-# name before it goes in a filename — this is a suggestion the save dialog shows,
-# not a path the app writes to blind, but a name holding a slash should not be
-# able to propose a directory.
+# Anything a filesystem would reject or read as a path, stripped from the
+# account name before it is suggested as a filename.
 _UNSAFE_NAME = re.compile(r'[^\w \-.]+')
 
 

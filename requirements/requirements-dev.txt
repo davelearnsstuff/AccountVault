@@ -1,9 +1,9 @@
 # Development only — not needed to run AccountVault.
 #
-# Kept out of requirements.txt deliberately: start.bat prints that file when it
-# offers to install, and someone who just wants to open their vault should not
-# be asked to install a test runner. Dependabot's pip ecosystem watches this
-# directory, so it picks this file up alongside requirements.txt.
+# Kept out of requirements.txt deliberately: AccountVault_Windows.bat prints
+# that file when it offers to install, and someone who just wants to open their
+# vault should not be asked to install a test runner. Dependabot's pip ecosystem
+# watches this directory, so it picks this file up alongside requirements.txt.
 #
 #   python -m pip install --require-hashes -r requirements.lock -r requirements-dev.lock
 #   python -m pytest tests/

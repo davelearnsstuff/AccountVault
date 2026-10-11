@@ -1,84 +1,86 @@
 # -----------------------------------------------------------------------------
 # ui/dashboard_view.py
-# Net worth over time plus a per-category trend card grid.
+# The current balance sheet, net worth over time, a trend card per category,
+# and investing against income.
 # -----------------------------------------------------------------------------
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QEvent, Qt, Signal
+from PySide6.QtGui import QAction, QBrush, QColor, QGuiApplication, QIcon, QKeySequence
 from PySide6.QtWidgets import (
-    QButtonGroup, QFrame, QGridLayout, QHBoxLayout, QLabel, QPushButton,
-    QScrollArea, QSizePolicy, QVBoxLayout, QWidget,
+    QApplication, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel,
+    QPushButton, QScrollArea, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
-from categories import format_money, normalize_category
-from encryption import VaultLockedError
+from core.categories import format_money, normalize_category
+from core.encryption import VaultLockedError
 from services import dashboard as dashboard_service
 from services.dashboard import (
-    LIABILITY_CATEGORIES, composition, latest_value, month_over_month, side_totals,
+    LIABILITY_CATEGORIES, balance_sheet, change_across, composition, latest_value,
+    trailing_window,
+)
+from ui.ranges import (
+    DEFAULT_RANGE, basis_text, change_label, month_name, range_buttons,
 )
 from ui.theme import category_color, palette
 from ui.widgets import (
-    CategoryDot, CompositionBar, FlowLayout, build_series_chart, clear_layout,
+    build_series_chart, clear_layout, dot_pixmap, plain_label, plain_text, selectable,
 )
 
 _CARD_COLUMNS = 2
 
-# How much history each range button shows, in months. None means everything
-# recorded. Trailing windows rather than calendar years: "the last 6 months" is
-# what someone checking a trend actually means.
-RANGES = [('6M', 6), ('1Y', 12), ('All', None)]
-# The range a fresh dashboard opens on, named out of RANGES rather than
-# restated as a literal beside it.
-DEFAULT_RANGE = dict(RANGES)['1Y']
+_NET_WORTH = 'Net Worth'
+_BALANCES = 'Current Assets & Liabilities'
+_TRENDS = 'Trends'
+_INVESTING = 'Investing vs. Income'
 
+# Figures in the dashboard's tables, as in the balance history table.
+_FIGURE_ALIGN = Qt.AlignRight | Qt.AlignVCenter
 
-# Past this multiple the percentage stops informing and starts distracting.
-# A month where an account is first recorded, or one that starts near zero,
-# produces perfectly correct figures like "2846.0%" that tell the reader nothing
-# they did not already get from the amount beside it. The change itself is
-# always shown; only the ratio is dropped.
-_ABSURD_FRACTION = 10.0
+# How far an account sits in from the category it is listed under. Spaces, as
+# a table item has no indent of its own; copying strips them.
+_ACCOUNT_INDENT = ' ' * 6
 
+# The disclosure arrow on a category row, by whether its accounts are showing.
+_EXPANDED, _COLLAPSED = '\u25be', '\u25b8'
+# The arrow column: room for the arrow and no more, so the names stay close to
+# the left edge.
+_GUTTER_WIDTH = 26
 
-def _delta_text(change: float, fraction: float | None) -> str:
-    arrow = '▲' if change > 0 else '▼' if change < 0 else '■'
-    if fraction is None or abs(fraction) > _ABSURD_FRACTION:
-        percent = ''
-    else:
-        percent = f" ({abs(fraction) * 100:.1f}%)"
-    return f"{arrow} {format_money(abs(change))}{percent} vs last month"
+def _basis_text(range_months: int | None, month_keys: list, start: int) -> str:
+    """What a change line is measured from, given the window's month keys and
+    the index of its first reading. The window covers the whole range when it
+    holds every month of it and its first month has a reading."""
+    full = (range_months is not None and start == 0
+            and len(month_keys) == range_months + 1)
+    return basis_text(range_months, full, month_name(month_keys[start]))
 
 
 def _share_text(share: float) -> str:
-    """A share as a percentage, never rounded down to a bare '0%'.
-
-    A category can be a genuinely tiny fraction of its side — a credit-card
-    balance against a mortgage is routinely well under one percent — and '0%'
-    printed beside a real amount reads as a broken figure rather than as
-    'very small'."""
+    """A share as a percentage, never rounded down to a bare '0%', which beside
+    a real amount reads as a broken figure."""
     percent = share * 100
     if 0 < percent < 0.5:
         return '<1%'
     return f"{percent:.0f}%"
 
 
-def _delta_object_name(change: float, higher_is_better: bool) -> str:
-    """Which way to colour a change.
+def _rate_text(fraction: float) -> str:
+    """A share of income, to one decimal place: whole percents are too coarse
+    for a savings rate, where 9.3% and 9.7% are different decisions. Never a
+    bare '0.0%' beside a real amount, for the reason _share_text gives."""
+    percent = fraction * 100
+    if 0 < percent < 0.05:
+        return '<0.1%'
+    return f"{percent:.1f}%"
 
-    Up is not good news everywhere: a credit-card balance climbing is the same
-    arrow as savings climbing and the opposite outcome, so liabilities invert.
-    A flat month is neither."""
-    if not change:
-        return 'DeltaFlat'
-    good = (change > 0) if higher_is_better else (change < 0)
-    return 'DeltaGood' if good else 'DeltaBad'
+
+def _per_period_text(amount: float, period: str | None) -> str:
+    """'$100 every 2 weeks'. The amount alone when no period is set."""
+    return f"{format_money(amount)} {period.lower()}" if period else format_money(amount)
 
 
 class _Card(QFrame):
-    """A dashboard card. Clickable ones carry the category they stand for.
-
-    The category cards are the natural way into a category — you notice
-    something on the dashboard and the next thing you want is the accounts
-    behind it — and before this the only route was back up to the tab bar."""
+    """A dashboard card. A category card is clickable and opens that category."""
 
     def __init__(self, category: str | None = None, parent=None):
         super().__init__(parent)
@@ -89,8 +91,24 @@ class _Card(QFrame):
             self.setCursor(Qt.PointingHandCursor)
 
     def on_activate(self, callback):
+        """Makes the card open its category when clicked. Call once its
+        content is in place."""
         self._activate = callback
-        self.setToolTip(f"Show the {self._category} accounts")
+        self.setToolTip(plain_text(f"Show the {self._category} accounts"))
+        # Its text is selectable, and a label taking the mouse for that keeps
+        # the click from ever reaching the card. So the card watches its
+        # labels: a release that selected nothing was a click. The hand stays
+        # over the text, since a click there still opens the category.
+        for label in self.findChildren(QLabel):
+            label.installEventFilter(self)
+            label.setCursor(Qt.PointingHandCursor)
+
+    def eventFilter(self, obj, event):
+        if (event.type() == QEvent.MouseButtonRelease and self._activate
+                and event.button() == Qt.LeftButton and not obj.hasSelectedText()
+                and obj.rect().contains(event.position().toPoint())):
+            self._activate(self._category)
+        return super().eventFilter(obj, event)
 
     def mouseReleaseEvent(self, event):
         # On release, not press: a press-triggered navigation fires under a
@@ -101,69 +119,178 @@ class _Card(QFrame):
         super().mouseReleaseEvent(event)
 
 
+def _cell(text: str, *, figure: bool = False, color: str | None = None) -> QTableWidgetItem:
+    """A table cell. Figures sit right-aligned, header and all, so the cents
+    line up down a column. A table item never reads its text as HTML, so vault
+    content is safe in one as it is."""
+    item = QTableWidgetItem(text)
+    if figure:
+        item.setTextAlignment(_FIGURE_ALIGN)
+    if color:
+        item.setForeground(QBrush(QColor(color)))
+    return item
+
+
+def _fit(table: QTableWidget):
+    """Sizes a table to exactly its contents, so it sits inline in the page
+    rather than scrolling or stretching."""
+    frame = 2 * table.frameWidth()
+    header = table.horizontalHeader()
+    table.setFixedWidth(header.length() + frame)
+    # A hidden header still reports the height it would have.
+    table.setFixedHeight(table.verticalHeader().length()
+                         + (0 if header.isHidden() else header.height()) + frame)
+
+
+def _gutter() -> QTableWidgetItem:
+    """A cell of the arrow column. Not selectable, so a copy never carries an
+    arrow, or an empty cell where one would be, into a spreadsheet."""
+    item = QTableWidgetItem()
+    item.setTextAlignment(Qt.AlignCenter)
+    item.setFlags(Qt.ItemIsEnabled)
+    # The arrows are small glyphs at text size; this makes them a target.
+    font = item.font()
+    font.setPointSizeF(font.pointSizeF() * 1.4)
+    item.setFont(font)
+    return item
+
+
+def _note(text: str) -> QLabel:
+    label = selectable(plain_label(text))
+    label.setObjectName('Subtle')
+    return label
+
+
+def _copy_cells(table: QTableWidget):
+    """The selected cells as tab-separated rows, so they paste into a
+    spreadsheet as cells. A gap in the selection is copied as an empty cell,
+    keeping the rest in their columns. Plain text, like any text selected by
+    hand: these are figures, not secrets, so nothing clears it later."""
+    indexes = table.selectedIndexes()
+    if not indexes:
+        return
+    rows = sorted({index.row() for index in indexes})
+    columns = sorted({index.column() for index in indexes})
+    chosen = {(index.row(), index.column()) for index in indexes}
+    lines = []
+    for row in rows:
+        cells = []
+        for column in columns:
+            item = table.item(row, column)
+            cells.append(item.text().strip() if item and (row, column) in chosen else '')
+        lines.append('\t'.join(cells))
+    QGuiApplication.clipboard().setText('\n'.join(lines))
+
+
 class DashboardView(QWidget):
     """Rebuilt from scratch each time it is shown, so it always reflects the
     current balance history."""
 
     category_activated = Signal(str)
+    # (account id, category), from a name in the investing section.
+    account_activated = Signal(int, str)
 
     def __init__(self, theme: str, parent=None):
         super().__init__(parent)
         self._theme = theme
         self._range_months = DEFAULT_RANGE
+        # Rebuilds each section the range applies to, from the summary in hand.
+        self._redraws = []
         self._data = None
+        self._investing = None
+        # Each section on the page now, by heading, for the jump links.
+        self._sections = {}
+        # The categories whose accounts the balance tables are showing. Kept
+        # across reloads, so saving an account does not fold them all back up.
+        self._expanded = set()
 
         self._content = QWidget()
         self._body = QVBoxLayout(self._content)
         self._body.setContentsMargins(18, 16, 18, 16)
         self._body.setSpacing(16)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(self._content)
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setWidget(self._content)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(scroll)
+        layout.addWidget(self._scroll)
 
-    # -- range ------------------------------------------------------------
+        # Owned here, shown by whoever frames the view: in the panel's title
+        # bar, outside the scroll area, they stay in reach from anywhere on
+        # the page.
+        self._links = {}
+        self.section_links = self._build_section_links()
 
-    def _build_range_row(self) -> QWidget:
+    # -- jump links ---------------------------------------------------------
+
+    def _build_section_links(self) -> QWidget:
         row = QWidget()
         layout = QHBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(6)
-
-        heading = QLabel('Showing')
-        heading.setObjectName('SectionHeading')
-        layout.addWidget(heading)
-
-        group = QButtonGroup(row)
-        group.setExclusive(True)
-        for label, months in RANGES:
-            button = QPushButton(label)
-            button.setObjectName('Toggle')
-            button.setCheckable(True)
-            button.setChecked(months == self._range_months)
-            button.setCursor(Qt.PointingHandCursor)
-            button.clicked.connect(lambda _=False, m=months: self._set_range(m))
-            group.addButton(button)
-            layout.addWidget(button)
-        layout.addStretch(1)
+        layout.setSpacing(2)
+        for title in (_BALANCES, _TRENDS, _INVESTING):
+            # Doubled, or a button reads the '&' as a shortcut marker and
+            # underlines the letter after it instead.
+            link = QPushButton(title.replace('&', '&&'))
+            link.setObjectName('Ghost')
+            link.setCursor(Qt.PointingHandCursor)
+            link.setToolTip(f"Jump to {title}")
+            link.setAccessibleName(f"Jump to {title}")
+            link.clicked.connect(lambda _=False, t=title: self.scroll_to(t))
+            link.hide()
+            self._links[title] = link
+            layout.addWidget(link)
         return row
+
+    def scroll_to(self, title: str):
+        """Brings a section's heading to the top of the view."""
+        section = self._sections.get(title)
+        if section is None:
+            return
+        top = self._body.contentsMargins().top()
+        self._scroll.verticalScrollBar().setValue(max(0, section.y() - top))
+
+    def _add_section(self, title: str, section: QWidget):
+        self._sections[title] = section
+        self._body.addWidget(section)
+
+    def _show_links(self):
+        """A link for each section on the page, and none when there is only
+        one: a link to the only thing on screen goes nowhere."""
+        several = len(self._sections) > 1
+        for title, link in self._links.items():
+            link.setVisible(several and title in self._sections)
+
+    # -- range ------------------------------------------------------------
 
     def _set_range(self, months: int | None):
         if months == self._range_months:
             return
         self._range_months = months
-        # Redraws from the summary already in hand rather than reading the vault
-        # again — the range only decides how much of it to show.
-        self._render()
+        # Redraws the sections the range applies to from the summary already
+        # in hand, rather than reading the vault again: the range only decides
+        # how much of it to show.
+        for redraw in self._redraws:
+            redraw()
 
-    def _sliced(self, series: list) -> list:
-        if self._range_months is None:
-            return series
-        return series[-self._range_months:]
+    def _window(self, series: list) -> list:
+        """The part of a series the range shows."""
+        return trailing_window(series, self._range_months)
+
+    def _ranged(self, build) -> QWidget:
+        """What `build` makes, made again whenever the range changes."""
+        holder = QWidget()
+        box = QVBoxLayout(holder)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.addWidget(build())
+
+        def redraw():
+            clear_layout(box)
+            box.addWidget(build())
+        self._redraws.append(redraw)
+        return holder
 
     def set_theme(self, theme: str):
         """Records the theme for the next build. Deliberately does not redraw —
@@ -175,16 +302,16 @@ class DashboardView(QWidget):
     def reload(self):
         try:
             self._data = dashboard_service.monthly_summary()
+            self._investing = dashboard_service.investing_vs_income()
         except VaultLockedError:
-            # Let it out: the caller answers a lock by locking the window and
-            # dropping the decrypted data. Catching it as a failed load would
-            # paint an error card while the rest of the vault stayed on screen —
-            # which is the outcome services/dashboard.py re-raises to avoid, and
-            # the bare `except Exception` below used to undo.
+            # Let it out: the caller answers a lock by locking the window.
             raise
         except Exception as exc:
             self._data = None
+            self._investing = None
             clear_layout(self._body)
+            self._sections = {}
+            self._show_links()
             self._body.addWidget(_message(f"Failed to load dashboard: {exc}"))
             return
         self._render()
@@ -193,216 +320,357 @@ class DashboardView(QWidget):
         """Draws the summary currently in hand. Split from reload() so the range
         buttons can redraw without decrypting every balance entry again."""
         clear_layout(self._body)
+        self._redraws = []
+        self._sections = {}
+        self._show_links()
         data = self._data
         if data is None:
             return
+
+        # Built from current figures, not balance history, so it is shown even
+        # when there is no history to chart.
+        investing = self._investing_section()
 
         months = data['months']
         if not months:
             self._body.addWidget(_message(
                 'No balance history recorded yet. Add balances to accounts to see trends here.'
             ))
+            if investing:
+                self._add_section(_INVESTING, investing)
             self._body.addStretch(1)
+            self._show_links()
             return
 
-        # The delta is always month-over-month, so it is computed on the full
-        # series and never on the visible slice — otherwise picking "6M" would
-        # change what "vs last month" meant.
-        # Computed once and handed to both sections: the bars draw it, and the
-        # grid below orders its cards by it and captions each with its share.
+        # What the grid orders and captions its cards by.
         parts = composition(data)
 
-        # Built first so the net-worth card knows whether its own one-line
-        # assets/liabilities summary would just be repeating what the bars are
-        # about to say two rows further down.
-        #
-        # The test is both sides, not whether the card appears at all. A side
-        # with no positive balance behind it — an overdrawn account as the only
-        # asset — gets no block in that card, and dropping the summary line on
-        # the strength of the other side having one would leave that total
-        # stated nowhere on the dashboard.
-        both_sides = bool(parts['assets']['parts']) and bool(parts['liabilities']['parts'])
-        breakdown = self._composition_section(parts)
-
-        self._body.addWidget(self._net_worth_section(data, both_sides))
-        # Above the range row on purpose. This is a reading of where things
-        # stand now, so unlike everything below it the range does not apply.
-        if breakdown:
-            self._body.addWidget(breakdown)
-        if len(months) > 1:
-            self._body.addWidget(self._build_range_row())
-        self._body.addWidget(self._category_grid(data['categories'], parts))
+        # Current figures, then the trends the range buttons apply to, then the
+        # other current figures.
+        balances = self._balance_section(balance_sheet(data))
+        if balances:
+            self._add_section(_BALANCES, balances)
+        # A single month has no range to choose.
+        buttons = range_buttons(self._range_months, self._set_range) if len(months) > 1 else None
+        self._add_section(_TRENDS, _section(
+            _TRENDS, self._ranged(lambda: self._trend_grid(data, parts)), buttons))
+        if investing:
+            self._add_section(_INVESTING, investing)
         self._body.addStretch(1)
+        self._show_links()
 
     # -- sections ----------------------------------------------------------
 
-    def _net_worth_section(self, data, composition_shown: bool = False) -> QWidget:
-        assets, liabilities = side_totals(data)
-        current = latest_value(data['net_worth'])
-        theme = palette(self._theme)
+    def _balance_section(self, sheet) -> QWidget | None:
+        """Each side as a table of its categories and their total, then the
+        net worth the two totals make. A side with nothing on it is left out.
+        Under each category, the accounts its figure is made of: clicking a
+        category opens it, and clicking an account opens that account.
 
-        title = QLabel('Net Worth')
-        title.setObjectName('SectionHeading')
-
-        # Object name rather than an inline size and colour: the size now
-        # follows the font setting like every other heading in the app, and the
-        # negative-figure red comes from the active palette instead of being
-        # baked in at build time.
-        value = QLabel(format_money(current) if current is not None else '—')
-        value.setObjectName(
-            'NetWorthNegative' if current is not None and current < 0 else 'NetWorthValue'
-        )
-
-        header = QHBoxLayout()
-        header.addWidget(title)
-        header.addStretch(1)
-        header.addWidget(value)
-
-        # Dropped only when the composition card below is carrying both of
-        # these figures already, which is nearly always. It is kept for the case
-        # that card cannot cover: composition() draws on positive balances
-        # alone, so a side made up entirely of an overdrawn account has no block
-        # there, and this line is then the only place its total is stated.
-        breakdown = None
-        if not composition_shown:
-            breakdown = QLabel(
-                f"Assets {format_money(assets)}   ·   Liabilities {format_money(liabilities)}"
-            )
-            breakdown.setObjectName('Subtle')
-
-        card = _Card()
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(16, 14, 16, 14)
-        layout.setSpacing(8)
-        layout.addLayout(header)
-        if breakdown is not None:
-            layout.addWidget(breakdown)
-
-        # Computed on the whole series, never the visible slice: "vs last month"
-        # has to mean the same thing whichever range is selected.
-        change = month_over_month(data['net_worth'])
-        if change:
-            layout.addWidget(_delta_label(*change, higher_is_better=True))
-
-        chart = build_series_chart(
-            self._sliced(data['months']), self._sliced(data['net_worth']),
-            theme['accent'], self._theme, 170,
-        )
-        if chart:
-            layout.addWidget(chart)
-
-        return card
-
-    def _composition_section(self, parts) -> QWidget | None:
-        """What the two totals are actually made of.
-
-        Assets and liabilities get a bar each rather than sharing one. They are
-        opposite signs, so a single bar carrying both would be measuring
-        nothing — 400k of mortgage beside 400k of investments would read as an
-        even split of a net worth that is in fact zero. And the question people
-        ask is what the debt is made of, or what the savings are, not how the
-        two compare as lengths; the figure above already answers that."""
-        sides = [('Assets', parts['assets']), ('Liabilities', parts['liabilities'])]
-        drawable = [(title, side) for title, side in sides if side['parts']]
-        if not drawable:
+        A table per side, not a bar: the shares sit in a column, and a negative
+        balance, which no bar can draw, is listed and counted, so the totals
+        always come to the net worth beneath them."""
+        sides = [('Assets', sheet['assets']), ('Liabilities', sheet['liabilities'])]
+        shown = [(title, side) for title, side in sides if side['rows']]
+        if not shown:
             return None
 
-        heading = QLabel('Composition')
-        heading.setObjectName('SectionHeading')
+        columns = ['Amount', 'Share']
+        tables = [self._side_table(title, side, columns) for title, side in shown]
+
+        net_worth = sheet['net_worth']
+        danger = palette(self._theme)['danger'] if net_worth < 0 else None
+        tables.append(self._sheet(
+            ['', _NET_WORTH, *columns], [],
+            [_gutter(), _cell(_NET_WORTH),
+             _cell(format_money(net_worth), figure=True, color=danger), _cell('')],
+            show_header=False, leading=2,
+        ))
+
+        # One width per column across all three, so every amount sits in the
+        # same column down the card.
+        for column in range(2 + len(columns)):
+            widest = max(table.columnWidth(column) for table in tables)
+            for table in tables:
+                table.setColumnWidth(column, widest)
+        for table in tables:
+            table.horizontalHeader().setMinimumSectionSize(_GUTTER_WIDTH)
+            table.setColumnWidth(0, _GUTTER_WIDTH)
 
         card = _Card()
         layout = QVBoxLayout(card)
         layout.setContentsMargins(16, 14, 16, 14)
-        layout.setSpacing(16)
-        for title, side in drawable:
-            layout.addLayout(self._composition_block(title, side))
+        layout.setSpacing(12)
+        for table in tables:
+            _fit(table)
+            layout.addWidget(table, 0, Qt.AlignLeft)
+        return _section(_BALANCES, card)
 
-        container = QWidget()
-        outer = QVBoxLayout(container)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(10)
-        outer.addWidget(heading)
-        outer.addWidget(card)
-        return container
+    def _side_table(self, title: str, side: dict, columns: list[str]) -> QTableWidget:
+        """One side's table: a row per category, with its accounts folded
+        beneath it behind the arrow in the first column, then the side's total.
+        Clicking the arrow shows or hides the accounts; clicking anywhere else
+        on the row opens the category."""
+        body = []
+        groups = {}  # category row -> (category, the rows of its accounts)
+        for row in side['rows']:
+            category = row['category']
+            head = len(body)
+            share = '' if row['share'] is None else _share_text(row['share'])
+            body.append((
+                lambda c=category: self.category_activated.emit(c),
+                [_gutter(), self._category_cell(category),
+                 _cell(format_money(row['value']), figure=True),
+                 _cell(share, figure=True)],
+            ))
+            for account in row['accounts']:
+                entry = {**account, 'category': category}
+                body.append((self._opener(entry), self._account_cells(account, category)))
+            if row['accounts']:
+                groups[head] = (category, range(head + 1, len(body)))
 
-    def _composition_block(self, title: str, side: dict) -> QVBoxLayout:
-        """One side: its total, its bar, and the legend naming every segment."""
-        name = QLabel(title)
-        name.setObjectName('CardTitle')
-        total = QLabel(format_money(side['total']))
-        total.setObjectName('CardValue')
+        def show(head: int):
+            category, rows = groups[head]
+            expanded = category in self._expanded
+            for index in rows:
+                table.setRowHidden(index, not expanded)
+            arrow = table.item(head, 0)
+            arrow.setText(_EXPANDED if expanded else _COLLAPSED)
+            # Tooltips guess at HTML; a custom category's name is vault content.
+            arrow.setToolTip(plain_text(
+                f"{'Hide' if expanded else 'Show'} the {category} accounts here"))
 
-        header = QHBoxLayout()
-        header.addWidget(name)
-        header.addStretch(1)
-        header.addWidget(total)
+        def toggle(head: int):
+            self._expanded ^= {groups[head][0]}
+            show(head)
+            _fit(table)
 
-        noun = title.lower()
-        bar = CompositionBar(
-            [(category_color(part['category']),
-              f"{part['category']}: {format_money(part['value'])}"
-              f" — {_share_text(part['share'])} of {noun}",
-              part['share'])
-             for part in side['parts']],
-            self._theme,
-        )
+        total = [_gutter(), _cell('Total'),
+                 _cell(format_money(side['total']), figure=True), _cell('')]
+        table = self._sheet(['', title, *columns], body, total, leading=2,
+                            toggles={head: (lambda h=head: toggle(h)) for head in groups})
+        # Folded only now: _sheet sized the columns with every row showing, so
+        # unfolding a category never has to widen the table.
+        for head in groups:
+            show(head)
+        return table
 
-        block = QVBoxLayout()
-        block.setSpacing(8)
-        block.addLayout(header)
-        block.addWidget(bar)
-        block.addWidget(self._legend(side['parts']))
-        return block
+    def _category_cell(self, category: str) -> QTableWidgetItem:
+        """A category's name and dot, in the link colour: clicking its row
+        opens it, as clicking its trend card does."""
+        item = _cell(category, color=palette(self._theme)['accent'])
+        item.setIcon(QIcon(dot_pixmap(category_color(category))))
+        # Tooltips guess at HTML; a custom category's name is vault content.
+        item.setToolTip(plain_text(f"Show the {category} accounts"))
+        return item
+
+    def _account_cells(self, account: dict, category: str) -> list[QTableWidgetItem]:
+        """An account's row under its category: set in from it, and quieter,
+        so the category figures still read as the table's own. Its share is
+        of the category, not of the side."""
+        subtle = palette(self._theme)['text_secondary']
+        name = _cell(_ACCOUNT_INDENT + account['name'], color=subtle)
+        # Tooltips guess at HTML; the name is vault content.
+        name.setToolTip(plain_text(f"Open {account['name']}"))
+        share = _cell('' if account['share'] is None else _share_text(account['share']),
+                      figure=True, color=subtle)
+        if account['share'] is not None:
+            share.setToolTip(plain_text(f"{share.text()} of {category}"))
+        return [_gutter(), name,
+                _cell(format_money(account['value']), figure=True, color=subtle), share]
+
+    def _investing_section(self) -> QWidget | None:
+        """Every income and every contribution as a yearly figure, their totals,
+        and the share of income going into investments. None when the vault
+        has neither."""
+        data = self._investing
+        if not data or not (data['income'] or data['contributions']):
+            return None
+
+        card = _Card()
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(14)
+        layout.addLayout(self._investing_header(data))
+        layout.addWidget(self._investing_tables(data))
+        return _section(_INVESTING, card)
 
     @staticmethod
-    def _legend(parts) -> QWidget:
-        """Names every segment, with its amount and its share.
+    def _investing_header(data) -> QVBoxLayout:
+        """The answer as one sentence, rate included, so it reads as a
+        sentence rather than a caption with a number off at the far edge. In
+        the cards' heading style, as every other figure on the page is."""
+        invested = format_money(data['contribution_total'])
+        if data['rate'] is None:
+            text = f"Currently investing {invested} a year"
+        else:
+            text = (f"Currently investing {invested} a year of "
+                    f"{format_money(data['income_total'])} income: "
+                    f"{_rate_text(data['rate'])}")
+        summary = selectable(QLabel(text))
+        summary.setObjectName('CardTitle')
+        summary.setWordWrap(True)
 
-        Always present, never optional. The bar is the only place these colours
-        appear without a word beside them, and on the Light theme three of the
-        category colours measure under 3:1 against the card behind them — the
-        labels are what make the bar readable there at all, and what keeps
-        identity off colour alone for a reader who cannot separate the hues.
+        header = QVBoxLayout()
+        header.setSpacing(4)
+        header.addWidget(summary)
+        if data['rate'] is None:
+            header.addWidget(_note('No income entered to compare it with.'))
+        return header
 
-        A FlowLayout because category names are long, a custom one can be
-        longer, and a fixed row would clip whatever ran past the edge."""
+    def _investing_tables(self, data) -> QWidget:
+        """Income, then contributions, each as a ruled table, the way the same
+        figures would sit in a spreadsheet.
+
+        Each table is as wide as its contents and sits at the left, so the
+        figures stay beside the names instead of across a full-screen window
+        from them. The name columns share one width, so the two tables start
+        their figures at the same place."""
+        theme = palette(self._theme)
+        warn = theme['level_warn']
+        tables = []
+
         container = QWidget()
-        # Same arrangement the category tab bar uses: the flow decides its own
-        # height from the width it is given, and the policy is what lets it.
-        policy = QSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
-        policy.setHeightForWidth(True)
-        container.setSizePolicy(policy)
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
 
-        flow = FlowLayout(container, spacing=14)
-        flow.setContentsMargins(0, 0, 0, 0)
-        for part in parts:
-            entry = QWidget()
-            row = QHBoxLayout(entry)
-            row.setContentsMargins(0, 0, 0, 0)
-            row.setSpacing(6)
-            row.addWidget(CategoryDot(category_color(part['category'])))
-            label = QLabel(f"{part['category']}   {format_money(part['value'])}"
-                           f"   {_share_text(part['share'])}")
-            # Text tokens, never the series colour. The dot beside it carries
-            # the identity; colouring the words too would leave a wall of
-            # saturated text that is harder to read and worse on Light, where
-            # these hues are already the low-contrast ones.
-            label.setObjectName('Subtle')
-            row.addWidget(label)
-            flow.addWidget(entry)
+        if data['income']:
+            body = []
+            for entry in data['income']:
+                yearly = (_cell('no pay entered', figure=True, color=warn)
+                          if entry['yearly'] is None
+                          else _cell(format_money(entry['yearly']), figure=True))
+                body.append((self._opener(entry), [self._name_cell(entry), yearly]))
+            total = [_cell('Total'), _cell(format_money(data['income_total']), figure=True)]
+            tables.append(self._sheet(['Income', 'Yearly'], body, total))
+            layout.addWidget(tables[-1], 0, Qt.AlignLeft)
+        else:
+            layout.addWidget(_note('No Income sources entered.'))
+
+        if data['contributions']:
+            body = []
+            for entry in data['contributions']:
+                yearly = (_cell('needs a period', figure=True, color=warn)
+                          if entry['yearly'] is None
+                          else _cell(format_money(entry['yearly']), figure=True))
+                share = ('' if entry['of_income'] is None
+                         else _rate_text(entry['of_income']))
+                body.append((self._opener(entry), [
+                    self._name_cell(entry),
+                    _cell(_per_period_text(entry['amount'], entry['period']), figure=True),
+                    yearly,
+                    _cell(share, figure=True),
+                ]))
+            total = [
+                _cell('Total'), _cell(''),
+                _cell(format_money(data['contribution_total']), figure=True),
+                _cell('' if data['rate'] is None else _rate_text(data['rate']), figure=True),
+            ]
+            tables.append(self._sheet(['Contributions', 'Per period', 'Yearly', '% of income'],
+                                      body, total))
+            layout.addWidget(tables[-1], 0, Qt.AlignLeft)
+        else:
+            layout.addWidget(_note('No contribution amounts entered on Investments accounts.'))
+
+        # One name-column width for both, then each table fitted around it.
+        widest = max((table.columnWidth(0) for table in tables), default=0)
+        for table in tables:
+            table.setColumnWidth(0, widest)
+            _fit(table)
         return container
 
-    def _category_grid(self, categories, parts) -> QWidget:
+    def _name_cell(self, entry: dict) -> QTableWidgetItem:
+        """An account's name in the link colour: clicking its row opens it."""
+        item = _cell(entry['name'], color=palette(self._theme)['accent'])
+        # Tooltips guess at HTML; the name is vault content.
+        item.setToolTip(plain_text(f"Open {entry['name']}"))
+        return item
+
+    def _opener(self, entry: dict):
+        """What clicking an account's row does."""
+        return lambda: self.account_activated.emit(entry['id'], entry['category'])
+
+    def _sheet(self, headers: list[str], body: list, total: list, *,
+               show_header: bool = True, leading: int = 1,
+               toggles: dict | None = None) -> QTableWidget:
+        """A read-only table: one row per (activate, cells) in `body`, then a
+        bold, shaded total row. Clicking a row calls its activate, except in
+        the first column of a row in `toggles`, which calls that instead.
+        Headers are still given when hidden: they set the column count. The
+        first `leading` columns hold text, and the rest figures."""
+        toggles = toggles or {}
+        table = QTableWidget(len(body) + 1, len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        table.horizontalHeader().setVisible(show_header)
+        for column in range(len(headers)):
+            table.horizontalHeaderItem(column).setTextAlignment(
+                Qt.AlignLeft | Qt.AlignVCenter if column < leading else _FIGURE_ALIGN)
+        table.verticalHeader().setVisible(False)
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+        # Cells select for copying: drag across them, or Shift- or Ctrl-click.
+        # Focus on a click only, so Ctrl+C reaches the table without it
+        # becoming a stop when tabbing through the page.
+        table.setSelectionMode(QTableWidget.ExtendedSelection)
+        table.setFocusPolicy(Qt.ClickFocus)
+        copy = QAction('Copy', table)
+        copy.setShortcut(QKeySequence.Copy)
+        copy.setShortcutContext(Qt.WidgetShortcut)
+        copy.triggered.connect(lambda: _copy_cells(table))
+        table.addAction(copy)
+        table.setContextMenuPolicy(Qt.ActionsContextMenu)
+        table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        actions = {}
+        for index, (activate, cells) in enumerate(body):
+            actions[index] = activate
+            for column, item in enumerate(cells):
+                table.setItem(index, column, item)
+
+        shade = QBrush(QColor(palette(self._theme)['bg_tertiary']))
+        for column, item in enumerate(total):
+            font = item.font()
+            font.setBold(True)
+            item.setFont(font)
+            item.setBackground(shade)
+            table.setItem(len(body), column, item)
+
+        def open_row(row: int, column: int):
+            if column == 0 and row in toggles:
+                toggles[row]()
+                return
+            # A Shift- or Ctrl-click is building a selection, not opening.
+            if QApplication.keyboardModifiers() & (Qt.ShiftModifier | Qt.ControlModifier):
+                return
+            activate = actions.get(row)
+            if activate is not None:
+                activate()
+
+        def point_at(row: int, _column: int):
+            # A hand over a body row only: the total row opens nothing.
+            table.viewport().setCursor(
+                Qt.PointingHandCursor if row in actions else Qt.ArrowCursor)
+
+        table.cellClicked.connect(open_row)
+        table.setMouseTracking(True)
+        table.cellEntered.connect(point_at)
+
+        table.resizeColumnsToContents()
+        table.resizeRowsToContents()
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.Fixed)
+        for column in range(len(headers)):
+            # Breathing room past the widest entry, as a spreadsheet column has.
+            table.setColumnWidth(column, table.columnWidth(column) + 16)
+        return table
+
+    def _trend_grid(self, data, parts) -> QWidget:
+        """A card for net worth, then one per category, all the same size and
+        all over the range in force."""
         container = QWidget()
-        outer = QVBoxLayout(container)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(10)
-
-        heading = QLabel('By Category')
-        heading.setObjectName('SectionHeading')
-        outer.addWidget(heading)
-
-        grid = QGridLayout()
+        grid = QGridLayout(container)
+        grid.setContentsMargins(0, 0, 0, 0)
         grid.setSpacing(12)
 
         # Which side each category is on, and how much of it, so a card can
@@ -413,100 +681,100 @@ class DashboardView(QWidget):
             for part in parts[noun]['parts']
         }
 
-        # Largest first, not alphabetical. Every card carries the same 110px
-        # chart whatever it is drawing, so the grid gave a current account and a
-        # mortgage identical weight and then let the alphabet decide which was
-        # seen first. Magnitude is answered by the bars above now; what is left
-        # for this order to do is put the categories that move the total on top.
-        # Ties break on the name, so the grid does not reshuffle between
-        # renders when two categories hold the same amount.
+        # Largest first, so the categories that move the total are on top. Ties
+        # break on the name, so the grid does not reshuffle between renders.
+        categories = data['categories']
         order = sorted(
             categories,
             key=lambda name: (-abs(latest_value(categories[name]) or 0.0), name),
         )
 
-        for index, category in enumerate(order):
-            grid.addWidget(
-                self._category_card(category, categories[category],
-                                    shares.get(category)),
-                index // _CARD_COLUMNS, index % _CARD_COLUMNS,
-            )
+        # Net worth first: it is the total the rest are parts of.
+        cards = [self._net_worth_card(data)]
+        cards += [self._category_card(category, categories[category], shares.get(category))
+                  for category in order]
+        for index, card in enumerate(cards):
+            grid.addWidget(card, index // _CARD_COLUMNS, index % _CARD_COLUMNS)
 
         for column in range(_CARD_COLUMNS):
             grid.setColumnStretch(column, 1)
-
-        outer.addLayout(grid)
         return container
 
+    def _net_worth_card(self, data) -> QWidget:
+        current = latest_value(data['net_worth'])
+        theme = palette(self._theme)
+        # Red below zero, as the figure has always been; otherwise the colour
+        # its chart is drawn in.
+        color = theme['danger'] if current is not None and current < 0 else theme['accent']
+        # A caption, as every category card has, so its chart starts level
+        # with the one beside it.
+        return self._trend_card(_NET_WORTH, 'Assets minus liabilities', data['net_worth'],
+                                color, theme['accent'], higher_is_better=True)
+
     def _category_card(self, category: str, series: list, share=None) -> QWidget:
-        latest = latest_value(series)
         liability = normalize_category(category) in LIABILITY_CATEGORIES
         color = category_color(category)
 
-        name = QLabel(category)
-        name.setObjectName('CardTitle')
-
-        # Replaces the bare 'liability' tag this line used to carry. The share
-        # names the side too — '38% of liabilities' — so nothing is lost, and
-        # the card now states its weight instead of leaving it to be read off a
-        # chart drawn at the same size as every other card's.
-        #
-        # None when the category has no positive value to take a share of (an
-        # overdrawn account, a category down to zero), which composition()
-        # leaves out of its bar. The old tag stands in, since which side it is
-        # on is still worth saying.
+        # The card's share of its side ('38% of liabilities'). A category with no
+        # positive value has no share, and is just tagged with its side.
         if share is not None:
             fraction, noun = share
-            caption = QLabel(f"{_share_text(fraction)} of {noun}")
+            caption = f"{_share_text(fraction)} of {noun}"
         else:
-            caption = QLabel('liability' if liability else '')
-        caption.setObjectName('Subtle')
+            caption = 'liability' if liability else ''
 
-        # The only inline style left on this card, and deliberately: this
-        # colour says *which category* the card is, so it is data rather
-        # than theme — the same reason the chart below is drawn in it, and
-        # the same colour the category's dot carries in the list and on its
-        # tab. Everything a theme owns (weight, size) is in the sheet.
-        value = QLabel(format_money(latest) if latest is not None else '—')
+        card = self._trend_card(category, caption, series, color, color,
+                                higher_is_better=not liability, category=category)
+        card.on_activate(self.category_activated.emit)
+        return card
+
+    def _trend_card(self, title: str, caption: str, series: list, value_color: str,
+                    chart_color: str, *, higher_is_better: bool,
+                    category: str | None = None) -> QWidget:
+        """One card in the trend grid: its name and latest figure, a caption,
+        the change across the range, and the chart. Net worth's card and every
+        category's are built here, so they cannot drift apart in size. A card
+        given a category opens it when clicked."""
+        latest = latest_value(series)
+
+        name = selectable(plain_label(title))
+        name.setObjectName('CardTitle')
+
+        # Inline colour on purpose: on a category card it says which category
+        # this is, so it is data rather than theme. Weight and size come from
+        # the sheet.
+        value = selectable(QLabel(format_money(latest) if latest is not None else '—'))
         value.setObjectName('CardValue')
-        value.setStyleSheet(f'color: {color};')
+        value.setStyleSheet(f'color: {value_color};')
 
+        # Figures sit beside their names, with the slack after them: pushed to
+        # the far edge, a full-screen window put the width of the screen between
+        # a figure and what it is a figure of.
         header = QHBoxLayout()
-        header.setSpacing(8)
+        header.setSpacing(12)
         header.addWidget(name)
-        header.addStretch(1)
         header.addWidget(value)
+        header.addStretch(1)
 
         card = _Card(category)
-        card.on_activate(self.category_activated.emit)
-
         layout = QVBoxLayout(card)
         layout.setContentsMargins(14, 12, 14, 12)
         layout.setSpacing(6)
         layout.addLayout(header)
 
-        # The share gets a line of its own, and the reason is width rather than
-        # taste. Every card here is one cell of a two-column grid, so whatever
-        # widens a card widens the grid twice over, and the grid already sets
-        # the dashboard's minimum width. Beside the title it added its text to
-        # the header's minimum; sharing the delta's line it added to that line's
-        # instead — either way two columns of it pushed the grid past the 900px
-        # window this app calls its minimum, and put a horizontal scrollbar
-        # under a dashboard that never needed one. On its own row it is measured
-        # against the widest row rather than added to it, which costs one line
-        # of height and nothing at all in width.
-        if caption.text():
-            layout.addWidget(caption)
+        # On a line of its own: beside the title it widened every card, and two
+        # columns of cards then outgrew the 900px minimum window.
+        if caption:
+            layout.addWidget(_note(caption))
 
-        change = month_over_month(series)
+        months = self._window(self._months())
+        window = self._window(series)
+        change = _change_label(window, months, self._range_months,
+                               higher_is_better=higher_is_better)
         if change:
-            # A liability climbing is bad news wearing the same arrow as savings
-            # climbing, so the colour follows the outcome rather than the sign.
-            layout.addWidget(_delta_label(*change, higher_is_better=not liability))
+            layout.addWidget(change)
 
-        chart = build_series_chart(
-            self._sliced(self._months()), self._sliced(series), color, self._theme, 110,
-        )
+        chart = build_series_chart(months, window, chart_color, self._theme, 110)
         if chart:
             layout.addWidget(chart)
 
@@ -516,15 +784,43 @@ class DashboardView(QWidget):
         return self._data['months'] if self._data else []
 
 
-def _delta_label(change: float, fraction: float | None, *, higher_is_better: bool) -> QLabel:
-    """The month-over-month line under a card's figure."""
-    label = QLabel(_delta_text(change, fraction))
-    label.setObjectName(_delta_object_name(change, higher_is_better))
-    return label
+def _section(title: str, content: QWidget, controls: QWidget | None = None) -> QWidget:
+    """A heading above its content, laid out the same for every section. Any
+    controls sit beside the heading, with the slack after them: pushed to the
+    far edge, a full-screen window would put its whole width between them."""
+    heading = selectable(QLabel(title))
+    heading.setObjectName('SectionHeading')
+
+    row = QHBoxLayout()
+    row.setSpacing(12)
+    row.addWidget(heading)
+    if controls is not None:
+        row.addWidget(controls)
+    row.addStretch(1)
+
+    container = QWidget()
+    outer = QVBoxLayout(container)
+    outer.setContentsMargins(0, 0, 0, 0)
+    outer.setSpacing(10)
+    outer.addLayout(row)
+    outer.addWidget(content)
+    return container
+
+
+def _change_label(series: list, month_keys: list, range_months: int | None, *,
+                  higher_is_better: bool) -> QLabel | None:
+    """The change line under a figure, across the window its section shows.
+    `series` and `month_keys` are that window. None with nothing to compare."""
+    change = change_across(series)
+    if not change:
+        return None
+    amount, fraction, start = change
+    return change_label(amount, fraction, _basis_text(range_months, month_keys, start),
+                        higher_is_better=higher_is_better)
 
 
 def _message(text: str) -> QLabel:
-    label = QLabel(text)
+    label = selectable(plain_label(text))
     label.setObjectName('Placeholder')
     label.setWordWrap(True)
     label.setAlignment(Qt.AlignCenter)

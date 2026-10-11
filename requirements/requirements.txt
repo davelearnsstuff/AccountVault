@@ -1,5 +1,5 @@
 # Pinned; Dependabot keeps them current (see .github/dependabot.yml).
-# start.bat prints this file when it offers to install, so keep it short.
+# Shown by AccountVault_Windows.bat when it offers to install: keep it short.
 #
 # This file pins versions. requirements.lock pins the artifacts behind them and
 # is what actually gets installed — regenerate it with `python tools/genlock.py`

@@ -1,12 +1,11 @@
 # -----------------------------------------------------------------------------
-# encryption.py
+# core/encryption.py
 # Argon2id key derivation and AES-256-GCM field encryption.
 #
 # The key is never written to disk and is released on lock, but it is not
 # scrubbed from RAM and cannot be: Python strings and bytes are immutable, and
 # further copies live inside argon2-cffi, cryptography and Qt's password field.
 # Full-disk encryption and a short auto-lock cover what the OS pages out.
-# Say "release", not "wipe", anywhere this is described.
 # -----------------------------------------------------------------------------
 
 
@@ -24,16 +23,14 @@ _TAG_LEN = 16    # GCM authentication tag, appended to the ciphertext
 
 _MIN_TOKEN_LEN = _NONCE_LEN + _TAG_LEN
 
-# Returned in place of a field that will not decrypt. Handing back the raw
-# token instead would let ciphertext pass as the value: it would render as the
-# password, export into backups as the password, and be written back as the
-# password by the next save.
+# Returned in place of a field that will not decrypt. Returning the raw token
+# instead would let ciphertext pass as the value — shown, exported and saved
+# back as if it were the password.
 UNREADABLE = '⚠ unreadable'
 
 
 class VaultLockedError(RuntimeError):
-    """Raised when a crypto operation is attempted while the vault is locked.
-    Subclasses RuntimeError so existing `except RuntimeError` guards still apply."""
+    """Raised when a crypto operation is attempted while the vault is locked."""
 
 
 def generate_salt() -> bytes:
@@ -41,45 +38,35 @@ def generate_salt() -> bytes:
 
 
 # Above OWASP's floor of 19 MiB / t=2, and shared with the master-password
-# verifier in auth.py: both recover the same password from a stolen database,
-# so an attacker works on whichever is cheaper and the pair is only as strong
-# as its weaker half.
+# verifier in auth.py: an attacker holding the database attacks whichever is
+# cheaper, so the two must cost the same.
 #
-# These are the values *new* key material is derived under, not the values every
-# existing field was derived under. A vault records the parameters it was built
-# with (app_config.kdf_params) and a .vault backup carries its own copy, so
-# raising these here no longer orphans anything: auth.migrate_vault_format
-# re-keys the vault to the new figures at the next login, and derive_key opens
-# older material by being handed the parameters it was written with.
+# These are the values *new* key material is derived under. A vault records the
+# parameters it was built with (app_config.kdf_params), so raising these does
+# not orphan anything: auth.migrate_vault_format re-keys at the next login.
 ARGON2_TIME_COST   = 4
 ARGON2_MEMORY_COST = 131072  # KiB — 128 MiB
 ARGON2_PARALLELISM = 2
 
 
 # The work factors everything written before parameters were recorded was
-# derived under. History, not configuration: they are the only way to reproduce
-# a key for a vault or a .vault backup from before the figures were written
-# down, so they must never be edited to follow the constants above. Raising
-# those is what triggers a re-key; this is what still opens what came before.
+# derived under. Never edit these to follow the constants above: they are the
+# only way to reproduce the key for a vault from before the figures were stored.
 LEGACY_KDF_PARAMS = {'t': 4, 'm': 131072, 'p': 2}
 
 
 def current_kdf_params() -> dict:
     """The work factors new key material is derived under.
 
-    A function rather than a module-level dict because the constants above are
-    substituted in tests, and a dict built at import time would hold the real
-    128 MiB figures for the whole run."""
+    A function rather than a module-level dict so tests can substitute the
+    constants above."""
     return {'t': ARGON2_TIME_COST, 'm': ARGON2_MEMORY_COST, 'p': ARGON2_PARALLELISM}
 
 
-# What a stored or imported parameter set has to fall inside to be believed.
-#
-# The ceiling is the point: these arrive from app_config and from the header of
-# a .vault file, and both are read *before* anything is authenticated. Without a
-# bound, a hand-built backup naming 64 GiB of memory cost is a one-line denial
-# of service against whoever opens it. The upper limits are far above the real
-# figures above and far below anything that would wedge a machine.
+# Bounds a stored or imported parameter set must fall inside to be believed.
+# Parameters are read from app_config before anything is authenticated, so the
+# ceiling stops a hand-built vault naming 64 GiB of memory from wedging the
+# machine that opens it.
 _KDF_BOUNDS = {
     't': (1, 64),
     'm': (8, 1024 * 1024),  # KiB — 8 KiB (argon2's own floor) to 1 GiB
@@ -89,8 +76,8 @@ _KDF_BOUNDS = {
 
 def valid_kdf_params(params) -> dict | None:
     """params reduced to the three Argon2id work factors, or None if it is not a
-    usable set. Booleans are rejected explicitly: bool is a subclass of int, so
-    True would otherwise pass as t=1."""
+    usable set. Booleans are rejected explicitly: True would otherwise pass as
+    t=1."""
     if not isinstance(params, dict):
         return None
     clean = {}
@@ -119,8 +106,7 @@ def derive_key(password: str, salt: bytes, params: dict | None = None) -> bytes:
     )
 
 
-# Lets anything holding decrypted data drop it at the moment the vault can no
-# longer decrypt. Registration is one-way and process-wide.
+# Lets anything holding decrypted data drop it the moment the key changes.
 _key_listeners = []
 
 
@@ -132,8 +118,7 @@ def on_key_change(callback):
 
 
 def _notify_key_change():
-    # A listener that raises part-way through a lock would leave the remaining
-    # listeners holding decrypted data while the key is already gone.
+    # One listener raising must not leave the rest holding decrypted data.
     for callback in _key_listeners:
         try:
             callback()
@@ -148,16 +133,14 @@ def install_key(password: str, salt: bytes, params: dict | None = None):
     defaults to the current one for a vault being created."""
     global _key_instance
     _key_instance = AESGCM(derive_key(password, salt, params))
-    # Also fires on unlock: a password change re-keys the vault and lands here,
-    # so anything cached under the old key is stale rather than unreadable.
+    # Fires on unlock too: a password change re-keys, so anything cached under
+    # the old key is stale.
     _notify_key_change()
 
 
 def release_key():
-    """Releases the in-memory key. Called on lock.
-
-    Drops the only reference the app holds, so nothing here can decrypt
-    afterwards. The bytes survive in freed heap — see the file header."""
+    """Releases the in-memory key. Called on lock. See the file header for why
+    this is a release rather than a wipe."""
     global _key_instance
     _key_instance = None
     _notify_key_change()
@@ -170,17 +153,12 @@ def is_unlocked() -> bool:
 def field_aad(table: str, column: str) -> bytes:
     """Associated data binding a field's ciphertext to the column it lives in.
 
-    AES-GCM authenticates a token against tampering but not against relocation:
-    with no associated data, a token lifted out of `notes` and dropped into
-    `password` decrypts perfectly, and the vault then shows — and copies to the
-    clipboard — one field's contents as another's. Anyone who can write the
-    database file can do that without knowing the key.
+    Without it, a token moved from `notes` into `password` decrypts perfectly,
+    and anyone who can write the database file can make the vault show — and
+    copy to the clipboard — one field's contents as another's.
 
-    Binding the column name makes the tag depend on where the value is stored,
-    so a moved token fails to open. It is deliberately not bound to the row id
-    as well: ids are reassigned by an import, which would make every restored
-    backup unreadable to buy protection against shuffling values between rows of
-    the same column — the far less useful half of the attack."""
+    Deliberately not bound to the row id: ids are reassigned by a restore, which
+    would make every restored record unreadable."""
     return f'{table}.{column}'.encode()
 
 
@@ -195,9 +173,8 @@ def encrypt(value: str, aad: bytes = b'') -> str:
 def _split_token(value: str) -> tuple[bytes, bytes]:
     """Splits a token into (nonce, ciphertext||tag), or raises InvalidTag.
 
-    InvalidTag rather than the ValueError a short nonce would raise out of
-    AESGCM: a truncated token has failed authentication just as surely as a
-    tampered one, and callers already handle that exception."""
+    A truncated token has failed authentication as surely as a tampered one, so
+    it raises the same exception callers already handle."""
     raw = base64.urlsafe_b64decode(value)
     if len(raw) < _MIN_TOKEN_LEN:
         raise InvalidTag()
@@ -212,10 +189,8 @@ def decrypt(value: str, aad: bytes = b'') -> str:
 
 
 def cipher_for(key: bytes) -> AESGCM:
-    """The AES-GCM cipher for a raw 32-byte key.
-
-    Building one runs the AES key schedule, so a re-key walking every field in
-    the vault should build one cipher and reuse it rather than one per field."""
+    """The AES-GCM cipher for a raw 32-byte key. Build one and reuse it across a
+    re-key rather than one per field."""
     return AESGCM(key)
 
 
@@ -224,15 +199,12 @@ def _as_cipher(key) -> AESGCM:
 
 
 def encrypt_with(key, plaintext: bytes, aad: bytes = b'') -> str:
-    """Encrypts raw bytes under an explicit key or cipher, in the same
-    base64url(nonce || ciphertext || tag) envelope encrypt() produces.
+    """Encrypts raw bytes under an explicit key or cipher, in the same envelope
+    encrypt() produces.
 
-    Every AES-GCM envelope in the app is built here: the guarantee that no
-    nonce repeats under one key holds only while one site chooses them.
-
-    aad defaults to empty, which AES-GCM treats exactly as it treats absent —
-    the tag is byte-identical either way. That is what keeps tokens written
-    before field binding existed readable by an unbound call."""
+    Every AES-GCM envelope in the app is built here, so nonces are chosen in one
+    place. Empty aad is byte-identical to no aad, which keeps tokens written
+    before field binding readable."""
     aesgcm = _as_cipher(key)
     nonce = os.urandom(_NONCE_LEN)
     return base64.urlsafe_b64encode(nonce + aesgcm.encrypt(nonce, plaintext, aad)).decode()
@@ -248,11 +220,9 @@ def reencrypt(value: str, new_key, aad: bytes = b'', new_aad: bytes = b'') -> st
     """Decrypts with the current key and re-encrypts with new_key, which may be
     raw 32 bytes or a cipher from cipher_for.
 
-    The two associated-data values differ only while a vault is being moved onto
-    a format that binds its fields differently — see auth._rekey_fields. Both
-    are spelled out at that one call site rather than one defaulting to the
-    other, because a re-key that reads and writes the wrong binding is a vault
-    nothing opens again."""
+    The two associated-data values differ only while a vault moves onto a format
+    that binds fields differently (see auth._rekey_fields). Neither defaults to
+    the other: a re-key that reads or writes the wrong binding is unrecoverable."""
     if _key_instance is None:
         raise VaultLockedError("Encryption key not initialized — app is locked")
     if not value:
@@ -266,12 +236,9 @@ def _b64decode_strict(value: str) -> bytes:
     """base64url-decodes value, rejecting anything encrypt() would not have
     written. Raises binascii.Error on bad input.
 
-    base64.urlsafe_b64decode discards characters outside the alphabet, so a
-    long enough piece of prose can decode to something token-sized and be
-    mistaken for ciphertext. Such a field is then skipped by
-    migrate_plaintext_fields as already encrypted and left in the clear, and
-    fails to decrypt during the next password change, aborting every future
-    rotation."""
+    The lenient decoder discards characters outside the alphabet, so long prose
+    could decode to something token-sized and be mistaken for ciphertext — then
+    skipped by the plaintext migration and left unencrypted."""
     return base64.b64decode(value, altchars=b'-_', validate=True)
 
 
@@ -279,9 +246,8 @@ def looks_encrypted(value) -> bool:
     """True when value has the shape encrypt() produces.
 
     Separates "never encrypted" from "encrypted and broken", which a failed
-    decrypt alone cannot. Genuine ciphertext always satisfies it, so nothing
-    real is mistaken for plaintext and wrapped a second time; a plaintext note
-    long enough to pass only ever costs a refusal to touch it."""
+    decrypt alone cannot. Real ciphertext always passes, so nothing is ever
+    wrapped a second time."""
     if not isinstance(value, str) or not value:
         return False
     try:
@@ -300,9 +266,9 @@ def safe_decrypt(value: str, aad: bytes = b'') -> str:
     """Decrypt value, tolerating rows this vault did not write.
 
     Legacy plaintext is returned as-is and undecryptable ciphertext returns
-    UNREADABLE, so one corrupt field degrades to a placeholder instead of
-    passing itself off as the value. A locked vault re-raises, so callers
-    cannot stamp placeholders over a vault that is merely closed."""
+    UNREADABLE, so one corrupt field degrades to a placeholder. A locked vault
+    re-raises, so callers cannot stamp placeholders over a vault that is merely
+    closed."""
     if not looks_encrypted(value):
         return value
     try:
@@ -317,9 +283,7 @@ def safe_reencrypt(value: str, new_key, aad: bytes = b'', new_aad: bytes = b'') 
     """Reencrypt with new_key, encrypting legacy plaintext directly.
 
     Ciphertext that will not decrypt raises rather than being treated as
-    plaintext: wrapping it would encrypt the base64 token and lose the real
-    value for good, since the new key would return the token and the old
-    password would no longer open anything."""
+    plaintext: wrapping the token would lose the real value for good."""
     if not looks_encrypted(value):
         return encrypt_with(new_key, value.encode(), new_aad)
     return reencrypt(value, new_key, aad, new_aad)

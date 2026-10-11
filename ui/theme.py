@@ -2,9 +2,8 @@
 # ui/theme.py
 # Colour palettes and the generated Qt stylesheet.
 #
-# The palettes carry over from the CSS custom properties the web build used. Qt
-# style sheets have no variables, so the sheet is built by formatting a template
-# against the active palette.
+# Qt style sheets have no variables, so the sheet is built by formatting a
+# template against the active palette.
 # -----------------------------------------------------------------------------
 
 import zlib
@@ -59,8 +58,7 @@ THEMES = {
 
 DEFAULT_THEME = 'dark'
 
-# Base point size per font-size setting. The web build scaled the whole page
-# with CSS zoom; Qt scales from the application font instead.
+# Base point size per font-size setting; every other size scales from it.
 FONT_SIZES = {
     'small':   9,
     'default': 10,
@@ -68,24 +66,17 @@ FONT_SIZES = {
     'xl':      14,
 }
 
-# Every font size in the sheet, as a multiple of the base above. QSS honours
-# only absolute font units — em and % are dropped silently — so a size that has
-# to track the font setting cannot be written relatively and must be
-# interpolated by stylesheet() instead.
-#
-# These were all hardcoded pixel values, which meant the Font Size setting moved
-# the body text and left every heading where it was: at XL the captions grew
-# past the section headings above them and the hierarchy read upside down. The
-# comment beside each is the pixel size it replaces, which is what 10pt (the
-# 'default' base) still resolves to.
+# Every font size in the sheet, as a multiple of the base above, so headings
+# and captions keep their hierarchy at every Font Size setting. QSS drops
+# relative units, so stylesheet() interpolates these. The comment beside each is
+# its pixel size at the 'default' base.
 FONT_SCALES = {
     'micro':   0.75,    # 10px — the theme swatch caption
     'caption': 0.85,    # 11px — field labels, row meta, Small buttons
-    'section': 0.90,    # 12px — section headings
     'body':    1.05,    # 14px — empty-state body copy
+    'section': 1.125,   # 15px — section headings, as big as a panel title
     'title':   1.125,   # 15px — nav brand, list and panel titles
     'heading': 1.50,    # 20px — detail and form titles, empty-state headings
-    'figure':  1.65,    # 22px — the dashboard's net-worth figure
     'display': 1.95,    # 26px — the auth screen title
 }
 
@@ -95,6 +86,7 @@ FONT_SCALES = {
 CATEGORY_COLORS = {
     'Banking':      '#4caf50',
     'Investments':  '#2196f3',
+    'Property':     '#78909c',
     'Credit Cards': '#e53935',
     'Loans':        '#ff9800',
     'Utilities':    '#9c27b0',
@@ -104,12 +96,13 @@ CATEGORY_COLORS = {
 }
 
 # Drawn from for categories the user invented, which have no entry above.
-# Deliberately hues the eight built-ins leave spare — pink, cyan, lime, slate,
-# violet, amber — rather than more of the same: a custom category sitting next
-# to Loans in the tab bar wants to be told apart from it, and an earlier ring
-# that included another orange put two near-identical dots side by side.
+# Deliberately hues the nine built-ins leave spare — pink, cyan, lime, violet,
+# amber — rather than more of the same: a custom category sitting next to Loans
+# in the tab bar wants to be told apart from it, and an earlier ring that
+# included another orange put two near-identical dots side by side. Slate left
+# the ring when Property took it, so no custom category can share its dot.
 _CUSTOM_COLORS = (
-    '#ec407a', '#26c6da', '#d4e157', '#78909c', '#7e57c2', '#ffca28',
+    '#ec407a', '#26c6da', '#d4e157', '#7e57c2', '#ffca28',
 )
 
 
@@ -231,31 +224,21 @@ QToolTip {{
     color: {accent};
 }}
 
-/* The caption is uppercased in field_label() rather than here: Qt Style Sheets
-   implement only a subset of CSS and drop text-transform silently, so the rule
-   that used to sit in this block never had any effect. letter-spacing is in the
-   subset and does work — caps set tight at this size read as cramped.
-
-   The size is interpolated by stylesheet() rather than written relatively:
-   QSS honours only absolute font units, dropping em and % just as quietly, so
-   a relative size here would leave the caption at body size. */
+/* Uppercased in field_label(): QSS silently drops text-transform. The size is
+   interpolated because QSS also drops relative units (em, %). */
 #FieldLabel {{
     color: {text_secondary};
     font-size: {caption_pt}pt;
     letter-spacing: 0.5px;
 }}
 
-/* The account name on a list row. An inline `font-weight: bold` here outranked
-   the sheet and, more to the point, sat in the one file that cannot see the
-   theme — the same trap #RowMeta and #RequirementMet were pulled out of. */
+/* The account name on a list row. */
 #RowName {{
     font-weight: bold;
 }}
 
-/* The balance, sharing the name's line. Body size and full-strength text, the
-   same as #RowName beside it: at caption size and secondary grey it was the
-   hardest thing on the row to read, which is backwards for the figure the row
-   is consulted for. Left unbolded so the name still reads as the heading. */
+/* The balance, sharing the name's line: full-strength text, the figure the row
+   is consulted for, but unbolded so the name still reads as the heading. */
 #RowBalance {{
     color: {text_primary};
 }}
@@ -289,8 +272,10 @@ QToolTip {{
     color: {level_danger};
 }}
 
+/* In the text colour and larger than a card title: at 12px grey, a heading
+   read as less important than the cards it was a heading for. */
 #SectionHeading {{
-    color: {text_secondary};
+    color: {text_primary};
     font-size: {section_pt}pt;
     font-weight: bold;
 }}
@@ -368,29 +353,16 @@ QToolTip {{
 
 /* --- Dashboard cards ----------------------------------------------------- */
 
-/* The net-worth figure and the per-category card headings. All three were
-   inline setStyleSheet calls; only the per-category *colour* still is, because
-   that one is data (which category this is) rather than theme, exactly like the
-   colour its chart is drawn in. Everything a theme owns lives here. */
-#NetWorthValue {{
-    font-size: {figure_pt}pt;
-    font-weight: bold;
-}}
-
-/* A negative net worth. Separate name rather than an inline colour so the
-   figure follows the theme's danger red instead of being frozen at whichever
-   one was active when the card was built. */
-#NetWorthNegative {{
-    font-size: {figure_pt}pt;
-    font-weight: bold;
-    color: {danger};
-}}
-
+/* The trend cards' headings, and the investing summary in the same style.
+   Only a card's *colour* is still set inline: on a category card it is data
+   (which category this is) rather than theme, exactly like the colour its
+   chart is drawn in, and the dashboard is rebuilt whenever the theme changes.
+   Everything else a theme owns lives here. */
 #CardTitle, #CardValue {{
     font-weight: bold;
 }}
 
-/* The month-over-month line under a card's figure. Coloured by whether the
+/* The change line under a card's figure. Coloured by whether the
    change was good news, which is not the same as which way it went: a credit
    card balance climbing draws the same arrow as savings climbing and means the
    opposite, so dashboard_view.py picks the name and liabilities invert.
@@ -455,7 +427,7 @@ QMenu::separator {{
    QTextEdit — both descend from QAbstractScrollArea — so it inherits none of
    these rules by subclass and renders in the platform's own colours if left
    out, which is a white box in every dark theme here. */
-QLineEdit, QTextEdit, QPlainTextEdit, QComboBox, QDateEdit {{
+QLineEdit, QTextEdit, QPlainTextEdit, QComboBox, QDateEdit, QSpinBox {{
     background-color: {bg_input};
     color: {text_primary};
     border: 1px solid {border};
@@ -465,12 +437,13 @@ QLineEdit, QTextEdit, QPlainTextEdit, QComboBox, QDateEdit {{
     selection-color: #ffffff;
 }}
 
-QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QComboBox:focus, QDateEdit:focus {{
+QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QComboBox:focus, QDateEdit:focus,
+QSpinBox:focus {{
     border: 1px solid {accent};
 }}
 
 QLineEdit:disabled, QTextEdit:disabled, QPlainTextEdit:disabled,
-QComboBox:disabled, QDateEdit:disabled {{
+QComboBox:disabled, QDateEdit:disabled, QSpinBox:disabled {{
     color: {text_placeholder};
 }}
 
@@ -769,6 +742,17 @@ QTableWidget::item {{
     padding: 4px 6px;
 }}
 
+/* Cells picked for copying on the dashboard, the only tables that select.
+   Marked the way a selected account row is, by a raised background and an
+   accent edge, never an accent fill: a name already drawn in the accent
+   colour would vanish into it. The text colour is said outright, or a light
+   theme would draw its plain cells in the platform's white. */
+QTableWidget::item:selected {{
+    background-color: {bg_tertiary};
+    color: {text_primary};
+    border: 1px solid {accent};
+}}
+
 /* Same for the history table's cell widgets: the row's background wins. */
 #RowActions {{
     background-color: transparent;
@@ -875,15 +859,10 @@ def font_points(name: str, font_size: str = 'default') -> float:
 # adds to a widget's base object name: 'RowMeta' + 'Warn' is the #RowMetaWarn
 # rule below, 'Level' + 'Danger' is #LevelDanger.
 #
-# One table because the two places that paint a level — the detail view's field
-# values and the account list's captions — each used to decide for themselves
-# which levels were worth colouring, in two separately written maps. They agreed
-# by coincidence; a level added to categories.py had to be remembered in both,
-# and 'lapsed' already showed what that looks like when it is not.
-#
-# A level that is absent here is deliberately uncoloured, not unhandled:
-# 'lapsed' means a record nobody rolled forward, and painting it the same red as
-# a bill due on Tuesday is what taught people to stop reading the colour.
+# Shared by the detail view's field values and the account list's captions, so
+# the two agree on which levels are coloured. A level absent here is
+# deliberately uncoloured: 'lapsed' is a record nobody rolled forward, not a bill
+# due this week.
 LEVEL_SUFFIX = {'warn': 'Warn', 'danger': 'Danger'}
 
 

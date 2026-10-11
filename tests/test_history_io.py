@@ -17,8 +17,8 @@ from datetime import date, timedelta
 
 import pytest
 
-import database
-import encryption
+from core import database
+from core import encryption
 from conftest import make_account, snapshot_rows
 from services import accounts as accounts_service
 from services import history_io

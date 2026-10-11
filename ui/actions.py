@@ -1,19 +1,13 @@
 # -----------------------------------------------------------------------------
 # ui/actions.py
-# The window's command layer.
+# The window's command layer: the QActions and their key sequences, the vault
+# menu that lists those same objects, the guard every handler runs behind, and
+# the appearance settings the commands move.
 #
-# Everything the window can be *asked* to do, as opposed to what it draws or
-# what it holds: the QActions and their key sequences, the vault menu those
-# same objects are listed in, the guard every handler runs behind, and the
-# three appearance settings the commands move.
-#
-# A mixin rather than a helper object, and that is a deliberate limit on what
-# this split claims to have done. These methods reach all over the window —
-# self.settings, self.detail_view, self._category_tabs — and turning them into
-# a collaborator would mean handing it a reference to the window and inverting
-# nothing. What the split buys is that the file you open to change a shortcut
-# is 400 lines about shortcuts rather than 2,900 lines about everything, and
-# that each of the four now states which slice of the window's state it owns.
+# A mixin rather than a collaborator: these methods reach all over the window,
+# and a helper object would only be handed a reference to it. What the split
+# buys is a file about shortcuts, and each mixin stating which slice of the
+# window's state it owns.
 #
 # What this one owns: self._actions.
 # -----------------------------------------------------------------------------
@@ -22,10 +16,10 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction, QKeySequence, QShortcut
 from PySide6.QtWidgets import QApplication, QMenu
 
-import auth
-import preferences
-from categories import get_config
-from encryption import VaultLockedError
+from core import auth
+from core import preferences
+from core.categories import get_config
+from core.encryption import VaultLockedError
 from ui import dialogs
 from ui.theme import FONT_SIZES, stylesheet
 from ui.widgets import IconButton, NavChip, ThemedIcon
@@ -35,15 +29,7 @@ from ui.widgets import IconButton, NavChip, ThemedIcon
 # or an empty list) is not mistaken for a failure.
 _FAILED = object()
 
-# The font-size ladder, smallest first, labelled as Settings labels it. Ctrl+=
-# and Ctrl+- step along this list, so its order is what "one size up" means and
-# it has to stay in step with preferences.VALID_FONT_SIZES.
-FONT_SIZE_STEPS = [
-    ('small', 'Small'), ('default', 'Default'), ('large', 'Large'), ('xl', 'XL'),
-]
-
-# How many category tabs Ctrl+<n> can reach. Past nine the digits run out, and
-# a tab that far along is quicker to click than to count to.
+# How many tabs Ctrl+<n> can reach.
 _TAB_SHORTCUT_LIMIT = 9
 
 
@@ -56,38 +42,16 @@ class ActionsMixin:
     def _build_actions(self):
         """The window's commands, one QAction each.
 
-        Nearly all of them own a key sequence; the theme toggle is here because
-        it needs the same thing the keyed ones need — a single object the menu
-        can show and the window can keep in step — rather than because it has a
-        shortcut.
-
-        One owner per sequence, and that is the whole point. These used to be
-        QShortcuts here plus a separate menu QAction repeating the same key, and
-        Qt's shortcut map answers two candidates for one sequence by dispatching
-        to neither: Ctrl+N, Ctrl+,, Ctrl+L and Ctrl+Q were advertised in the menu
-        and did nothing when pressed, while every sequence with no menu entry
-        behind it (Ctrl+F, Ctrl+E, Ctrl+B, Ctrl+1..9) kept working. Narrowing the
-        menu copy to WidgetShortcut was meant to break that tie; measured against
-        real key events it does not, because the action stays in contention
-        either way. The menu now shows these objects instead of copying them, so
-        there is one handler per key and the hint in the menu is rendered from
-        the handler itself and cannot drift from it.
-
-        Every slot goes through _on_main_screen first. An action lives on the
-        window rather than on a screen within it, so without that guard Ctrl+N on
-        the login screen would start building an account form against a locked
-        vault.
+        One owner per key sequence: Qt answers two candidates for one sequence
+        by dispatching to neither, so the menu shows these same objects rather
+        than copies. Every slot is guarded so a shortcut is inert off the main
+        screen — Ctrl+N on the login screen must not build a form against a
+        locked vault.
 
         Where a command lists several sequences, the first is the one the menu
-        shows and the rest are the same physical key as Qt actually reports it.
-        The font pair needs all of them: on a US layout "Ctrl and +" is really
-        Ctrl+Shift+= , which Qt delivers as Key_Plus *carrying* Shift, so plain
-        Ctrl++ never matches it; Ctrl+= is that key without reaching for Shift;
-        and the keypad's own +/- arrive with KeypadModifier set, which likewise
-        matches none of the others. Each was checked against real key events
-        rather than assumed — Ctrl+Shift+= , the obvious spelling, matches
-        nothing, because by then the key is no longer '='.
-        """
+        shows and the rest are the same physical key as Qt actually reports it:
+        on a US layout "Ctrl and +" arrives as Key_Plus carrying Shift, and the
+        keypad's keys carry KeypadModifier."""
         commands = [
             ('add',       'Add Account',   ['Ctrl+N'], self._start_add,
              'Create a new account in the current category'),
@@ -125,64 +89,48 @@ class ActionsMixin:
             if tooltip:
                 action.setToolTip(tooltip)
             action.triggered.connect(self._guarded(slot))
-            # Without this the action is only a menu entry; the window is what
-            # gives its sequences somewhere to be matched.
+            # The window is what gives an action's sequences somewhere to match.
             self.addAction(action)
             self._actions[key] = action
 
-        # The one command with a state to show rather than only an effect, so it
-        # is the one that carries a tick. apply_appearance sets that tick, and
-        # every theme change in the app goes through there — this entry, the
-        # Settings swatches and a cancelled preview cannot end up disagreeing.
+        # The one command with a state to show, so it carries a tick, kept in
+        # step by apply_appearance.
         theme_action = self._actions['theme']
         theme_action.setCheckable(True)
         theme_action.setChecked(self.settings.get('theme') == 'dark')
 
     def _build_shortcuts(self):
         """The bindings with no command object of their own: the tab digits and
-        Escape. Everything that also appears in a menu is a QAction instead —
-        see _build_actions."""
-        # Ctrl+1..9 select the nth tab as the bar actually reads, Dashboard
-        # included — the bar is the map, so the digits have to follow it rather
-        # than a fixed category order the user cannot see.
+        Escape."""
+        # Ctrl+1..9 select the nth tab as the bar actually reads.
         for digit in range(1, _TAB_SHORTCUT_LIMIT + 1):
             shortcut = QShortcut(QKeySequence(f'Ctrl+{digit}'), self)
             shortcut.activated.connect(self._guarded(
                 lambda index=digit - 1: self._select_tab_by_index(index)
             ))
 
-        # Escape clears an active search. Bound to the window rather than the
-        # search box so it works from anywhere in the list, and it deliberately
-        # does nothing when the box is empty — swallowing Escape when there is
-        # nothing to clear would take it from any dialog that wanted it.
+        # Escape clears an active search, from anywhere in the list. It does
+        # nothing when the box is empty, leaving Escape to any dialog.
         escape = QShortcut(QKeySequence(Qt.Key_Escape), self)
         escape.activated.connect(self._guarded(self._clear_search))
 
-        # Down from the search box moves into the results without reaching for
-        # the mouse, which is the whole point of Ctrl+F.
+        # Down from the search box moves into the results.
         self.search_input.installEventFilter(self)
 
     def _build_manage_menu(self) -> QMenu:
-        """The vault menu, replacing the old Manage dialog.
-
-        The one-line descriptions that dialog showed under each action are kept
-        as tooltips rather than dropped — they explain the difference between an
-        encrypted backup and a plaintext CSV, which is the single most important
-        thing a user can misunderstand here.
-
-        Entries named by a string are the shared QAction objects from
-        _build_actions rather than new ones repeating their sequence; see there
-        for why a second copy stopped the key working at all. Their labels and
-        tooltips travel with the action, so only the shortcut-less entries carry
-        their own here."""
+        """The vault menu on the nav bar's gear button. Entries named by a
+        string are the shared QActions from _build_actions; the descriptions
+        are tooltips."""
         menu = QMenu(self)
-        # Off by default in Qt; without it the descriptions below never show.
+        # Off by default in Qt; without it the descriptions never show.
         menu.setToolTipsVisible(True)
 
         entries = [
             'add',
             None,
             'settings',
+            ('Warnings…',             self._open_warnings,
+             'When due dates and stale balances turn orange and red, per category'),
             'theme',
             'font_up',
             'font_down',
@@ -206,6 +154,8 @@ class ActionsMixin:
             None,
             ('Readme',                lambda: dialogs.ReadmeDialog(self).exec(),
              'Features, security details, and usage notes'),
+            ('Design Document',       lambda: dialogs.DesignDocumentDialog(self).exec(),
+             'Why the app is built the way it is'),
             ('About',                 lambda: dialogs.AboutDialog(self).exec(),
              'Version and encryption information'),
             None,
@@ -232,14 +182,12 @@ class ActionsMixin:
     # -----------------------------------------------------------------
     def _on_main_screen(self) -> bool:
         """True when the vault is open and its browser is the visible screen."""
-        return self.screens.currentIndex() == 2
+        return self.screens.currentWidget() is self.main_screen
 
     def _guarded(self, slot):
-        """Wraps a shortcut handler so it is inert off the main screen.
-
-        Takes and drops any arguments: QAction.triggered hands its slot a
-        checked flag, QShortcut.activated hands it nothing, and the same wrapper
-        serves both."""
+        """Wraps a shortcut handler so it is inert off the main screen. Takes and
+        drops any arguments, so it serves QAction.triggered and
+        QShortcut.activated alike."""
         def run(*_args):
             if self._on_main_screen():
                 slot()
@@ -249,15 +197,10 @@ class ActionsMixin:
                  report=None):
         """Runs a vault call, reporting any failure and returning _FAILED.
 
-        The shape nearly every service call in this window shares: a vault found
-        locked underneath goes to _handle_vault_locked, anything else is shown
-        to the user, and either way the caller stops. Callers test the result
-        against _FAILED rather than catching.
-
-        `prefix` heads the message ('Export failed: ...'), `dwell` holds the
-        toast longer than usual, and `report` sends the message somewhere other
-        than a toast — a form's own error line, say. Calls needing keyword
-        arguments pass a lambda instead of args."""
+        A vault found locked underneath goes to _handle_vault_locked; anything
+        else is shown — in a toast, or through `report` (a form's error line,
+        say). `prefix` heads the message and `dwell` holds the toast longer.
+        Calls needing keyword arguments pass a lambda."""
         try:
             return call(*args)
         except VaultLockedError:
@@ -276,16 +219,11 @@ class ActionsMixin:
     def apply_appearance(self, theme: str, font_size: str,
                          list_density: str | None = None):
         """Puts the three appearance settings on screen, previewed or saved.
-
-        list_density defaults to whatever is already in force, so the callers
-        that only ever move theme or font — startup, unlock, the Ctrl+/Ctrl-
-        pair — can keep passing two arguments and leave density alone.
-        """
+        list_density defaults to whatever is already in force."""
         if list_density is None:
             list_density = self.settings.get('list_density', 'compact')
 
-        # Captured before the settings dict is updated below, since that is what
-        # says which size and density we are coming from.
+        # Captured before self.settings is updated below.
         font_changed = font_size != self.settings.get('font_size')
         density_changed = list_density != self.settings.get('list_density')
 
@@ -299,58 +237,34 @@ class ActionsMixin:
         self.settings['theme'] = theme
         self.settings['font_size'] = font_size
         self.settings['list_density'] = list_density
-        # Set rather than toggled, so the tick tracks the theme that actually
-        # landed — including one arriving from the Settings swatches or from a
-        # preview being reverted, neither of which went through the menu.
-        # setChecked emits toggled, not triggered, so this cannot loop back into
-        # _toggle_theme.
+        # setChecked emits toggled, not triggered, so this cannot loop back.
         self._actions['theme'].setChecked(theme == 'dark')
         self.detail_view.set_theme(theme)
         self.dashboard_view.set_theme(theme)
 
-        # Icons are rendered pixmaps with their colour already baked in, and no
-        # style sheet can recolour one — every icon on screen has to be redrawn
-        # against the new palette by hand.
+        # Icons are pixmaps with their colour baked in; redraw every one.
         for widget in (self.findChildren(IconButton) + self.findChildren(ThemedIcon)
                        + self.findChildren(NavChip)):
             widget.apply_theme(theme)
 
-        # Two things measure themselves against the font in force when they are
-        # built and then hold that number: a category tab's setFixedWidth, and
-        # the size hint render_list() stores on every row. Neither notices the
-        # font moving underneath it, so after a change in Settings the tabs kept
-        # the old size while everything around them grew, and the rows clipped
-        # their own text. Both are re-measured below.
-        #
-        # All of it is guarded on there being tabs, which only exist once a
-        # vault has been loaded — this also runs before login, where there is
-        # nothing to measure — and skipped for a theme-only change, which moves
-        # no metrics and would otherwise rebuild every row for nothing.
-        #
-        # Only the font reaches the tabs; density is a property of a list row
-        # and leaves the bar alone.
+        # Category tabs fix their width, and list rows store a size hint, from
+        # the font in force when they were built — re-measure both after a font
+        # change. Guarded on there being tabs, which only exist once a vault is
+        # loaded; a theme-only change moves no metrics.
         if font_changed and self._category_tabs:
             self._rebuild_category_bar()
             self._check_current_tab()
 
-        # A row carries both the font metrics and the density layout, so either
-        # one moving means every row has to be built again. This is what makes
-        # density preview live from Settings rather than appear only on save.
         if (font_changed or density_changed) and self._category_tabs:
-            # The sidebar was fitted to the old metrics and every row has just
-            # changed size underneath it, so the fit is stale — at XL a compact
-            # row's meta line ran off the edge of a sidebar sized for 10pt. Fit
-            # again from the new measurements, unless the user has dragged the
-            # divider themselves, in which case their width stands.
+            # The sidebar was fitted to the old metrics; fit again unless the
+            # user dragged the divider themselves.
             if not self._sidebar_user_set:
                 self._sidebar_fitted = False
             self.render_list()
 
         # Chart colours are baked in when the cards are built, so the dashboard
-        # only picks up a theme change by being rebuilt. Guarded on it being the
-        # visible view: rebuilding one nobody is looking at costs a decrypt of
-        # every balance entry, and this also runs once before login, where
-        # reload() would hit a locked vault.
+        # is rebuilt — only when it is on screen, since that decrypts every
+        # balance entry.
         if self._dashboard_open():
             try:
                 self.dashboard_view.reload()
@@ -358,22 +272,13 @@ class ActionsMixin:
                 self._handle_vault_locked()
 
     def _apply_saved_appearance(self):
-        """Re-applies the three appearance settings from self.settings.
-
-        On the way out of the Settings dialog this is what turns a preview into
-        the settled state, and on a save failure it is what puts back whatever
-        self.settings still holds."""
+        """Re-applies the appearance settings from self.settings — settling a
+        Settings preview, or putting back what a failed save left."""
         self.apply_appearance(self.settings['theme'], self.settings['font_size'],
                               self.settings.get('list_density'))
 
     def _toggle_theme(self):
-        """Flips between the two palettes straight from the vault menu.
-
-        Saved rather than held for the session, for the same reason the font
-        keys save: a palette picked here and one picked in Settings are the same
-        setting, and it would be strange for only one of them to survive a
-        restart. apply_appearance is what puts the new tick on the menu entry.
-        """
+        """Flips between the two palettes from the vault menu, and saves it."""
         theme = 'light' if self.settings.get('theme') == 'dark' else 'dark'
         try:
             preferences.save_settings(**{**self.settings, 'theme': theme})
@@ -386,31 +291,22 @@ class ActionsMixin:
         self.show_toast(f"{theme.capitalize()} mode.")
 
     def _step_font(self, step: int):
-        """Moves the font one place along FONT_SIZE_STEPS and saves it there.
+        """Moves the font one place along preferences.FONT_SIZE_CHOICES and saves it.
 
-        Written through preferences.save_settings rather than held in memory, so a size
-        reached by keyboard survives a restart exactly as one picked in Settings
-        does, and Settings opens showing the size actually on screen.
-
-        apply_appearance is what updates self.settings, and it does so *after*
-        comparing the size it was handed against the one still recorded there —
-        that comparison is how it decides whether to re-measure the category
-        tabs and list rows that cache metrics from the old font. So nothing here
-        may write self.settings['font_size'] first: doing so would make the test
-        always false and leave both stale. The Settings dialog previews through
-        the same call for the same reason.
-        """
-        order = [key for key, _ in FONT_SIZE_STEPS]
+        self.settings['font_size'] must not be updated here: apply_appearance
+        compares against it to decide whether to re-measure tabs and rows."""
+        order = list(preferences.VALID_FONT_SIZES)
+        labels = dict(preferences.FONT_SIZE_CHOICES)
         current = self.settings.get('font_size', 'default')
         index = order.index(current) if current in order else order.index('default')
         target = index + step
 
         if not 0 <= target < len(order):
             edge = 'largest' if step > 0 else 'smallest'
-            self.show_toast(f"Text is already at its {edge} ({FONT_SIZE_STEPS[index][1]}).")
+            self.show_toast(f"Text is already at its {edge} ({labels[order[index]]}).")
             return
 
-        key, label = FONT_SIZE_STEPS[target]
+        key = order[target]
         try:
             preferences.save_settings(**{**self.settings, 'font_size': key})
             auth.apply_saved_settings()
@@ -419,7 +315,7 @@ class ActionsMixin:
             return
 
         self.apply_appearance(self.settings['theme'], key)
-        self.show_toast(f"Text size: {label}.")
+        self.show_toast(f"Text size: {labels[key]}.")
 
     # -----------------------------------------------------------------
     # Handlers with no view of their own
@@ -432,11 +328,8 @@ class ActionsMixin:
         if not self.search_input.text():
             return
         self.search_input.clear()
-        # Straight to the reload rather than through the 250ms debounce the
-        # clear() above just restarted. That delay is there to keep a run of
-        # keystrokes from decrypting the vault once per letter; an explicit
-        # Escape is one deliberate action, and waiting it out makes the key
-        # feel broken.
+        # Straight to the reload rather than through the search debounce: this
+        # is one deliberate action, not a run of keystrokes.
         self._search_timer.stop()
         self._run_search()
         self.account_list.setFocus()
@@ -452,11 +345,8 @@ class ActionsMixin:
         return next((a for a in self.accounts if a['id'] == self.selected_id), None)
 
     def _copy_field(self, key: str):
-        """Copies one field of the selected account straight to the clipboard.
-
-        Goes through the same copy_to_clipboard the detail view's buttons use,
-        so the clipboard-history opt-out and the auto-clear timer apply exactly
-        as they do to a clicked copy."""
+        """Copies one field of the selected account to the clipboard, through the
+        same copy_to_clipboard the detail view's buttons use."""
         account = self._selected_account()
         if account is None:
             self.show_toast('Select an account first.')

@@ -14,7 +14,7 @@ import base64
 import pytest
 from cryptography.exceptions import InvalidTag
 
-import encryption
+from core import encryption
 
 
 # -- the envelope --------------------------------------------------------------

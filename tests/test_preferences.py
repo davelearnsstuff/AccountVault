@@ -12,8 +12,8 @@
 
 import pytest
 
-import database
-import preferences
+from core import database
+from core import preferences
 
 
 def store(key: str, value: str):

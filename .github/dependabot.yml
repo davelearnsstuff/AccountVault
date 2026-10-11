@@ -15,7 +15,7 @@
 version: 2
 updates:
   - package-ecosystem: "pip"
-    directory: "/"
+    directory: "/requirements"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 3
@@ -31,3 +31,10 @@ updates:
     # cryptography, cffi, pycparser and the argon2 packages are deliberately
     # left ungrouped: they are what the vault's security actually rests on, and
     # each one is worth seeing and reviewing by itself.
+
+  # The workflow pins its actions to commit hashes; this keeps those current.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 3

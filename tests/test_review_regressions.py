@@ -17,7 +17,7 @@ import sys
 import pytest
 from PySide6.QtTest import QTest
 
-import database
+from core import database
 from conftest import _destroy, corrupt, make_account
 from services import accounts as accounts_service
 
@@ -152,7 +152,7 @@ def test_an_ordinary_entry_still_cannot_be_dated_into_the_future(qt_app):
 # -- 5. Date Due sorted on the anchor, not the displayed date -----------------
 
 def test_due_date_sort_follows_the_date_the_row_displays(window, qt_app):
-    from categories import DUE_CYCLE_KEY, MONTHLY, next_due_date
+    from core.categories import DUE_CYCLE_KEY, MONTHLY, next_due_date
     from ui.account_list import ALL
 
     window.current_category = ALL
@@ -222,11 +222,22 @@ def test_a_search_keeps_the_tab_counts_current(window, qt_app):
 
 # -- 9. the excepthook crashed when sys.stderr was None -----------------------
 
-def test_the_excepthook_survives_a_missing_stderr(monkeypatch):
+@pytest.fixture
+def quiet_hook(monkeypatch, tmp_path):
+    """The hook with its log redirected to tmp_path and its dialog stubbed out
+    — a modal box would hang an offscreen run. Yields the reported errors."""
     import main as main_module
 
+    reported = []
+    monkeypatch.setattr(main_module, 'error_log_path', lambda: tmp_path / 'errors.log')
+    monkeypatch.setattr(main_module, '_report_error',
+                        lambda exc_type, path: reported.append((exc_type, path)))
     monkeypatch.setattr(sys, 'excepthook', sys.__excepthook__)
     main_module._install_excepthook()
+    yield reported
+
+
+def test_the_excepthook_survives_a_missing_stderr(monkeypatch, quiet_hook):
     monkeypatch.setattr(sys, 'stderr', None)      # what pythonw.exe gives us
 
     try:
@@ -234,14 +245,12 @@ def test_the_excepthook_survives_a_missing_stderr(monkeypatch):
     except ValueError:
         sys.excepthook(*sys.exc_info())           # must not raise
 
+    assert [exc_type for exc_type, _ in quiet_hook] == [ValueError]
 
-def test_the_excepthook_still_prints_a_traceback(monkeypatch):
+
+def test_the_excepthook_still_prints_a_traceback(monkeypatch, quiet_hook):
     import io
 
-    import main as main_module
-
-    monkeypatch.setattr(sys, 'excepthook', sys.__excepthook__)
-    main_module._install_excepthook()
     stream = io.StringIO()
     monkeypatch.setattr(sys, 'stderr', stream)
 
@@ -284,8 +293,8 @@ def test_the_unreadable_entry_notice_is_not_repeated(vault, qt_app):
 # -- 11. get_settings hardcoded the key list a second time --------------------
 
 def test_a_setting_added_to_the_defaults_is_read_back(vault, monkeypatch):
-    import preferences
-    from database import write_config
+    from core import preferences
+    from core.database import write_config
 
     monkeypatch.setitem(preferences._SETTING_DEFAULTS, 'show_tooltips', 'off')
     write_config('show_tooltips', 'on')

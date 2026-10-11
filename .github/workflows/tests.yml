@@ -1,18 +1,17 @@
 # Runs the suite on every push and pull request.
 #
-# This is the half of the pinning story that was missing. .github/dependabot.yml
-# argues that exact pins are safe *because* something watches for the next
-# release — but Dependabot only opens the pull request. Without this, a bump to
-# cryptography or argon2-cffi could be merged with nothing having checked that
-# the vault still opens under it, which is the one thing the pins exist to
-# protect.
+# Dependabot only opens the pull request for a version bump; this is what checks
+# the vault still opens under it before it can be merged.
 #
-# Windows only, deliberately. It is the platform the app is developed and run
-# on, the only one where restrict_to_owner does real work (icacls and an ACL
-# rather than a mode bit), and the one whose CRLF handling the export tests are
-# actually about. A Linux job would need the Qt platform libraries installed
-# before the widget tests could load PySide6 at all; worth adding, but not worth
-# a red tick that means nothing.
+# Windows only, deliberately: it is the platform the app is developed and run
+# on, and the only one where restrict_to_owner does real work (icacls and an
+# ACL). A Linux job would need the Qt platform libraries installed first.
+#
+# Tested on the oldest and newest Python that requirements.lock carries hashes
+# for, so a bump that drops support for either end fails here.
+#
+# Actions are pinned to a commit rather than a tag, which can be moved;
+# Dependabot keeps the pins current.
 name: tests
 
 on:
@@ -26,24 +25,23 @@ permissions:
 jobs:
   pytest:
     runs-on: windows-latest
+    strategy:
+      matrix:
+        python-version: ['3.11', '3.14']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
         with:
-          python-version: '3.14'
+          python-version: ${{ matrix.python-version }}
           cache: pip
 
       # The lock files, not the .txt ones: --require-hashes is the check
-      # start.bat now performs on a user's machine, so it is the one CI has to
-      # keep working. A version bump that lands without a regenerated lock
-      # fails here rather than at somebody's first install.
-      #
-      # pip is deliberately not upgraded first. That would fetch and run an
-      # unverified copy of the very tool about to do the verifying, and the pip
-      # setup-python ships is new enough for --require-hashes by many years.
+      # AccountVault_Windows.bat performs on a user's machine, so it is the one
+      # CI has to keep working. pip is not upgraded first; that would fetch an
+      # unverified copy of the tool about to do the verifying.
       - name: Install dependencies
-        run: python -m pip install --require-hashes -r requirements.lock -r requirements-dev.lock
+        run: python -m pip install --require-hashes -r requirements/requirements.lock -r requirements/requirements-dev.lock
 
       - name: Run tests
         run: python -m pytest tests/ -q

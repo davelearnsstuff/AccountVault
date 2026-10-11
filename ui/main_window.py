@@ -2,20 +2,15 @@
 # ui/main_window.py
 # The application window.
 #
-# What is left here after the split is the coordinator: the widget tree, the
-# account form's lifecycle, the unsaved-changes guard, the dashboard toggle,
-# and the handful of things that genuinely span the other three — a save has to
-# write through the service, reload the list, and put the selection back.
-#
-# The three mixins are the rest of it, and each says at the top which slice of
-# this window's state it owns:
+# The coordinator: the widget tree, the account form's lifecycle, the
+# unsaved-changes guard, the dashboard toggle, and the things that span the
+# mixins — a save writes through the service, reloads the list, and puts the
+# selection back. The mixins are the rest, each stating which slice of the
+# window's state it owns:
 #
 #   ui/actions.py        commands, shortcuts, the vault menu, appearance
 #   ui/vault_session.py  which vault, locked or not, and everything on a clock
 #   ui/account_list.py   the list, the tab bar, search, sort, bulk actions
-#
-# They are mixins rather than collaborators, which is a real limit on what this
-# buys — see the note in ui/actions.py.
 # -----------------------------------------------------------------------------
 
 from PySide6.QtCore import QEvent, Qt, QTimer
@@ -25,9 +20,9 @@ from PySide6.QtWidgets import (
     QSizePolicy, QSplitter, QStackedWidget, QVBoxLayout, QWidget,
 )
 
-import preferences
-from categories import attention_counts, get_config, normalize_category
-from encryption import VaultLockedError
+from core import preferences
+from core.categories import attention_counts, get_config, normalize_category
+from core.encryption import VaultLockedError
 from services import accounts as accounts_service
 from ui import dialogs
 from ui.account_form import AccountForm
@@ -40,17 +35,20 @@ from ui.dashboard_view import DashboardView
 from ui.detail_view import (
     DETAIL_MIN_WIDTH, BulkView, DetailView, PlaceholderView,
 )
-from ui.vault_session import VaultSessionMixin, _ActivityFilter
-from ui.widgets import FlowLayout, IconButton, NavChip, ThemedIcon, Toast
+from ui.vault_session import (
+    VaultSessionMixin, _ActivityFilter, is_session_lock, unwatch_session_lock,
+    watch_session_lock,
+)
+from ui.widgets import (
+    FlowLayout, IconButton, NavChip, ThemedIcon, Toast, plain_label, plain_text,
+)
 
 # Nav icon sizes. The bar is a fixed 56px tall, so these do not scale with the
-# font setting — a larger icon would have nowhere to grow into.
+# font setting.
 NAV_ICON_PX = 20
 NAV_BRAND_PX = 22
 
-# How long a deleted account can be brought back. Long enough to notice the
-# toast and reach for it, short enough that the window has closed by the time
-# the user has moved on to something else — see _delete_account.
+# How long a deleted account can be brought back.
 UNDO_WINDOW_MS = 10_000
 
 
@@ -80,9 +78,8 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
         self.closed_count = 0
         self.favorite_count = 0
         self.all_categories: set[str] = set()
-        # Every key attention_counts returns, so a reader before the first
-        # load sees zeros rather than a KeyError. 'lapsed' was missing, and
-        # _attention_hint reads it.
+        # Every key attention_counts returns, so a reader before the first load
+        # sees zeros rather than a KeyError.
         self.attention = attention_counts([])
         self.sort_key = 'name'
         self.sort_descending = False
@@ -90,31 +87,28 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
         self.form: AccountForm | None = None
         self._pending_navigation = None
         self._sidebar_fitted = False
-        # Whether the sidebar width on screen is one the user chose, and so
-        # worth remembering. An auto-fitted width is not: it was measured from
-        # whatever rows happened to be loaded, and storing it would freeze the
-        # fit at that moment and stop it ever tracking the vault again.
+        # Whether the sidebar width on screen is one the user chose. An
+        # auto-fitted width is not stored, so the fit keeps tracking the vault.
         self._sidebar_user_set = False
         self._warned_of_lock = False
         self._copied_value = None
-        # The last deleted account, still openable, for as long as the undo
-        # toast is up. Ciphertext rather than decrypted fields — see
-        # services.accounts.delete_account — and dropped by close_vault and
-        # lock_vault, because rows encrypted under one vault's key must never
-        # be offered for restore into another's.
+        # The last deleted account, still restorable while the undo toast is up.
+        # Ciphertext, and dropped by close_vault and lock_vault.
         self._undo_delete = None
-        # The day the scheduled backup was last considered, so the session tick
-        # can notice the date turning over without asking once a second.
+        # The day the scheduled backup was last considered.
         self._backup_checked_on = None
+        # The window handle registered for Windows session-lock notifications:
+        # None until first shown, 0 if registration was not possible.
+        self._session_watch = None
 
-        # Before the screens, because _build_main_screen puts the vault menu
-        # together and that menu shows these very actions rather than copies.
+        # Before the screens: the vault menu shows these very actions.
         self._build_actions()
 
         # --- screens ---
         self.chooser_screen = ChooserScreen()
         self.chooser_screen.open_requested.connect(self._open_vault_dialog)
         self.chooser_screen.create_requested.connect(self._create_vault_dialog)
+        self.chooser_screen.demo_requested.connect(self._create_demo_vault_dialog)
         self.chooser_screen.recent_activated.connect(self._open_vault_path)
         self.chooser_screen.forget_requested.connect(self._forget_vault)
         self.chooser_screen.clear_requested.connect(self._clear_recent)
@@ -129,9 +123,6 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
         self.login_screen.switch_requested.connect(self._switch_vault)
         self.login_screen.quit_requested.connect(self.close)
 
-        # Held by name rather than reached for by index. The stack used to be
-        # addressed as widget(2), which was one screen away from being wrong the
-        # moment a fourth was added — and adding the chooser is exactly that.
         self.main_screen = self._build_main_screen()
 
         self.screens = QStackedWidget()
@@ -164,21 +155,16 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
         QApplication.instance().installEventFilter(_ActivityFilter(self))
 
     def _restore_geometry(self):
-        """Puts the window back where it was last closed, falling back to a
-        sensible default size the first time — and any time the stored blob is
-        one Qt declines (a screen that has since been unplugged, most often)."""
+        """Puts the window back where it was last closed, or a default size when
+        there is no stored geometry or Qt declines it (an unplugged screen)."""
         stored = preferences.get_window_geometry()
         if stored and self.restoreGeometry(stored):
             return
         self.resize(1180, 780)
 
     def _save_window_state(self):
-        """Records the window and sidebar geometry for the next launch. Called
-        from closeEvent, which is the one moment both are final."""
+        """Records the window and sidebar geometry for the next launch."""
         preferences.save_window_geometry(bytes(self.saveGeometry()))
-        # Only a width the user chose. An auto-fitted one is left unstored so
-        # the fit runs again next launch and keeps tracking the vault as its
-        # rows get longer, rather than being frozen at today's measurement.
         if self._sidebar_user_set:
             preferences.save_sidebar_width(self.splitter.sizes()[0])
 
@@ -196,7 +182,9 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
 
         self.dashboard_view = DashboardView(self.settings['theme'])
         self.dashboard_view.category_activated.connect(self._open_category_from_dashboard)
-        self.dashboard_panel = self._wrap_panel(self.dashboard_view, 'Dashboard')
+        self.dashboard_view.account_activated.connect(self._open_account_from_dashboard)
+        self.dashboard_panel = self._wrap_panel(
+            self.dashboard_view, 'Dashboard', self.dashboard_view.section_links)
         self.dashboard_panel.hide()
 
         self.content_area = self._build_content_area()
@@ -215,9 +203,7 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
         nav.setObjectName('TopNav')
         nav.setFixedHeight(56)
 
-        # The brand mark is the same padlock as the window icon, so the taskbar
-        # and the nav bar agree on what this app looks like. Repainted by
-        # apply_appearance, since a pixmap cannot follow the theme on its own.
+        # The same padlock as the window icon. Repainted by apply_appearance.
         self._brand_icon = ThemedIcon('lock', role='accent', size=NAV_BRAND_PX)
 
         brand_text = QLabel('AccountVault')
@@ -228,8 +214,7 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
         brand.addWidget(self._brand_icon)
         brand.addWidget(brand_text)
 
-        # Countdown chips. Both stay hidden until they have something to report,
-        # so the bar looks exactly as it did until a promise is actually running.
+        # Countdown chips, hidden until they have something to report.
         self.clipboard_chip = NavChip('info')
         self.clipboard_chip.clicked.connect(self._clear_clipboard_now)
 
@@ -242,10 +227,6 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
         )
         manage_button.setObjectName('NavIcon')
         manage_button.setFixedWidth(40)
-        # A menu, not a dialog. Every one of these actions used to cost two
-        # steps — open a modal, pick from seven buttons, watch it close, wait
-        # for the real dialog — and the menu also gives the shortcuts somewhere
-        # to advertise themselves, which a dialog full of buttons never could.
         manage_button.setMenu(self._build_manage_menu())
 
         lock_button = IconButton('lock', 'Lock vault  (Ctrl+L)', size=NAV_ICON_PX,
@@ -276,8 +257,7 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
     def _build_category_bar(self) -> QWidget:
         """The view switcher: a Dashboard tab followed by one tab per category
         that has accounts. Exactly one is checked, and it is always the view on
-        screen — that is the only indication of where you are, so every path
-        that changes the view has to keep it honest."""
+        screen."""
         bar = QFrame()
         bar.setObjectName('CategoryBar')
         # Height comes from how many rows the tabs wrap onto at the current width.
@@ -288,11 +268,10 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
         self.category_buttons = QButtonGroup(self)
         self.category_buttons.setExclusive(True)
 
-        # Flow, not a plain row: with every category populated the tabs are wider
-        # than the minimum window, and they need to wrap rather than clip.
+        # Flow, so the tabs wrap rather than clip in a narrow window.
         self._category_row = FlowLayout(bar, spacing=4)
         self._category_row.setContentsMargins(16, 3, 16, 3)
-        bar.hide()  # Stays hidden until a vault load fills it in.
+        bar.hide()  # Until a vault load fills it in.
         return bar
 
     def _build_content_area(self) -> QWidget:
@@ -308,8 +287,7 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
         return self.splitter
 
     def _on_splitter_moved(self, *_args):
-        """A drag of the divider is the user choosing a width, which is the only
-        kind worth carrying to the next launch."""
+        """A drag of the divider is the user choosing a width."""
         self._sidebar_user_set = True
 
     def _build_list_panel(self) -> QWidget:
@@ -318,7 +296,8 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
         panel.setMinimumWidth(SIDEBAR_MIN)
         panel.setMaximumWidth(SIDEBAR_MAX)
 
-        self.list_title = QLabel('All Accounts')
+        # A custom category's name is vault content.
+        self.list_title = plain_label('All Accounts')
         self.list_title.setObjectName('ListTitle')
 
         self.add_button = QPushButton('+ Add New')
@@ -326,8 +305,20 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
         self.add_button.setAccessibleName('Add new account')
         self.add_button.clicked.connect(self._start_add)
 
+        # Needs Attention only: load_category shows it there.
+        self.refresh_button = IconButton(
+            'refresh', 'Refresh — drop accounts that no longer need attention',
+            size=14, label='Refresh Needs Attention',
+        )
+        self.refresh_button.setObjectName('Small')
+        self.refresh_button.setFixedWidth(30)
+        self.refresh_button.clicked.connect(self._refresh_attention)
+        self.refresh_button.hide()
+
         header = QHBoxLayout()
-        header.addWidget(self.list_title, 1)
+        header.addWidget(self.list_title)
+        header.addWidget(self.refresh_button)
+        header.addStretch(1)
         header.addWidget(self.add_button)
 
         self.search_input = QLineEdit()
@@ -335,7 +326,7 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
         self.search_input.setClearButtonEnabled(True)
         self.search_input.setAccessibleName('Search accounts')
         self.search_input.setAccessibleDescription(
-            'Matches names, usernames, websites and notes. Secrets are excluded.'
+            'Matches names, usernames and websites. Secrets and notes are excluded.'
         )
         self.search_input.textChanged.connect(self._on_search_typed)
 
@@ -346,8 +337,6 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
         self.sort_combo.setAccessibleName('Sort order')
         self.sort_combo.currentIndexChanged.connect(self._on_sort_changed)
 
-        # Each sort used to run one hardcoded direction — A–Z could not be
-        # reversed, and Last Updated could only ever show the newest first.
         self.sort_direction = IconButton('arrow-down', size=14, label='Sort direction')
         self.sort_direction.setObjectName('Small')
         self.sort_direction.setFixedWidth(30)
@@ -361,16 +350,11 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
 
         self.account_list = QListWidget()
         self.account_list.setAccessibleName('Accounts')
-        # Shift/Ctrl-click to pick several, for the bulk actions in BulkView.
-        # Rubber-band drag selection is deliberately not enabled: rows are tall
-        # and a stray drag would silently reselect half the list.
+        # Shift/Ctrl-click to pick several for the bulk actions. No rubber-band
+        # drag: rows are tall and a stray drag would reselect half the list.
         self.account_list.setSelectionMode(QListWidget.ExtendedSelection)
-        # Rows never scroll sideways. A compact row's meta line can outrun a
-        # sidebar the user has dragged narrow, or one already at SIDEBAR_MAX,
-        # and the honest answer there is to let the tail clip: it is a summary,
-        # the full values are one click away in the detail pane, and a
-        # horizontal scrollbar under a vertical list is a control nobody goes
-        # looking for.
+        # Rows clip rather than scroll sideways: the full values are one click
+        # away in the detail pane.
         self.account_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.account_list.itemSelectionChanged.connect(self._on_selection_changed)
 
@@ -385,8 +369,8 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
     def _build_detail_panel(self) -> QWidget:
         panel = QFrame()
         panel.setObjectName('DetailPanel')
-        # Keeps the splitter — auto-fit or hand-dragged — from ever shrinking
-        # a pinned field value's grid column below what DetailView assumes.
+        # Keeps the splitter from shrinking a field value's column below what
+        # DetailView assumes.
         panel.setMinimumWidth(DETAIL_MIN_WIDTH)
 
         self.placeholder = PlaceholderView()
@@ -398,6 +382,8 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
         self.detail_view.favorite_toggled.connect(self._toggle_favorite)
         self.detail_view.quick_update_requested.connect(self._quick_update)
         self.detail_view.touch_requested.connect(self._touch_account)
+        self.detail_view.navigate_requested.connect(self._step_account)
+        self.detail_view.set_navigator(self._navigation_state)
         self.detail_view.copy_requested.connect(self.copy_to_clipboard)
         self.detail_view.history_changed.connect(self._on_history_changed)
         self.detail_view.error.connect(self.show_toast)
@@ -410,20 +396,22 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
         self.bulk_view.close_requested.connect(self._bulk_set_closed)
         self.bulk_view.category_requested.connect(self._bulk_set_category)
         self.bulk_view.clear_requested.connect(self._clear_selection)
+        self._bulk_scroll = self._scrolled(self.bulk_view)
 
         self.detail_stack = QStackedWidget()
         self.detail_stack.addWidget(self.placeholder)
         self.detail_stack.addWidget(self._detail_scroll)
-        self.detail_stack.addWidget(self._scrolled(self.bulk_view))
+        self.detail_stack.addWidget(self._bulk_scroll)
 
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.detail_stack)
         return panel
 
-    def _wrap_panel(self, widget: QWidget, title: str) -> QWidget:
-        """Titled panel. Leaving it is the tab bar's job, so there is no close
-        button here — two ways out would be two things to keep in sync."""
+    def _wrap_panel(self, widget: QWidget, title: str,
+                    controls: QWidget | None = None) -> QWidget:
+        """Titled panel, with any controls beside the title. Leaving it is the
+        tab bar's job, so there is no close button."""
         panel = QFrame()
         panel.setObjectName('DashboardPanel')
 
@@ -432,7 +420,11 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
 
         header = QHBoxLayout()
         header.setContentsMargins(16, 12, 16, 8)
-        header.addWidget(heading, 1)
+        header.setSpacing(16)
+        header.addWidget(heading)
+        if controls is not None:
+            header.addWidget(controls)
+        header.addStretch(1)
 
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -469,9 +461,7 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
 
     def _start_edit(self, account: dict):
         category = account.get('_category') or account.get('category')
-        # Guarded here rather than in _edit_selected so the Ctrl+E shortcut and
-        # the detail pane's Edit button are both covered by the one check.
-        # Ctrl+E fires whatever is on screen, so it could land on a dirty form.
+        # Guarded here so Ctrl+E and the Edit button share the one check.
         if not self._confirm_leaving_form(('edit', account['id'], category)):
             return
         self._open_form(account, category)
@@ -526,17 +516,14 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
         self.show_toast('Account updated.' if account_id else 'Account added.')
 
         target = normalize_category(saved['category'])
-        # The saved row is named before the reload, not highlighted after it.
-        # Every branch below ends in a render, and re-applying the selection
-        # afterwards meant building every row a second time to do it.
+        # The saved row is named before the reload, so a single render
+        # highlights it.
         if self.search_query:
-            # Stay in the results rather than dropping back to a category list.
             self.selected_id = saved['id']
             self.selected_category = target
             self._run_search(keep_selection=True)
         elif self.current_category not in AGGREGATE_TABS and target != self.current_category:
-            # Adding or re-categorising can move a record out of the current
-            # view; follow it so the user keeps seeing what they just saved.
+            # Adding or recategorising moved the record out of this view; follow it.
             self.load_category(target, select_first=False, select=(saved['id'], target))
         else:
             self.load_category(self.current_category, select_first=False,
@@ -545,8 +532,8 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
         if any(a['id'] == saved['id'] for a in self.accounts):
             self._select_account(saved['id'], target)
         else:
-            # The edit moved it out of the list on screen — most often a rename
-            # that no longer matches the active search.
+            # The edit moved it out of the list — a rename that no longer
+            # matches the search, say.
             self.selected_id = None
             self._show_placeholder()
 
@@ -554,27 +541,17 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
             self._run_pending_navigation()
 
     def _delete_account(self, account: dict):
-        """Deletes an account, and offers it back for ten seconds.
-
-        The confirmation stays. It is not made redundant by the undo — the two
-        catch different mistakes. The dialog catches the click that was never
-        meant; the undo catches the one that was meant and turns out to have
-        been wrong, which no amount of confirming prevents because the user
-        already believed they were sure.
-
-        What changed is the wording. 'This cannot be undone' was true when
-        there was nothing to undo it with, and repeating it next to an Undo
-        button would be the app lying about its own behaviour. It says what is
-        actually on offer instead: the window, and what happens when it closes.
-        """
+        """Deletes an account after confirmation, and offers it back for ten
+        seconds. The confirmation catches the click that was never meant; the
+        undo catches the one that was meant and turned out wrong."""
         config = get_config(account.get('_category') or self.current_category)
         name = account.get(config['name_field']) or f"this {config['item_label'].lower()}"
 
         confirmed = QMessageBox.question(
             self, 'Delete Account',
-            f"Delete {name}?\n\nIt and its balance history go immediately. There "
-            f"is a {UNDO_WINDOW_MS // 1000}-second window to undo it, and after "
-            f"that only a backup can bring it back.",
+            plain_text(f"Delete {name}?\n\nIt and its balance history go immediately. "
+                       f"There is a {UNDO_WINDOW_MS // 1000}-second window to undo it, "
+                       f"and after that only a backup can bring it back."),
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
         )
         if confirmed != QMessageBox.Yes:
@@ -584,10 +561,8 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
         if token is _FAILED:
             return
 
-        # Held rather than passed into the closure alone, so lock_vault and
-        # close_vault have something to drop. A token is rows encrypted under
-        # this vault's key; restoring one into a different vault would write
-        # rows nothing there can open.
+        # Held on the window as well as in the closure, so lock_vault and
+        # close_vault have something to drop.
         self._undo_delete = token
         self.selected_id = None
         self.selected_category = None
@@ -602,13 +577,9 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
     def _undo_last_delete(self, token: dict):
         """Puts back the account the toast is still offering.
 
-        The token is compared against the one being held rather than simply
-        used. The toast drops its callback when it expires, so this should be
-        unreachable afterwards — but a lock in the middle of the window clears
-        the held token without the toast knowing, and that is the case this
-        check is for: the restore must not run against a vault that is no
-        longer the one the rows came from.
-        """
+        The token is compared with the one held: a lock during the window clears
+        the held token without the toast knowing, and the restore must not run
+        against a vault the rows did not come from."""
         if token is not self._undo_delete:
             self.show_toast('That delete can no longer be undone.', 3000)
             return
@@ -620,35 +591,25 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
             return
 
         self.show_toast('Account restored.')
-        # Reloading first, then selecting out of what came back: the restored
-        # row keeps its original id, so this lands on the same account rather
-        # than on whatever now occupies its place in the list.
+        # The restored row keeps its original id.
         self._reload_view()
         restored = next((a for a in self.accounts if a['id'] == account_id), None)
         if restored is not None:
             self._select_account(account_id, restored.get('_category'))
 
     def _toggle_favorite(self, account: dict, favorite: bool):
-        """Pins or unpins the account on screen.
-
-        A full reload rather than only redrawing the pane, because the pin is
-        visible in three places at once: the star in the header, the star on
-        the row, and the Favorites tab, which appears with the first pin and
-        goes with the last.
-        """
+        """Pins or unpins the account on screen. A full reload, because the pin
+        shows on the header, the row, and the Favorites tab."""
         if self._attempt(accounts_service.set_favorite, account['id'], favorite,
                          prefix='Could not change this pin') is _FAILED:
             return
 
         self.show_toast('Pinned to Favorites.' if favorite else 'Unpinned.')
-        # Held across the reload below, which rebuilds self.accounts and so
-        # invalidates the dict this was handed.
+        # Held across the reload, which replaces the dict this was handed.
         account_id = account['id']
         category = account.get('_category')
         self._reload_view()
-        # Unpinning from inside the Favorites view moves the row out of the
-        # list it was selected in, which is the one case there is nothing left
-        # to re-select.
+        # Unpinning from inside Favorites moves the row out of the list.
         if any(a['id'] == account_id for a in self.accounts):
             self._select_account(account_id, category)
         else:
@@ -672,9 +633,8 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
         updated = dict(account)
         updated.update(changes)
 
-        # The 'as of' date only describes an amount, so it is only meaningful
-        # when one was actually entered. update_account decides from it whether
-        # the figure is current or history alone, and writes both in one go.
+        # The 'as of' date only describes an amount, so it applies only when
+        # one was entered.
         as_of = dialog.balance_date() if 'current_balance' in changes else None
         if self._attempt(lambda: accounts_service.update_account(
                 account['id'], updated, balance_date=as_of)) is _FAILED:
@@ -682,7 +642,8 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
         self._refresh_selected(account)
 
     def _refresh_selected(self, account: dict):
-        """Re-reads one account and refreshes both panes without losing the selection."""
+        """Re-reads one account and refreshes both panes without losing the
+        selection or the reading position."""
         fresh = self._attempt(accounts_service.get_account, account['id'])
         if fresh is _FAILED:
             return
@@ -693,30 +654,23 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
                 self.accounts[index] = fresh
                 break
 
-        # Where the user was reading, kept across the rebuild below. Quick
-        # Update, No Change and every balance-history edit land here, and all
-        # three are things you do partway down a long account — being thrown
-        # back to the top afterwards is the app losing your place on your
-        # behalf. Deliberately does not restore which secrets were revealed:
-        # re-masking on a refresh is the safer default, and nothing here is
-        # worth weakening it for.
+        # Revealed secrets are deliberately re-masked by the rebuild; only the
+        # scroll position is kept.
         scrollbar = self._detail_scroll.verticalScrollBar()
-        offset = scrollbar.value() if self.detail_stack.currentIndex() == 1 else 0
+        offset = (scrollbar.value()
+                  if self.detail_stack.currentWidget() is self._detail_scroll else 0)
 
         self.render_list()
         self.detail_view.show_account(fresh)
-        self.detail_stack.setCurrentIndex(1)
+        self.detail_stack.setCurrentWidget(self._detail_scroll)
 
         if offset:
-            # Deferred: the new content has not been laid out yet, so the
-            # scrollbar's range is still the old one and a value past it would
-            # clamp to whatever the previous account happened to be tall.
+            # Deferred until the new content has a scroll range to hold it.
             QTimer.singleShot(0, lambda: scrollbar.setValue(offset))
 
     def _on_history_changed(self):
-        """A history edit can move the account's balance and last_updated — the
-        newest entry is what the account currently holds — so the account is
-        re-read rather than the in-memory copy being redrawn from stale values."""
+        """A history edit can move the account's balance and last_updated, so
+        the account is re-read rather than redrawn."""
         if self.selected_id is None:
             return
         account = next((a for a in self.accounts if a['id'] == self.selected_id), None)
@@ -730,13 +684,9 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
         """True when navigation may go ahead now.
 
         False means a dirty form is in the way: `pending` has been parked and
-        the unsaved-changes prompt is up, and whichever button the user picks
-        either runs that navigation or drops it.
-
-        Every path that replaces the form goes through here. The check used to
-        be spelled out at three of the five, and the two without it — Ctrl+E and
-        extending the list selection — reached _discard_form with unsaved edits
-        behind them and no prompt at all."""
+        the unsaved-changes prompt is up, and the user's answer either runs that
+        navigation or drops it. Every path that replaces the form, or closes
+        the window, goes through here."""
         if self.form is None or not self.form.is_dirty():
             return True
         self._pending_navigation = pending
@@ -755,10 +705,14 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
         clicked = box.clickedButton()
         if clicked is save:
             # _save_account runs the pending navigation once the write succeeds.
-            # Guarded like the Discard branch below: exec() above spins the event
-            # loop, and an idle lock landing in it discards the form.
+            # exec() spins the event loop, and an idle lock there discards the
+            # form, hence the checks.
             if self.form is not None:
                 self.form.submit()
+            if self.form is not None:
+                # The save was refused and the form is still up with its error.
+                # Drop the navigation rather than run it after some later save.
+                self._pending_navigation = None
         elif clicked is discard:
             if self.form is not None:
                 self.form.clear_dirty()
@@ -773,9 +727,7 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
             return
         kind, value, category = pending
 
-        # Every destination replaces the form, and the user has already chosen
-        # Save or Discard by the time this runs — drop it here so no branch can
-        # leave the resolved form mounted and have it reappear later.
+        # Save or Discard has been chosen by now, so the form goes either way.
         self._discard_form()
 
         if kind == 'select':
@@ -783,8 +735,7 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
         elif kind == 'bulk':
             self._show_bulk(value)
         elif kind == 'edit':
-            # Re-found rather than carried: choosing Save on the prompt rebuilt
-            # self.accounts, so the dict captured before it is stale.
+            # Re-found: a Save on the prompt rebuilt self.accounts.
             account = next((a for a in self.accounts if a['id'] == value), None)
             if account is not None:
                 self._start_edit(account)
@@ -795,14 +746,16 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
             self._show_dashboard()
         elif kind == 'add':
             self._start_add()
+        elif kind == 'quit':
+            # Deferred: this can run from inside closeEvent.
+            QTimer.singleShot(0, self.close)
 
     # -----------------------------------------------------------------
     # Dashboard
     # -----------------------------------------------------------------
     def _dashboard_open(self) -> bool:
-        # isVisible() is false for the whole main screen while the login screen
-        # is up, so ask the panel whether it is the chosen view, not whether it
-        # is currently painted.
+        # Whether the panel is the chosen view, not whether it is painted —
+        # the whole main screen is hidden while the login screen is up.
         return not self.dashboard_panel.isHidden()
 
     def _show_dashboard(self):
@@ -820,16 +773,30 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
         self._check_current_tab()
 
     def _open_category_from_dashboard(self, category: str):
-        """Clicking a category card leaves the dashboard for that category.
-
-        Routed through _on_tab_selected rather than load_category so it takes
-        the same path a tab click does — including the unsaved-form guard, and
-        the tab-highlight bookkeeping that keeps the bar honest about which view
-        is on screen. A category with a card but no tab (every one of its
-        accounts closed since) is ignored rather than loading a view no tab
-        stands for."""
+        """Clicking a category card goes to that category, the same way a tab
+        click does. A category with a card but no tab is ignored."""
         if category in self._category_tabs:
             self._on_tab_selected(category)
+
+    def _open_account_from_dashboard(self, account_id: int, category: str):
+        """Clicking a name in the investing section opens that account in its
+        category's list, with the row highlighted and its details showing."""
+        if category not in self._category_tabs:
+            return
+        # Reaching the dashboard already settled any dirty form, so this only
+        # ever prompts if something reopened one since.
+        if not self._confirm_leaving_form(('category', category, None)):
+            return
+        self._hide_dashboard()
+        self.load_category(category, select_first=False, select=(account_id, category))
+        if any(a['id'] == account_id for a in self.accounts):
+            self._select_account(account_id, category)
+        else:
+            # Gone since the dashboard was drawn: show the category as a tab
+            # click would.
+            self.selected_id = None
+            self.selected_category = None
+            self._select_first_row()
 
     # -----------------------------------------------------------------
     # Misc
@@ -842,15 +809,34 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
         if self.toast.isVisible():
             self.toast.reposition()
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self._session_watch is None:
+            hwnd = int(self.winId())
+            self._session_watch = hwnd if watch_session_lock(hwnd) else 0
+
+    def nativeEvent(self, event_type, message):
+        if is_session_lock(event_type, message):
+            # Deferred: the lock tears down widgets, which is not something to
+            # do inside native message dispatch.
+            QTimer.singleShot(0, self._on_session_locked)
+        return super().nativeEvent(event_type, message)
+
     def closeEvent(self, event):
-        # close_vault runs the same sequence a vault switch does, in the same
-        # order and for the same reasons — the window geometry is written back
-        # before lock_app, which is where the vault stops being writable.
-        #
-        # Deliberately no backup here. A scheduled copy to a share that has
-        # gone away can block for as long as the network stack takes to give
-        # up, and a quit that will not quit is a worse failure than a backup
-        # taken at the next unlock instead.
+        # A quit with unsaved edits asks first — only while the window is on
+        # screen, since a hidden window has nobody to ask. The auto-shutdown
+        # only runs after a lock, which has already discarded the form.
+        if self.isVisible() and not self._confirm_leaving_form(('quit', None, None)):
+            event.ignore()
+            return
+
+        if self._session_watch:
+            unwatch_session_lock(self._session_watch)
+            self._session_watch = None
+
+        # The same teardown a vault switch runs. No backup here: a copy to a
+        # share that has gone away can block a quit for as long as the network
+        # takes to give up.
         self.close_vault()
         self._clear_clipboard()
         super().closeEvent(event)

@@ -10,7 +10,7 @@
 
 import pytest
 
-from categories import CATEGORY_CONFIG, get_config, searchable_fields
+from core.categories import CATEGORY_CONFIG, get_config, searchable_fields
 
 
 def _keys(category):

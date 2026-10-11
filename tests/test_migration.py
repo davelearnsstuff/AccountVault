@@ -12,9 +12,9 @@ import sqlite3
 
 import pytest
 
-import auth
-import database
-import encryption
+from core import auth
+from core import database
+from core import encryption
 from conftest import (
     MASTER, corrupt_column, decrypted_column, make_account, raw_column,
     snapshot_rows,
@@ -194,7 +194,7 @@ def test_permissions_hardened_reports_the_file_as_it_ends_up(tmp_path, monkeypat
     path the earlier call ran against a path that did not exist yet, answered
     False, and poisoned the flag for good — main.py then warned the user about
     a vault that had in fact ended up owner-only."""
-    import database
+    from core import database
 
     monkeypatch.setattr(database, 'DB_PATH', tmp_path / 'vault.db')
     monkeypatch.setattr(database, '_create_db_file', lambda: None)  # the failure path
@@ -209,7 +209,7 @@ def test_permissions_hardened_reports_the_file_as_it_ends_up(tmp_path, monkeypat
 def test_permissions_hardened_is_false_when_the_file_cannot_be_restricted(
         tmp_path, monkeypatch):
     """The other direction: the warning still fires when it should."""
-    import database
+    from core import database
 
     monkeypatch.setattr(database, 'DB_PATH', tmp_path / 'vault.db')
     monkeypatch.setattr(database, 'restrict_to_owner',

@@ -10,9 +10,9 @@
 
 import pytest
 
-import auth
-import categories
-from categories import parse_iso_date
+from core import auth
+from core import categories
+from core.categories import parse_iso_date
 from services import account_export, csv_export as backup_service, export_io, history_io
 from services import accounts as accounts_service
 
@@ -211,7 +211,7 @@ def test_a_lapsed_date_is_left_uncoloured_on_purpose():
     not a payment anyone can make today, and painting it the same red as a bill
     due on Tuesday is what taught people to stop reading the colour."""
     from ui.theme import level_object_name
-    assert categories.due_date_level('2000-01-01', None) == 'lapsed'
+    assert categories.due_date_level('2000-01-01', None, 'Credit Cards') == 'lapsed'
     assert level_object_name('RowMeta', 'lapsed') == 'RowMeta'
     assert level_object_name('Level', 'lapsed') == 'Level'
 
@@ -224,7 +224,7 @@ def test_setup_refuses_a_password_that_fails_the_rules(tmp_path, monkeypatch,
     """The rules used to live only in SetupScreen._submit, which made the
     password protecting everything the one rule a new caller could omit. Now
     that a backup is a copy of the vault, this is the only password there is."""
-    import database
+    from core import database
 
     monkeypatch.setattr(database, 'DB_PATH', tmp_path / 'vault.vault')
     monkeypatch.setattr(database, 'restrict_to_owner', lambda path: None)

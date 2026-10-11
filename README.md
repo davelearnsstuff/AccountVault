@@ -1,191 +1,193 @@
 # AccountVault
 
-A local, offline credential manager that runs entirely on your own machine. There is no cloud, no sync and no account to sign up for. Your data never leaves the device.
+AccountVault is a password manager and money tracker that runs entirely on your own computer. There's no cloud, no sync, and no account to sign up for, and your data never leaves your machine.
 
-It is a native desktop application built with PySide6 (Qt). No web server, no listening socket and no browser are involved.
+It's a regular desktop app built with PySide6 (Qt). There's no web server or browser involved.
+
+**TLDR:** AccountVault is a password manager and money tracker that keeps everything in one encrypted file on your own computer. It makes no network connections.
+
+- Every field is encrypted, account names included, and one master password of at least 15 characters opens the vault. If you lose that password, nothing can recover your data.
+- It stores logins, cards, bank and loan details, and secure notes. It also tracks balances, due dates, and net worth over time.
+- The vault is a single `.vault` file you can keep anywhere. A backup is a copy of that file and opens with the same password.
+- To start, run `AccountVault_Windows.bat` on Windows or `./AccountVault_Mac_Linux.sh` on Linux or macOS. To look around first, click **Create Demo Vault…** on the first screen.
+
+This README has two parts. Everything before **For developers** is about using the app. **For developers** covers the security design, where files are kept, the database, tests, and dependencies.
 
 ## Features
 
-**Accounts and categories**
+### Accounts
 
-- Built-in categories for Credit Cards, Banking, Loans, Investments, Income, Utilities, Websites and Secure Notes, plus any custom category name you type.
-- Each category has its own fields. Credit cards track a credit limit, minimum payment, due date and interest rate; loans add a lender, payoff date and monthly payment; income tracks annual pay instead of a balance.
-- A due date can be marked as repeating weekly, monthly, quarterly or annually, in which case the app works out the next occurrence itself rather than asking you to roll the date forward. New records in the categories that have a due date start out monthly; existing ones stay one-off until you say otherwise. Quick Update's button follows the cycle, so a quarterly bill moves on a quarter at a time rather than needing three presses, and an annual one does not need twelve.
-- Each occurrence is worked out from the date on file rather than by stepping forward from the last one, so a bill due on the 31st shows as the 28th in February and goes back to the 31st in March instead of staying there.
-- Sensitive fields (card numbers, account and routing numbers, security answers, note bodies) are masked by default with a show/hide toggle.
-- The star beside an account's name pins it; the same star marks it in the list.
-- Copy buttons sit beside usernames, passwords, websites, and the card, account and routing numbers. On a masked field the button copies the stored value without revealing it, so a card number can reach the clipboard without ever appearing on screen. Copying this way is also the only route that gets the clipboard protections below — a value selected by hand out of a revealed field does not.
-- A built-in password generator sits under every password field, with a choice of length and character classes.
-- Accounts can be marked closed. Closed accounts move to their own tab and drop out of the dashboard totals.
-- Any account can be pinned. A Favorites tab appears while something is pinned and goes again when the last pin is removed, and pinned rows carry a star wherever they are listed. Closed accounts keep their pin — settling an account is not the same as no longer wanting it to hand.
-- Deleting an account offers ten seconds to undo it, from the message that confirms the delete. Only closed accounts can be deleted at all, and after the window closes only a backup can bring one back.
-- Select several rows with Shift or Ctrl click to close, reopen or move them to another category in one action.
+- Built-in categories are Credit Cards, Banking, Loans, Investments, Property, Income, Utilities, Websites, and Secure Notes. You can also type in a category of your own.
+- Each category has its own fields. Credit cards have a credit limit, minimum payment, due date, and interest rate. Loans add a lender, payoff date, and monthly payment. Investments have a contribution amount and how often you make it. Property (a home, vehicle, or land) tracks an estimated value instead of a balance. Income tracks yearly pay.
+- Sensitive fields stay hidden until you click **Show**. These are passwords, card numbers, account and routing numbers, security questions and answers, and the contents of secure notes.
+- Copy buttons sit next to usernames, passwords, websites, and card, account, and routing numbers. On a hidden field, the button copies the value without showing it on screen. Only values copied with these buttons or the copy shortcuts (see **Keyboard shortcuts**) are cleared from the clipboard automatically. Text you select and copy by hand isn't.
+- Every password field has a **Generate** button. You choose the length and which kinds of characters to include.
+- **Quick Update** changes the balance and the due date without opening the full form. Use its **As Of** date to file a figure under the day your statement covers. An older figure only becomes the current balance if nothing newer is on file.
+- **No Change** marks an account as checked. It sets the Last Updated date to today and saves the current balance to the history.
+- The arrows next to an account's name step to the previous or next account in the list.
+- Click the star next to an account's name to pin it. A **Favorites** tab shows up while anything is pinned, and pinned accounts show a star in every list. Closed accounts keep their pin.
+- You can mark an account as closed. Closed accounts move to the **Closed** tab and aren't counted in the dashboard totals.
+- Only closed accounts can be deleted. After you delete one, you have 10 seconds to undo it from the message that appears. After that, only a backup can bring it back.
+- Shift-click or Ctrl-click to select several accounts, then close them, reopen them, or move them to another category all at once.
 
-**Finding things**
+### Due dates
 
-- Search runs across every category at once and shows which field matched, category names included. Sensitive fields are excluded from matching on purpose, so the search box cannot be used to confirm a secret you already suspect.
-- Sort by name, due date or last updated, in either direction. The choice is remembered.
-- A Needs Attention tab appears when something is due within 14 days, already past due, or has gone too long without an update. It stays hidden when there is nothing in it.
-- How long is too long is per category, because it depends on what the figure measures: three weeks for a credit card or a bank balance, two months for a loan or an investment account, half a year for annual pay. Websites, secure notes and custom categories never go stale at all — a password is as correct as the day it was filed, and a note does not go out of date by being left alone.
-- A one-off due date more than 60 days past reads as lapsed rather than urgent. The record is wrong rather than the payment overdue, so it is listed in neutral text instead of the red reserved for a bill you can still act on.
+- A due date can repeat weekly, monthly, quarterly, or annually, and the app figures out the next one for you. New accounts in categories that have a due date start out monthly. Older accounts stay **One-off** (a one-time date) until you change them.
+- Quick Update's **+1** button moves the date by the account's own cycle. A quarterly bill moves 3 months in one click, and an annual one moves a year.
+- Each due date is worked out from the original date, so a bill due on the 31st shows as the 28th in February and goes back to the 31st in March.
 
-**Money tracking**
+### Finding things
 
-- Every balance change recorded on an account writes a dated entry to its balance history. Entries can also be added, edited and deleted by hand.
-- Past balances can be imported into the selected account in bulk — paste two columns straight out of a spreadsheet, or pick a CSV your bank exported. The date and amount columns are worked out for you and named back to you before anything is written, along with a preview of every entry and a count of the rows that were skipped and why. Rows the account already holds are dropped, so importing the same statement twice adds nothing the second time.
-- Dates are read in whatever form the file writes them — `2024-01-05`, `01/05/2024`, `Jan 5 2024`, or a full timestamp. A month on its own, `2024-04`, is filed on the first of that month, which is the one date the importer completes rather than reads; anything else it cannot fully determine is skipped and reported rather than guessed at.
-- History can be exported back out as a CSV of dates and figures, oldest first, via the account's Export button (see below). Dates are written `YYYY-MM-DD`, the one spelling that cannot be read two ways, so an exported file imports back into the same days it came from.
-- The dashboard builds a monthly net worth trend from that history, along with a per-category trend and the month-over-month change. Credit cards and loans count as liabilities; utilities, secure notes and income are left out of the totals.
-- A composition bar splits each side into the categories that make it up, with every segment named and given its amount and its share. Assets and liabilities get a bar each rather than sharing one: they are opposite signs, so a single bar carrying both would be measuring nothing.
-- The per-category cards are ordered largest first and each states its share of its own side, so the categories that move the total are the ones read first. Every card draws the same size chart whatever it holds, which is fine for reading a trend and useless for comparing two — the bar above is what compares them.
-- Months with no reading carry the last known balance forward rather than dropping to zero.
+- Search looks across every category at once and shows which field matched, including category names. It doesn't search hidden fields or notes, so nobody can use it to check a guess about a password or PIN.
+- Sort by name, due date, or last updated, in either direction. The app remembers your choice.
+- A **Needs Attention** tab appears when something is due within 14 days, is past due, or hasn't been updated in a while. It's hidden when there's nothing in it.
+- After a Quick Update or **No Change**, the account stays in Needs Attention so you aren't moved off it. Click the refresh button next to the list title to remove the accounts you've dealt with. The account you're viewing stays open if it still needs attention.
+- How long counts as "a while" depends on the category: 3 weeks for credit cards, bank accounts, and utilities, 2 months for loans and investments, and 6 months for property and income. Websites, secure notes, and custom categories are never flagged unless you turn it on for them.
+- A one-time due date that's more than 60 days past is shown as "lapsed" instead of in red. It's probably just out of date, not a missed bill.
+- You can change all of these limits under **Manage > Warnings…**. You can set when due dates turn orange and red, when a one-time date counts as lapsed, and, for each category, whether due dates and updates are checked and after how many days. These settings are encrypted, because they include the names of your custom categories.
 
-**Vault files and backups**
+### Money tracking
 
-- You choose where the vault lives. Create one anywhere, open another, and switch between them; the app remembers the ones you have opened.
-- A backup is a copy of the vault file, so it opens with the same master password and there is no second password to lose. **Manage > Save a Copy** writes one on demand.
-- Optional automatic backups, daily, weekly or monthly, into a `backups` folder beside the vault or anywhere you point them. Copies older than the retention window are removed, and the most recent one is always kept.
-- Plaintext CSV export for spreadsheets, clearly labelled as unencrypted in the menu.
-- Accounts can be imported from a CSV — this app's own export, another password manager's, or a spreadsheet of your own. The first row has to name the columns; which field each one is read as is listed before anything is written, along with the columns that matched nothing and were left out. Rows already in the vault are dropped, so importing the same file twice adds nothing the second time, and the whole file lands or none of it does.
-- Each account has its own Export button offering three scopes: everything, the account details only (name, username, password, website and the category's own fields), or the balance history only. The choice matters, so the dialog states the consequence rather than just listing the options — the two scopes that carry the password say so behind a red warning and a button reading "Export With Password", and the history scope, which carries nothing identifying the account, does not. Balance history is the default; a category that tracks no balance is offered only its details.
+- Every time an account's balance changes, a dated entry goes into its balance history. You can also add, edit, and delete entries yourself.
+- The newest entry is the account's current balance. An entry dated on or after all the others updates the balance and moves the Last Updated date forward. An older entry just fills in the past. If you delete a wrong newest entry, the balance goes back to the one before it.
+- The history table shows the change from each entry to the next (`+$250.50`, `-$150.50`). The oldest entry and a second entry on the same day show a dash.
+- The range buttons beside **Balance History** (**1M**, **3M**, **6M**, **1Y**, **2Y**, and **All**) set how much of the history the chart shows. The table always lists every entry.
+  - A change line above the chart shows how much the figure moved over the range, for example "vs last year", worded and colored the same way as on the dashboard. For credit cards, loans, and utilities, a falling figure is green.
+  - The range is measured from what the account held on the range's first day: the last entry on or before that day. If there's no entry that old, the line says "since" the first entry's date instead, for example "since Mar 4, 2025".
+  - The range starts on **1Y**, and the one you pick stays chosen as you move between accounts until you close the app.
+- To import past balances, paste two columns from a spreadsheet or choose a CSV file from your bank. Before anything is saved, the app shows which columns it picked as the date and amount, a preview of every entry, and how many rows it skipped and why. Entries the account already has are skipped, so importing the same statement twice doesn't add anything.
+- Most date formats work: `2024-01-05`, `01/05/2024`, `Jan 5 2024`, or a full timestamp. Dates with slashes are read month first (so `01/05/2024` is January 5), unless the first number is over 12. A month by itself, like `2024-04`, is saved as the first of that month. Any other date the app can't read for certain is skipped and listed in the report.
+- You can export the history as a CSV of dates and amounts, oldest first, with the account's **Export** button (see **Files, backups, and export**). Dates are written as `YYYY-MM-DD`, so the file imports back with the same dates.
+- The **Dashboard** tab has 3 sections, in this order: **Current Assets & Liabilities**, **Trends**, and **Investing vs. Income**. Credit cards and loans count as liabilities (money you owe). Utilities, income, websites, and secure notes aren't included in the totals.
+- Property counts as an asset, so a mortgage or car loan is set against the home or car it paid for. Without a Property entry, the loan is subtracted from your net worth with nothing to balance it.
+- **Current Assets & Liabilities** shows your current balances in two tables, one for assets and one for liabilities. Each lists its categories, largest first, with each category's amount and share and a total. A **Net Worth** row underneath is your assets total minus your liabilities total.
+  - Click the arrow beside a category to show the open accounts that make up its amount, each with its balance and its share of the category. Click it again to hide them. Categories start folded, and stay as you left them until you close the app.
+  - Click a category's name to open that category, or an account's name to open that account.
+  - A category with a negative balance (an overdrawn account, say) is listed and counted in the total, but has no share.
+- **Trends** has a card for your net worth first, then one for each category, largest first. Each card shows the current amount, how much it changed, and a chart of it month by month. Category cards also show their share of your assets or liabilities.
+- The cards all draw their charts at the same size, so use the **Current Assets & Liabilities** table to compare categories.
+- The range buttons beside **Trends** (**1M**, **3M**, **6M**, **1Y**, **2Y**, and **All**) set how much history every card in it shows. They start on **1Y**.
+  - A range includes the month it's measured from. **1Y** runs from this month last year to this month, and **1M** shows last month and this month.
+  - The change line under each figure follows the range: "vs last month", "vs 3 months ago", "vs 6 months ago", "vs last year", "vs 2 years ago", or "since" your first month for **All**.
+  - If your history doesn't go back as far as the range, the change line names the month it starts in instead, for example "since Feb 2026".
+- **Investing vs. Income** compares what you put into investments with what you earn, as yearly totals.
+  - Every open Income account counts, using its yearly pay.
+  - Every open Investments account with a **Contribution Amount** counts. Its **Contribution Period** (weekly, every 2 weeks, monthly, or yearly) turns the amount into a yearly figure. For example, $100 every 2 weeks is $2,600 a year.
+  - Income and contributions each get a table, largest first, with a total row and the share of your income going into investments. Click a row to open that account.
+  - An amount with no period is listed as "needs a period" and isn't counted until you pick one. Accounts created before the period field existed start out this way. An income with no pay entered is listed but not counted either.
+  - It shows the current figures only, with no history. Closed accounts aren't included.
+- If a month has no entry, the dashboard uses the last known balance instead of zero.
+- Links next to the **Dashboard** title jump to each section. They stay in place while you scroll.
+- You can select any text on the dashboard and copy it.
+  - On a card, drag across the text to select it. A plain click still opens the category.
+  - In a table, drag across cells, or Shift-click or Ctrl-click them, then press Ctrl+C or right-click and choose **Copy**. The cells paste into a spreadsheet as cells. A plain click on a row still opens it.
 
-**Session and appearance**
+### Files, backups, and export
 
-- Auto-lock after 5, 10, 15, 30 or 60 minutes of inactivity.
-- Optional auto-shutdown after lock at 30 minutes, 1, 2 or 4 hours, or disabled.
-- Clipboard auto-clear after 15, 30, 60 or 120 seconds.
-- Dark and light modes, four font sizes, and a compact or comfortable list density.
-- Window size, position and sidebar width are restored between sessions.
+- You choose where your vault is saved. You can create a new one anywhere, open another, and switch between them. The app remembers the ones you've opened.
+- A backup is a copy of the vault file, so it opens with the same master password. **Manage > Save a Copy…** makes one whenever you want. See **Backups and restoring** for automatic backups.
+- **Manage > Export CSV…** saves all your accounts as a spreadsheet. It isn't encrypted, and the menu says so.
+- **Manage > Import Accounts…** reads accounts from a CSV file. That can be this app's own export, another password manager's export, or your own spreadsheet. The first row must have column names. Before anything is saved, the app shows which field it matched to each column and which columns it skipped. Accounts already in the vault are skipped, so importing the same file twice doesn't add anything. Either the whole file is imported or none of it is.
+- Each account's **Export** button offers 3 choices: everything, the account details only (name, username, password, website, and the category's own fields), or the balance history only. The two choices that include the password show a red warning and an **Export With Password** button. The history-only choice contains nothing that identifies the account, and it's the default. Categories without a balance only offer the details.
 
-## Keyboard Shortcuts
+### Locking and appearance
+
+- The vault locks after 5, 10, 15, 30, or 60 minutes of inactivity. On Windows it also locks right away when you lock your computer (Win+L, a screen saver that locks, or switching users).
+- After locking, the app can close itself after 30 minutes or 1, 2, or 4 hours, or stay open.
+- Copied passwords are cleared from the clipboard after 15, 30, 60, or 120 seconds.
+- Dark and light themes, 4 text sizes, and a compact or comfortable account list.
+- The app remembers the window's size and position and the sidebar's width.
+
+## Keyboard shortcuts
+
+On macOS, use Cmd instead of Ctrl.
 
 | Keys | Action |
 |---|---|
-| `Ctrl+F` | Focus the search box |
-| `Esc` | Clear an active search |
+| `Ctrl+F` | Go to the search box |
+| `Down` | From the search box, move into the results |
+| `Esc` | Clear the search |
 | `Ctrl+N` | Add an account |
 | `Ctrl+E` | Edit the selected account |
 | `Ctrl+B` | Copy the selected account's username |
 | `Ctrl+Shift+C` | Copy the selected account's password |
-| `Ctrl+1` to `Ctrl+9` | Jump to the first nine tabs, Dashboard included |
-| `Ctrl++` | Larger text — one step up the four font sizes |
-| `Ctrl+-` | Smaller text — one step down |
+| `Ctrl+1` to `Ctrl+9` | Jump to one of the first 9 tabs, starting with Dashboard |
+| `Ctrl++` | Make text larger |
+| `Ctrl+-` | Make text smaller |
 | `Ctrl+,` | Open Settings |
 | `Ctrl+L` | Lock the vault |
 | `Ctrl+Q` | Quit |
 
-## Security
+In the **Readme** and **Design Document** windows:
 
-| Property | Detail |
+| Keys | Action |
 |---|---|
-| Key derivation | Argon2id at 128 MiB of memory, 4 iterations, 2 lanes. The parameters are recorded in the vault, so they can be raised later — the vault re-keys itself to the new figures at the next login |
-| Field encryption | AES-256-GCM, with a unique random 96-bit nonce per field |
-| Field binding | Every field is authenticated against the column it lives in, so ciphertext moved between columns, rows or tables stops decrypting. Without it, anyone who can write the database file can show a note as a password without knowing the key |
-| Key storage | Memory only. Never written to disk, released on lock, but not scrubbed from RAM (see below) |
-| Salt | 256-bit random value stored in the database |
-| Key check | A token only the right key opens, verified at every unlock. A password and a salt that do not belong together otherwise log in successfully and read every field as unreadable — and the first save then writes that over the real value |
-| Auto-lock | Configurable inactivity timeout. The key is released and decrypted data dropped on lock |
-| Network | None. The app opens no sockets and makes no connections |
-| Attack surface | A single process. Decrypted data never crosses a process boundary |
-| Login throttling | 5 failed attempts trigger a lockout that doubles from 30 seconds to a 5 minute cap. Both the lockout and the running failure count are stored in the database, so restarting the app clears neither. The lockout is held as a start time plus a duration, and the remaining wait is capped, so moving the system clock cannot extend it |
-| Clipboard | Copied secrets are cleared automatically, and only if the clipboard still holds what was copied |
-| Database file | Restricted to the owning account: mode 0600 on POSIX, an explicit DACL on Windows with inheritance removed. Stored outside the application directory — see below |
-| Deleted content | `secure_delete` scrubs pages as they are freed, so a deleted account does not linger in the file. The one-time format upgrade also compacts the file, which is what clears anything freed before that pragma was in force |
-| Undo after delete | The ten-second undo holds the deleted rows still encrypted, so the window costs no more exposure than the vault file already does. It is dropped when the vault locks or changes — rows encrypted under one vault's key must never be restored into another's |
-| Dependencies | Installed with `--require-hashes` against `requirements.lock`, so the artifacts are verified and not just the version numbers. A substituted `cryptography` or `argon2-cffi` wheel runs inside the process holding the master password |
-| Master password | At least 15 characters, and may not begin or end with a space. It is the only password there is — a backup is a copy of the vault and opens with the same one |
-| CSV export | Values that a spreadsheet would treat as a formula are neutralised before writing. A per-account export names its scope before writing and warns when the file will hold the password; its history scope carries dates and figures only |
-| CSV import | The file is named column by column before anything is written, so a heading read as the wrong field is visible rather than discovered later. A column it cannot name is dropped, not guessed at. Nothing is decrypted or written until Import is pressed, and the dialog says the source file is still plaintext |
-| Damaged data | A field that will not decrypt renders as a placeholder rather than raw ciphertext |
+| `Ctrl+F` | Go to the search box |
+| `Enter` or `F3` | Next match |
+| `Shift+Enter` or `Shift+F3` | Previous match |
+| `Esc` | Clear the search, or close the window if the search is empty |
 
-The master password itself is never stored. On login, Argon2id derives the AES-256-GCM key from the password and the stored salt, and that key is held in memory only.
+## How your data is protected
 
-Changing the master password re-encrypts every field in the vault under the new key. The operation is all or nothing: if any field fails to re-encrypt, the whole rotation is abandoned, because a vault half under the old key and half under the new one has no password that opens all of it.
+- Everything you store is encrypted, including account names, not just passwords. Encryption uses AES-256. The key is made from your master password with Argon2id, which is designed to be slow and memory-hungry, so every password guess takes real effort.
+- Your master password is never saved. The key made from it is kept only in memory while the vault is open, and the app lets go of it when the vault locks.
+- The app never connects to the internet or opens a network connection.
+- After 5 wrong passwords, you have to wait before trying again. The wait starts at 30 seconds and doubles each time, up to 5 minutes. Restarting the app doesn't reset it.
+- Only your user account can open the vault file. Other people who log in to the same computer can't, unless they're an administrator.
+- Copied passwords are cleared from the clipboard automatically.
+- A CSV export isn't encrypted. Anyone who opens one can read everything in it.
 
-### Where the vault is stored
+There's much more detail in **Security details**, under **For developers**.
 
-You choose. **Create New Vault** opens a file dialog, and the vault is a
-`.vault` file wherever you put it. The file itself is always restricted to the
-owning account; the folder is not, because a folder you picked is yours and
-locking down Documents on your behalf would break every other application that
-uses it.
+### What locking doesn't do
 
-The default offered, and the location used by a vault created before this was
-a choice, is the per-user application data directory —
-`%LOCALAPPDATA%\AccountVault` on Windows, `~/.local/share/AccountVault`
-elsewhere — and that directory *is* restricted to the owning account, because
-the app created it.
+When the vault locks, the app lets go of the key and the decrypted data it was holding, so nothing in the running app can decrypt anything else.
 
-Which vault was open last, and the handful opened before it, are recorded in
-`vaults.json` in that same directory. It holds paths and nothing else — no
-counts, no sizes, nothing summarising what a vault contains — and the recent
-list can be cleared or switched off.
+It can't erase that data from your computer's memory right away, though. Python doesn't let a program overwrite data in place, so it stays in memory until the space is reused. Copies also live inside the encryption libraries and Qt's password box, out of the app's reach.
 
-It is deliberately not kept beside the code. `init_db` can lock down the
-database file, but nothing locks down the source tree, so a vault stored there
-is protected by a permission on the data while the module that decrypts it sits
-unprotected next to it: an attacker who can write `encryption.py` never needs to
-read the database at all. Keeping the two apart also avoids an install under
-`Program Files`, where the vault would be silently redirected by UAC
-virtualization into a per-user shadow copy that neither backup tools nor the
-user can find.
-
-An existing `data/accountvault.db`, or one in the application data directory, is
-adopted where it is and without asking, so upgrading moves nothing. Set
-`ACCOUNTVAULT_DB`, or pass a path on the command line, to override the location
-— for a vault on removable media, or a second one kept deliberately apart.
-
-The application directory itself is worth putting somewhere other users cannot
-write. No control inside the app can substitute for that: code that has been
-modified is code that decides what the app does with your password.
-
-### What locking does and does not do
-
-On lock the app releases the key and drops the decrypted accounts it was holding, so nothing in the running process can decrypt anything further.
-
-It does not scrub those bytes from RAM, and in Python it cannot. Strings and bytes are immutable, so there is no in-place overwrite, and a freed object keeps its contents until the allocator reuses the space. Further copies live inside `argon2-cffi`, inside `cryptography`, and in Qt's password field, where no Python code can reach them.
-
-Anything the operating system pages out or writes into a crash dump is therefore outside the app's control. Full-disk encryption is what protects that at rest, and a short auto-lock timeout is what limits how long it exists at all.
-
-### Why there is no local web server
-
-Earlier versions served the UI over `http://localhost:8000`, which required session tokens, origin checks and CSP headers to keep other local processes and browser pages out. Running in-process removes that attack surface instead of defending it, so those mechanisms are gone.
+If your computer writes memory to disk (in a page file or a crash dump), some of that data could end up there. Full-disk encryption (BitLocker on Windows, FileVault on macOS, LUKS on Linux) protects against that, and a short auto-lock time limits how long the data stays around.
 
 ## Requirements
 
-- Python 3.10 or later
+- Python 3.11 or later. The verified install described in **Installation** supports 3.11 through 3.14.
 - pip
-- A desktop environment. The app opens a window, and Qt supports Windows, macOS, X11 and Wayland.
+- A computer running Windows, macOS, or Linux with a desktop (X11 or Wayland).
 
 ## Installation
 
-**Windows:** run `start.bat`. If the requirements are missing it offers to create a `.venv` folder and install them there, leaving the system Python untouched. If Python itself is missing it says so and prints the install command rather than failing silently.
+**Windows:** run `AccountVault_Windows.bat`. If the packages it needs aren't installed, it offers to install them into a `.venv` folder inside the app's folder, without touching your system Python. If Python itself isn't installed, it tells you where to download it and gives you a command that installs it.
 
-**Linux / macOS:**
+**Linux and macOS:**
 
 ```bash
-git clone <repo-url>
-cd AccountVault
-python3 -m venv .venv
-.venv/bin/pip install --require-hashes -r requirements.lock
+git clone https://github.com/dgibbonsri/AccountVault2-PySide.git
+cd AccountVault2-PySide
+./AccountVault_Mac_Linux.sh
 ```
 
-On Debian and Ubuntu the system Python is externally managed, so the virtual environment above is required rather than optional.
+The first time it runs, the script works the same way as the Windows one. If the packages it needs aren't installed, it offers to install them into a `.venv` folder inside the app's folder, without touching your system Python. Run it from a terminal, because it needs to ask before installing.
 
-Package versions in `requirements.txt` are pinned, and Dependabot keeps them current through `.github/dependabot.yml`. `requirements.lock` pins the artifacts behind those versions, and `--require-hashes` is what verifies them — the check is worth having for an app that holds secrets, since a substituted wheel runs in the same process as the master password.
+The script checks every downloaded file against a known fingerprint (`--require-hashes`). Those fingerprints only cover Linux and Windows on x86-64 with Python 3.11 through 3.14. On macOS, ARM Linux, or a newer Python, the script says so and asks before installing the same pinned versions without the check.
 
-The lock covers the Windows and Linux x86-64 wheels. On any other platform there is no matching hash and the install is refused rather than quietly unverified; `pip install -r requirements.txt` works there, without that check. After a version bump, regenerate with `python tools/genlock.py` and commit the result — CI installs from the lock, so a stale one fails there rather than at somebody's first install.
+On Debian and Ubuntu, creating the `.venv` needs the `python3-venv` package (`sudo apt install python3-venv`). The script tells you if it's missing.
+
+To install by hand instead:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install --require-hashes -r requirements/requirements.lock
+```
 
 ## Running
 
-**Linux / macOS:**
+**Linux and macOS:**
 ```bash
-./start.sh
+./AccountVault_Mac_Linux.sh
 ```
 
 **Windows:**
 ```bat
-start.bat
+AccountVault_Windows.bat
 ```
 
 **Or directly:**
@@ -193,131 +195,200 @@ start.bat
 python main.py
 ```
 
-The application window opens straight away. On first launch you are asked to create a master password of at least 15 characters. It is required every time you open the app and cannot be recovered if lost.
+The window opens right away. The first time, you're asked to create a master password of at least 15 characters. You'll need it every time you open the app, and it can't be recovered if you lose it.
 
-## Backup and Restore
+To open a specific vault instead of the last one you used, put its path on the command line: `python main.py path/to/my.vault`.
 
-A backup is a copy of the vault. It is the same encrypted file, so it opens with
-the same master password, and restoring it is opening it — there is no import
-step and no second password to keep track of.
+You can read this file inside the app, too: **Manage > Readme**. **Manage > Design Document** opens the design document, which explains why the app works the way it does. Both windows have a search box. Press Ctrl+F, type a word, and press Enter to jump to the next match or Shift+Enter for the previous one.
 
-Use **Manage > Save a Copy** to write one wherever you like. Turn on automatic
-backups in **Settings** to have one written on unlock, daily, weekly or monthly.
-They go to a `backups` folder beside the vault unless you choose somewhere else,
-and they are named for the vault and the day: `mymoney_backup_20260917.vault`.
+### Demo vault
 
-Old copies are removed once they pass the retention window — twelve months by
-default, or never. Three things that never happen: a partial copy is never left
-behind wearing a backup's name, nothing is deleted except immediately after a
-new backup has been written and verified, and no file this app did not create is
-ever deleted.
+A demo vault is full of made-up accounts for a fictional household. It has 31 months of balance history, every kind of repeating due date, out-of-date and lapsed accounts, pinned and closed accounts, and a custom category, so every screen has something on it.
 
-**One thing to know.** Changing your master password re-encrypts *this vault*,
-not the copies. A copy taken beforehand still opens only with the password it
-was taken under. The app offers you a fresh copy the moment the password
-changes; take it.
+To build one, use either of these. For safety, neither will overwrite a file that already exists, so to replace an old demo, delete it yourself first.
 
-Use **Manage > Move Vault** to move the vault somewhere else and carry on
-working there. The original is left exactly where it was — delete it yourself
-once you are satisfied the move worked.
+- Click **Create Demo Vault…** on the vault chooser and pick where it goes. The app shows you the password, then asks for it to unlock the new vault.
+- Run `python tools/make_demo_vault.py [path]`. With no path, it writes `springfield.vault` in the current folder. It prints the password when it's done. Open the vault with **Manage > Open Vault…** or `python main.py path/to/springfield.vault`.
 
-**Manage > Export CSV** writes an unencrypted spreadsheet. It is useful for moving data elsewhere, and it is not a backup: anyone who opens the file can read every value in it.
+The balance history and due dates count back from the day it's built, so a fresh one looks current.
 
-## Tests
+## Backups and restoring
+
+A backup is a copy of your vault file. It opens with the same master password, and to restore one, you just open it. There's no import step and no second password to remember.
+
+- To make a backup yourself, use **Manage > Save a Copy…** and save it wherever you like.
+- To make backups automatically, turn them on in **Settings** and choose daily, weekly, or monthly. The app checks whether one is due when you unlock the vault, and again whenever the date changes while the vault is open.
+- Automatic backups go into a `backups` folder next to the vault unless you choose another folder. They're named after the vault and the date, like `mymoney_backup_20260917.vault`.
+- If you choose your own folder, the app asks you to confirm it before the first backup goes there. It also warns you if the folder is on a network share (a path starting with `\\`) or, on Windows, a removable drive. Each backup is a full copy of your vault, and anyone who gets one can try to guess the password on their own computer.
+- Old automatic backups are deleted after the time you choose, from 1 month to 2 years (12 months by default), or never. The newest backup is always kept.
+- The app never leaves a half-written backup behind. It only deletes old backups right after a new one has been saved and checked, and it never deletes a file it didn't create.
+- If the backup settings were changed outside the app, they're reset when the vault opens, and automatic backups stay off until you turn them back on. The app tells you when this happens.
+
+**Changing your master password doesn't change your backups.** Backups made earlier still open only with the old password. Right after you change your password, the app offers to make a fresh backup. Say yes.
+
+**Manage > Move Vault…** moves your vault to another folder, and you keep working from the new location. The original file stays where it was. Delete it yourself once you're sure the move worked.
+
+**Manage > Export CSV…** isn't a backup. It saves an unencrypted spreadsheet, which is handy for moving your data to another app, but anyone who opens the file can read everything in it.
+
+## For developers
+
+The rest of this README is technical. The reasons behind the design are in `docs/AccountVault_Design_Document.md`, which you can also read in the app under **Manage > Design Document**.
+
+### Security details
+
+| Property | Detail |
+|---|---|
+| Key derivation | Argon2id with 128 MiB of memory, 4 iterations, and 2 lanes. These settings are saved in the vault, so they can be raised later. The vault re-encrypts itself with the new settings at the next login |
+| Field encryption | AES-256-GCM, with a new random 96-bit nonce every time a field is encrypted |
+| Field binding | Each field is tied to its table and column, so encrypted data moved to a different column or table won't decrypt. This stops someone who can edit the database file from making a note show up as a password. Fields aren't tied to their row, so swapping two accounts' passwords would still decrypt |
+| Key storage | In memory only and never written to disk. Released when the vault locks, but not erased from memory (see **What locking doesn't do**) |
+| Salt | A 256-bit random value stored in the database |
+| Key check | At every unlock, the app decrypts a known test value to confirm the key is right. Without it, a password and salt that don't belong together (from a half-restored backup, for example) would log in, show every field as unreadable, and the first save would write that over the real data |
+| Auto-lock | After a set time with no activity, and right away when the Windows session locks. Locking releases the key and drops the decrypted data |
+| Network | None. The app opens no sockets and makes no connections |
+| Attack surface | One process. Decrypted data never passes to another process |
+| Login throttling | 5 failed attempts cause a lockout that starts at 30 seconds and doubles up to 5 minutes. The lockout and the failure count are both saved in the database, so restarting the app resets neither. The lockout is stored as a start time and a length, and the remaining wait is capped, so changing the system clock can't make it longer |
+| Clipboard | Copied secrets are cleared automatically, but only if the clipboard still holds what the app copied |
+| Database file | Only the owner's account can access it: mode 0600 on Linux and macOS, and an access control list with inherited permissions removed on Windows. It's kept apart from the app's code (see **Where the vault is stored**) |
+| Deleted data | SQLite's `secure_delete` overwrites data as it's deleted, so a deleted account doesn't linger in the file. The one-time format upgrade also compacts the file, which clears anything deleted before `secure_delete` was turned on |
+| Backup settings | These settings control where copies of the whole vault go and which files can be deleted. Anyone who can edit the vault file could change them without the password, so the app protects them with a seal made with the vault key. If the seal doesn't match, the settings are reset to the defaults, automatic backups are turned off, and the app tells you. A backup folder you choose yourself is confirmed once before the first copy goes there |
+| Undo after delete | During the 10 seconds you can undo a delete, the deleted data is held still encrypted, so it's no more exposed than the vault file itself. It's discarded when the vault locks or you switch vaults, because data encrypted with one vault's key must never be restored into another vault |
+| Dependencies | Installed with `--require-hashes` against `requirements.lock`, which checks the exact files and not just the version numbers. A tampered `cryptography` or `argon2-cffi` package would run in the same process as the master password |
+| Master password | At least 15 characters, with no space at the start or end. It's the only password: a backup is a copy of the vault and opens with the same one |
+| CSV export | Values a spreadsheet would run as a formula are made safe before they're written. A per-account export says what it includes before saving and warns when the file will contain the password. The history-only export holds just dates and amounts |
+| CSV import | Every column is listed with the field it will be read as before anything is saved, so a wrongly matched column is easy to spot. Columns the app can't match are skipped. Nothing is decrypted or saved until you click **Import**, and the dialog reminds you that the source file is still unencrypted |
+| Damaged data | A field that won't decrypt shows a placeholder instead of the raw encrypted text. The placeholder is never saved as a value, whether by a save or by importing a CSV exported from a damaged vault |
+| Displayed values | Stored values are always shown as plain text. A value that looks like HTML (`xK9<b>mq2`) is shown exactly as stored |
+| Value lengths | A value that's too long for its field is rejected with a message naming the field. It's never cut short without telling you |
+| Error log | Unexpected errors are shown on screen and written to `errors.log` next to `vaults.json`, readable only by you. The log records the error type and where it happened, never the error message or any values, because a message can include field contents |
+
+The master password itself is never stored. When you log in, Argon2id turns your password and the stored salt into the AES-256-GCM key, and that key is kept only in memory.
+
+Changing the master password re-encrypts every field with the new key. It's all or nothing. If any field can't be re-encrypted, nothing changes, because a vault that's half on the old password and half on the new one couldn't be fully opened with either.
+
+### Where the vault is stored
+
+You choose. When you create a vault (**Create New Vault…** on the vault chooser, or **Manage > New Vault…**), you pick where the `.vault` file goes. The file itself is always restricted to your account. The folder isn't, because it's your folder, and locking down something like Documents would break every other app that uses it.
+
+If you don't pick a folder, or your vault was created before you could, it goes in the app's data folder: `%LOCALAPPDATA%\AccountVault` on Windows, and `~/.local/share/AccountVault` on Linux and macOS. The app created that folder, so it restricts the folder to your account too.
+
+The app keeps the list of vaults you've opened, including the last one, in `vaults.json` in that same folder. The list holds file paths and nothing else: no counts, no sizes, and nothing about what's inside a vault. To clear the list, click **Clear** above it on the vault chooser. To stop keeping it, right-click the list.
+
+The vault is never kept with the app's code. Nothing locks down the code folder, so a vault stored there would be protected while the code that decrypts it wasn't. Someone who could change `core/encryption.py` wouldn't need to read your vault at all. Keeping them apart also avoids a Windows problem: under `Program Files`, Windows can silently redirect the vault into a hidden copy that neither you nor your backup tools can find.
+
+If you already have `data/accountvault.db`, or a vault in the app's data folder, the app opens it where it is, so upgrading doesn't move anything. To use a different location, such as a USB drive or a second vault kept separate, set the `ACCOUNTVAULT_DB` environment variable or pass a path on the command line.
+
+Install the app itself somewhere other users can't change. The app can't protect your password from someone who has changed its code.
+
+### Why there's no local web server
+
+Older versions ran the interface at `http://localhost:8000`. That needed session tokens, origin checks, and CSP headers to keep other programs and web pages out. Running everything inside one desktop app removes that risk completely, so none of those protections are needed anymore.
+
+### Tests
 
 ```bash
-python -m pip install -r requirements.txt -r requirements-dev.txt
+python -m pip install --require-hashes -r requirements/requirements.lock -r requirements/requirements-dev.lock
 python -m pytest tests/
 ```
 
-The suite is weighted towards `services/`, `auth.py` and `encryption.py`, which are the paths where a bug destroys data that cannot be recovered: balance history, vault copies and their retention, the decrypted account cache, key rotation, login throttling, the legacy plaintext migration and the handling of fields that will not decrypt.
+On a platform the lock doesn't cover, install from `requirements/requirements.txt` and `requirements/requirements-dev.txt` instead.
 
-Most of `ui/` is deliberately not covered — its failures are cosmetic, and driving widgets costs more than it catches. The exceptions are the widgets that handle stored fields or secrets directly: the account form, which once destroyed fields it could not display, and the clipboard, which once kept a copied password after the vault locked. Those are tested like the services, which is why the suite needs `requirements.txt` installed too.
+Most tests cover `services/`, `core/auth.py`, `core/encryption.py`, and `core/preferences.py`. Those are where a bug could destroy data that can't be recovered: balance history, vault copies and how long they're kept, the backup seal, the decrypted account cache, password changes and format upgrades, login throttling, the old plaintext migration, and fields that won't decrypt.
 
-It runs on every push and pull request — see `.github/workflows/tests.yml`. That is what makes the exact pins safe to merge: Dependabot opens the bump, and this decides whether it is taken.
+Most of `ui/` isn't tested, because bugs there are cosmetic and testing widgets costs more than it catches. The exceptions are the widgets that handle stored values or secrets directly: the account form, which once lost fields it couldn't display, and the clipboard, which once kept a copied password after the vault locked. Those are tested like the services, which is why the test install includes the app's own requirements too.
 
-## File Structure
+`tests/test_layers.py` keeps the code layers apart. It fails if anything in `core/` imports Qt, `services/`, or `ui/`, even from inside a function.
+
+The tests run on every push and pull request, on Windows with Python 3.11 and 3.14, the oldest and newest versions the lock covers (see `.github/workflows/tests.yml`). That's what makes Dependabot's version bumps safe to accept: Dependabot opens the pull request, and the tests decide whether it gets merged.
+
+### File structure
 
 ```
-AccountVault/
-├── main.py                  # Qt application entry point
-├── database.py              # SQLite schema, connections, file permissions
-├── encryption.py            # Argon2id key derivation + AES-256-GCM
-├── auth.py                  # Master password, login throttling, session lock
-├── preferences.py           # User settings and window view state
-├── categories.py            # Field schemas, attention rules, formatting
-├── vaultfile.py             # Which vault to open, and the recent list
-├── urls.py                  # Blocks script-ish schemes before a link is opened
+AccountVault2-PySide/
+├── main.py                  # Qt application entry point, error log
+├── core/                    # The layer under services/ and ui/; imports no Qt
+│   ├── database.py          # SQLite schema, connections, file permissions
+│   ├── encryption.py        # Argon2id key derivation + AES-256-GCM
+│   ├── auth.py              # Master password, login throttling, session lock
+│   ├── preferences.py       # User settings and window view state
+│   ├── categories.py        # Field schemas, attention rules, formatting
+│   ├── vaultfile.py         # Which vault to open, and the recent list
+│   ├── urls.py              # Blocks unsafe link types before a link is opened
+│   └── version.py           # The application version
 ├── services/
 │   ├── accounts.py          # Account CRUD, balance history, decrypted cache
-│   ├── dashboard.py         # Monthly net worth and category trends
+│   ├── dashboard.py         # Balance sheet, monthly trends, investing vs. income
 │   ├── csv_export.py        # The whole vault as a plaintext CSV
-│   ├── account_import.py    # A table of accounts read back in
-│   ├── backups.py           # Vault copies, the backup schedule and retention
+│   ├── account_import.py    # Reads a table of accounts back in
+│   ├── backups.py           # Vault copies, the backup schedule, and retention
 │   ├── history_io.py        # Reads and writes one account's history as CSV
-│   ├── account_export.py    # One account as CSV, at the scope the user picks
-│   └── export_io.py         # Shared plaintext-file mechanics: cells, reads, writes
+│   ├── account_export.py    # One account as CSV, with the scope the user picks
+│   └── export_io.py         # Shared plaintext-file code: cells, reads, writes
 ├── ui/
 │   ├── main_window.py       # The widget tree, the account form, the dashboard
-│   ├── actions.py           # Commands, shortcuts, the vault menu, appearance
-│   ├── vault_session.py     # Which vault, locked or not, and everything on a clock
+│   ├── actions.py           # Commands, shortcuts, the Manage menu, appearance
+│   ├── vault_session.py     # Which vault, locked or not, and everything on a timer
 │   ├── account_list.py      # The list, the tab bar, search, sort, bulk actions
 │   ├── auth_screens.py      # Vault chooser, first-launch setup, unlock
 │   ├── detail_view.py       # Read-only account detail, per-account export
 │   ├── account_form.py      # Add/edit form
-│   ├── history_table.py     # Balance history table, chart and import
-│   ├── dashboard_view.py    # Net worth and per-category trends
-│   ├── dialogs.py           # Settings, password, account/history import, about
+│   ├── history_table.py     # Balance history table, chart, and import
+│   ├── dashboard_view.py    # Assets and liabilities, net worth, category trends, investing
+│   ├── ranges.py            # Range buttons and change lines, shared by both views
+│   ├── dialogs.py           # Settings, password, imports, document viewer, about
 │   ├── widgets.py           # Charts, toasts, password generator, tabs
-│   └── theme.py             # Colour palettes and the Qt style sheet
-├── tests/                   # pytest suite — see Tests above
+│   └── theme.py             # Color palettes and the Qt style sheet
+├── tests/                   # The pytest suite (see Tests)
 ├── assets/
 │   ├── accountvault.ico     # Window and taskbar icon
-│   └── make_icon.py         # Regenerates the icon
+│   └── make_icon.py         # Rebuilds the icon
 ├── tools/
-│   ├── genlock.py           # Regenerates the hash-pinned lock files
+│   ├── genlock.py           # Rebuilds the hash-pinned lock files
 │   └── make_demo_vault.py   # Builds a throwaway vault full of demo data
-├── start.sh                 # Linux/macOS launch script
-├── start.bat                # Windows launch script, installs if needed
-├── requirements.txt         # Pinned versions
-├── requirements.lock        # Pinned artifacts — what actually gets installed
-├── requirements-dev.txt
-├── requirements-dev.lock
+├── docs/
+│   └── AccountVault_Design_Document.md
+├── AccountVault_Mac_Linux.sh # Linux/macOS launch script
+├── AccountVault_Windows.bat  # Windows launch script, installs if needed
+├── requirements/
+│   ├── requirements.txt     # Pinned versions
+│   ├── requirements.lock    # Pinned files: what actually gets installed
+│   ├── requirements-dev.txt
+│   └── requirements-dev.lock
 └── .github/
-    ├── dependabot.yml       # Watches the pins for releases and CVEs
-    └── workflows/tests.yml  # Runs the suite on push and pull request
+    ├── dependabot.yml       # Watches the pins for new releases and CVEs
+    └── workflows/tests.yml  # Runs the tests on push and pull request
 ```
 
-## Database Schema
+### Database schema
 
-### accounts
+#### accounts
 
 | Column | Type | Notes |
 |---|---|---|
 | `id` | INTEGER | Primary key, auto-increment |
-| `category` | TEXT | Display name, for example "Credit Cards", "Banking", or a custom one |
+| `category` | TEXT | The category name, for example "Credit Cards", "Banking", or a custom one. Not encrypted |
 | `name` | TEXT | Account name, **encrypted** |
 | `username` | TEXT | **Encrypted** |
 | `password` | TEXT | **Encrypted** |
 | `website` | TEXT | **Encrypted** |
 | `notes` | TEXT | **Encrypted** |
-| `extra_data` | TEXT | Category-specific fields (balances, due dates, due-date recurrence, rates) plus the Favorites pin, serialised as JSON and **encrypted** as one blob. The pin lives here rather than in a column of its own so the file does not say which handful of accounts their owner reaches for most |
-| `closed` | INTEGER | 0 for active, 1 for closed |
-| `date_added` | TEXT | YYYY-MM-DD, set on insert. Not shown anywhere in the app |
-| `last_updated` | TEXT | YYYY-MM-DD, rewritten on edit. Drives the staleness half of Needs Attention, against the interval its category declares |
+| `extra_data` | TEXT | The category's own fields (balances, due dates and how they repeat, rates) plus the Favorites pin, stored as JSON and **encrypted** as one value. Keeping the pin here means the file doesn't reveal which accounts you use most |
+| `closed` | INTEGER | 0 for open, 1 for closed |
+| `date_added` | TEXT | YYYY-MM-DD, set when the account is created. Not shown anywhere in the app |
+| `last_updated` | TEXT | YYYY-MM-DD. Set to today by an edit or **No Change**, and moved forward (never back) to the date of a newer balance entry. Used by **Needs Attention** to flag accounts that haven't been updated within their category's limit |
 
-### balance_history
+#### balance_history
 
 | Column | Type | Notes |
 |---|---|---|
 | `id` | INTEGER | Primary key, auto-increment |
-| `account_id` | INTEGER | Foreign key to `accounts.id`, cascading on delete |
-| `balance` | TEXT | Numeric value, **encrypted** |
-| `recorded_at` | TEXT | ISO 8601 date or datetime |
+| `account_id` | INTEGER | Foreign key to `accounts.id`. Deleting the account deletes its history |
+| `balance` | TEXT | The amount, **encrypted** |
+| `recorded_at` | TEXT | ISO 8601 date or date and time |
 
 Each encrypted column holds `base64url(12-byte nonce || AES-256-GCM ciphertext || 16-byte tag)`.
 
-### app_config
+#### app_config
 
 | Column | Type | Notes |
 |---|---|---|
@@ -329,34 +400,52 @@ Stored keys:
 | Key | Default | Notes |
 |---|---|---|
 | `master_hash` | none | Argon2id hash of the master password |
-| `salt` | none | Hex-encoded 256-bit salt used for key derivation |
-| `kdf_params` | none | The Argon2id work factors the salt above was used with. Recorded so they can be raised without orphaning every existing field |
-| `vault_format` | none | How the fields are encrypted. `1` binds each to its column; absent means a vault written before that, upgraded at the next login |
-| `key_check` | none | A token encrypted under the session key, decrypted at unlock to confirm the key opens this vault |
-| `lockout_started` | none | POSIX timestamp the current login lockout began at |
-| `lockout_duration` | none | Length of that lockout in seconds. Stored with the start time rather than as a deadline, so the remaining wait can be capped and the system clock cannot be used to extend it |
-| `failed_login_attempts` | 0 | Consecutive failed attempts, persisted so a restart does not hand back the attempts still left before a lockout |
-| `lock_timeout_minutes` | 15 | Inactivity auto-lock timeout |
-| `clipboard_clear_seconds` | 30 | Delay before a copied secret is cleared |
-| `shutdown_after_lock_minutes` | 60 | Minutes after lock before the app exits, 0 to disable |
-| `theme` | dark | UI theme, `dark` or `light` |
-| `font_size` | default | UI font size |
-| `list_density` | compact | How much room each account row takes |
+| `salt` | none | Hex-encoded 256-bit salt used to derive the key |
+| `kdf_params` | none | The Argon2id settings used with `salt` to derive the key. Saved so they can be raised later without breaking existing data |
+| `vault_format` | none | How fields are encrypted. `1` ties each field to its column. Missing means an older vault, which is upgraded at the next login |
+| `key_check` | none | A test value encrypted with the vault key and decrypted at unlock to confirm the key is right |
+| `lockout_started` | none | When the current login lockout started, as a POSIX timestamp |
+| `lockout_duration` | none | How long that lockout lasts, in seconds. Stored with the start time instead of as an end time, so the wait can be capped and changing the clock can't extend it |
+| `failed_login_attempts` | 0 | Failed attempts in a row. Saved so restarting the app doesn't hand back the attempts left before a lockout |
+| `lock_timeout_minutes` | 15 | Minutes of inactivity before the vault locks |
+| `clipboard_clear_seconds` | 30 | Seconds before a copied secret is cleared |
+| `shutdown_after_lock_minutes` | 60 | Minutes after locking before the app closes, 0 for never |
+| `theme` | dark | `dark` or `light` |
+| `font_size` | default | `small`, `default`, `large`, or `xl` |
+| `list_density` | compact | `compact` or `comfortable` |
+| `auto_backup_enabled` | 0 | Whether automatic backups are on |
+| `backup_frequency` | weekly | `daily`, `weekly`, or `monthly` |
+| `backup_retention_months` | 12 | Months to keep automatic backups, 0 to keep them forever |
+| `backup_location` | default | Backup folder. `default` means a `backups` folder next to the vault, wherever the vault is moved |
+| `backup_confirmed_dir` | none | The folder you approved for backups, if you chose your own |
+| `last_backup_date` | none | When the last automatic backup was made |
+| `last_backup_outcome` | none | JSON: whether it worked, plus the file name or the error |
+| `backup_files` | none | JSON list of the backups this app made. Old backups are only deleted if they're on this list |
+| `backup_source` | none | The vault path the backup list belongs to. If it doesn't match, this vault is a copy, and the list it inherited is cleared |
+| `backup_auth` | none | The seal: a value covering every backup row (`auto_backup_enabled` through `backup_source`), encrypted with the vault key |
+| `warning_settings` | none | The **Manage > Warnings…** settings as JSON, **encrypted**. Missing means the defaults |
 | `sort_key` | name | Account list sort order |
-| `sort_descending` | per sort key | Direction override for the current sort |
+| `sort_descending` | depends on the sort | Whether the current sort is reversed |
 | `window_geometry` | none | Hex-encoded result of `QMainWindow.saveGeometry()` |
-| `sidebar_width` | none | Sidebar width in pixels, accepted between 240 and 560 |
+| `sidebar_width` | none | Sidebar width in pixels, between 240 and 560 |
 
-Everything below `key_check` is preference or view state rather than vault content, and is stored unencrypted. The lockout rows in particular have to stay legible while the vault is locked — which also means anyone who can write the database file can clear a lockout between guesses. That is not a gap the app can close, and it is why the Argon2id verify, not the lockout, is what actually bounds guessing; the lockout exists to slow someone typing at the keyboard.
+Everything after `key_check` is settings, window layout, and the backup record, not your data. It's stored unencrypted because the window has to be built and styled before you log in. There are two exceptions:
 
-## Dependencies
+- `warning_settings` is encrypted because it contains the names of your custom categories. It's only needed while the vault is open.
+- The backup rows stay readable, but they tell the app where to copy your vault and what it may delete. So `backup_auth` seals them, and rows that don't match the seal are reset instead of used.
+
+The lockout rows have to be readable while the vault is locked. That also means anyone who can edit the database file can clear a lockout between guesses. The app can't prevent that. The real protection against guessing is how slow Argon2id makes each attempt; the lockout is there to slow down someone typing at the keyboard.
+
+### Dependencies
 
 | Package | Purpose |
 |---|---|
-| `PySide6` | Qt bindings, the desktop UI |
+| `PySide6` | Qt bindings for the desktop interface |
 | `cryptography` | AES-256-GCM encryption |
 | `argon2-cffi` | Argon2id key derivation |
 
-SQLite comes from the Python standard library. `pytest` is the only development dependency and is kept in `requirements-dev.txt`, so anyone who just wants to open their vault is never asked to install a test runner.
+SQLite comes with Python. `pytest` is the only development dependency. It's kept in `requirements-dev.txt`, so people who just want to use the app never have to install it.
 
-Every version is pinned exactly, transitive dependencies included. That is only safe with something watching for the next release, so `.github/dependabot.yml` opens a pull request when a pin falls behind or picks up a CVE, and `.github/workflows/tests.yml` runs the suite against the bump before it can be merged. The two crypto packages are deliberately left ungrouped, so each one arrives on its own and gets reviewed by itself.
+Every version is pinned exactly, including the packages they depend on. `requirements.lock` goes further and pins the exact files, and `--require-hashes` checks them. That matters for an app that holds secrets, because a tampered package would run in the same process as the master password. The lock covers Windows and Linux x86-64. After changing a version in `requirements.txt`, run `python tools/genlock.py` and commit the result. CI installs from the lock, so a stale lock fails there instead of on someone's first install.
+
+Pinning exact versions is only safe if something watches for new releases. `.github/dependabot.yml` opens a pull request when a pinned version falls behind or has a known security problem (a CVE), and `.github/workflows/tests.yml` runs the tests on it before it can be merged. The two crypto packages aren't grouped with anything else, so each update arrives on its own and gets reviewed by itself.

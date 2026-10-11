@@ -19,7 +19,7 @@
 #
 # Install with:
 #
-#     python -m pip install --require-hashes -r requirements.lock
+#     python -m pip install --require-hashes -r requirements/requirements.lock
 
 PySide6==6.11.1 \
     --hash=sha256:0968877ab1fb4ef3587a284da6fe05e8647ada56a6a3750b6395188e01f4aba6 \

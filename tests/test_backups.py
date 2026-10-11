@@ -19,9 +19,9 @@ import sqlite3
 
 import pytest
 
-import auth
-import database
-import preferences
+from core import auth
+from core import database
+from core import preferences
 from conftest import MASTER, NEW_MASTER, make_account
 from services import accounts as accounts_service
 from services import backups
@@ -82,8 +82,8 @@ def test_a_copy_opens_with_the_same_master_password(vault, tmp_path, monkeypatch
     """A backup is the vault, so it takes the master password and no other.
     This is also the property that makes a copy taken before a password change
     need the old one afterwards."""
-    import auth
-    import encryption
+    from core import auth
+    from core import encryption
     make_account(name='Bank', password='s3cret')
     destination = tmp_path / 'copy.vault'
     backups.copy_vault(destination)

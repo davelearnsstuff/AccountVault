@@ -33,7 +33,7 @@ exit /b
 :create_venv
 echo.
 echo AccountVault needs a few Python packages that aren't installed yet:
-type requirements.txt
+type requirements\requirements.txt
 echo.
 echo They can be installed into a .venv folder here, leaving your system
 echo Python untouched. This downloads a few hundred MB and takes a few minutes.
@@ -48,13 +48,14 @@ if errorlevel 1 goto venv_failed
 :install_into_venv
 echo.
 echo Installing requirements ...
-"%VENV_PY%" -m pip install --upgrade pip
 
 rem --require-hashes against requirements.lock, not a plain install of
-rem requirements.txt. The versions are pinned either way; this pins the actual
-rem artifacts, so a substituted cryptography or argon2-cffi wheel is refused
-rem rather than installed into the process that will hold the master password.
-"%VENV_PY%" -m pip install --require-hashes -r requirements.lock
+rem requirements.txt: this pins the actual artifacts, so a substituted
+rem cryptography or argon2-cffi wheel is refused rather than installed into the
+rem process that will hold the master password. pip is deliberately not
+rem upgraded first - that would fetch and run an unverified copy of the tool
+rem about to do the verifying.
+"%VENV_PY%" -m pip install --require-hashes -r requirements\requirements.lock
 if errorlevel 1 goto install_failed
 
 echo.
@@ -64,9 +65,9 @@ exit /b
 
 :declined
 echo.
-echo Nothing was installed. Run start.bat again when you're ready,
+echo Nothing was installed. Run AccountVault_Windows.bat again when you're ready,
 echo or install the packages yourself with:
-echo     python -m pip install -r requirements.txt
+echo     python -m pip install -r requirements\requirements.txt
 echo.
 pause
 exit /b 1
@@ -74,7 +75,7 @@ exit /b 1
 :venv_failed
 echo.
 echo Could not create the .venv folder.
-echo Check that you can write to this directory, then run start.bat again.
+echo Check that you can write to this directory, then run AccountVault_Windows.bat again.
 echo.
 pause
 exit /b 1
@@ -86,9 +87,9 @@ echo.
 echo A network connection is required. If the error mentions hashes, this
 echo machine is on a platform requirements.lock does not cover - it holds the
 echo Windows and Linux x86-64 wheels. You can install without that check with:
-echo     python -m pip install -r requirements.txt
+echo     python -m pip install -r requirements\requirements.txt
 echo.
-echo Once the problem is fixed, run start.bat again to retry.
+echo Once the problem is fixed, run AccountVault_Windows.bat again to retry.
 echo.
 pause
 exit /b 1
@@ -105,7 +106,7 @@ echo Or paste this command into a terminal to install it:
 echo     winget install -e --id Python.Python.3.13 --accept-package-agreements --accept-source-agreements
 echo.
 echo During a manual install, tick "Add python.exe to PATH" on the first screen.
-echo After installing, close this window and run start.bat again.
+echo After installing, close this window and run AccountVault_Windows.bat again.
 echo.
 pause
 exit /b 1

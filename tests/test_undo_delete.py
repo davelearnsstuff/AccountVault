@@ -17,7 +17,7 @@ from services import accounts as accounts_service
 
 
 def _history_rows(account_id):
-    import database
+    from core import database
     with database.connect() as db:
         return [tuple(r) for r in db.execute(
             "SELECT * FROM balance_history WHERE account_id = ? ORDER BY id",

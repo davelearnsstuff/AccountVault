@@ -12,7 +12,7 @@
 import pytest
 
 from conftest import corrupt_column, make_account, snapshot_rows
-from categories import FAVORITE_KEY, is_favorite
+from core.categories import FAVORITE_KEY, is_favorite
 from services import accounts as accounts_service
 
 
@@ -53,7 +53,7 @@ def test_pinning_leaves_the_last_updated_stamp_alone(vault):
     account = make_account(name='Chase', current_balance='100')
     with_old_stamp = '2020-01-01'
     accounts_service.update_account(account['id'], {**account, 'name': 'Chase'})
-    import database
+    from core import database
     with database.connect() as db:
         db.execute("UPDATE accounts SET last_updated = ? WHERE id = ?",
                    (with_old_stamp, account['id']))

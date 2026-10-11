@@ -16,7 +16,7 @@ import pytest
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-import encryption
+from core import encryption
 from conftest import corrupt, corrupt_column, make_account, raw_column
 from services import accounts as accounts_service
 

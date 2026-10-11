@@ -100,6 +100,29 @@ def test_backdated_save_records_history_without_moving_the_headline(vault):
                for e in entries)
 
 
+def test_backdated_save_newer_than_history_moves_the_headline(vault):
+    """Quick Update with an 'As Of' a few days back, on an account last updated
+    before that: the figure is the newest one on file, so the account follows it
+    and last_updated moves up to its date, just as a history entry would."""
+    from core import database
+    account = make_account(current_balance=100)
+    old = (date.today() - timedelta(days=60)).isoformat()
+    recent = (date.today() - timedelta(days=3)).isoformat()
+    with database.connect() as db:
+        db.execute("UPDATE accounts SET last_updated = ? WHERE id = ?",
+                   (old, account['id']))
+        db.execute("UPDATE balance_history SET recorded_at = ? WHERE account_id = ?",
+                   (old, account['id']))
+    accounts_service.invalidate_cache()
+
+    edit = dict(accounts_service.get_account(account['id']))
+    edit['current_balance'] = 500
+    updated = accounts_service.update_account(account['id'], edit, balance_date=recent)
+
+    assert updated['current_balance'] == 500
+    assert updated['last_updated'] == recent
+
+
 def test_same_day_save_does_move_the_headline(vault):
     """The companion to the test above: no balance_date means the figure is current."""
     account = make_account(current_balance=100)

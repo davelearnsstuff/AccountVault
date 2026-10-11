@@ -2,30 +2,19 @@
 # services/backups.py
 # Copying the vault: by hand, and on a schedule.
 #
-# A backup is a copy of the vault file. It used to be a format of its own — a
-# JSON envelope sealed under a second password — and replacing that with a copy
-# trades one property for two. Lost: a backup that survives a master password
-# change, because a copy is frozen under whatever key the vault held when it
-# was taken. Gained: there is no second password to lose, and restoring is
-# opening the file rather than an import that could reject or reshape what it
-# reads.
-#
-# The frozen-key trade is real and foreseeable — a copy taken in January still
-# wants January's password in June — so change_master_password offers a fresh
-# copy on the spot rather than leaving it to be discovered.
+# A backup is a copy of the vault file. It opens with the master password the
+# vault held when it was taken — which is why change_master_password is followed
+# by an offer of a fresh copy.
 #
 # Three rules the rest of this file exists to hold:
 #
 #   * a partial write never becomes a backup. Copies land on a temporary name
 #     in the destination folder and are verified as openable vaults before
-#     being renamed into place, so a full disk or a pulled drive leaves no file
-#     rather than a plausible-looking broken one;
-#   * deletion only ever follows a successful write. Pruning runs after a new
-#     backup exists and never otherwise, so a destination that has stopped
-#     working stops the history growing instead of eating it;
+#     being renamed into place;
+#   * deletion only ever follows a successful write, so a destination that has
+#     stopped working stops the history growing instead of eating it;
 #   * nothing is deleted that this app did not create. Pruning works from the
-#     recorded list of files it wrote, not from whatever matches the naming
-#     pattern in the folder.
+#     recorded list of files it wrote, not from the folder's contents.
 # -----------------------------------------------------------------------------
 
 import datetime
@@ -35,13 +24,13 @@ import sqlite3
 import tempfile
 from pathlib import Path
 
-import database
-import preferences
-from database import VAULT_SUFFIX
+from core import database
+from core import preferences
+from core.categories import parse_iso_date
+from core.database import VAULT_SUFFIX
 
 # Days between backups at each setting. Elapsed days rather than calendar
-# boundaries: "a week" is seven days from the last one, which is what somebody
-# choosing weekly means and what survives an app that is not opened every day.
+# boundaries, which survives an app that is not opened every day.
 FREQUENCY_DAYS = {'daily': 1, 'weekly': 7, 'monthly': 30}
 
 # Folder made beside the vault when the user has not named one.
@@ -50,9 +39,8 @@ DEFAULT_DIR_NAME = 'backups'
 _TEMP_PREFIX = '.avbackup-'
 
 # The shape backup_name() produces: '<stem>_backup_<YYYYMMDD>.vault'. Only a
-# name matching this is ever deleted — see _deletable. The stem is whatever the
-# user called their vault, so it is left open, but it cannot contain a path
-# separator, a drive, or the '..' that would take the name out of the folder.
+# name matching this is ever deleted. The stem is whatever the user called their
+# vault, but it cannot contain a separator, a drive, or '..'.
 _BACKUP_NAME = re.compile(
     r'[^\\/:*?"<>|]+_backup_\d{8}' + re.escape(VAULT_SUFFIX))
 
@@ -61,17 +49,19 @@ class BackupError(Exception):
     """A backup could not be written, with a sentence saying why."""
 
 
+# What the user is told when check_seal discards a configuration.
+RESET_MESSAGE = ("The stored backup settings did not match this vault and have "
+                 "been reset. Automatic backups are off until you turn them on "
+                 "again in Settings.")
+
+
 # -----------------------------------------------------------------------------
 # Naming and locations
 # -----------------------------------------------------------------------------
 
 def backup_name(vault_path=None, when=None) -> str:
-    """The filename a backup of this vault takes today.
-
-    `mymoney.vault` becomes `mymoney_backup_20260917.vault`. The date is local
-    and unpunctuated so the files sort in the order they were taken, which is
-    the order anybody scanning the folder is looking for.
-    """
+    """The filename a backup of this vault takes today: `mymoney.vault` becomes
+    `mymoney_backup_20260917.vault`, which sorts in the order taken."""
     vault_path = Path(vault_path or database.DB_PATH)
     when = when or datetime.date.today()
     return f"{vault_path.stem}_backup_{when:%Y%m%d}{VAULT_SUFFIX}"
@@ -83,10 +73,8 @@ def default_dir(vault_path=None) -> Path:
 
 
 def resolve_dir(settings: dict, vault_path=None) -> Path:
-    """Where backups go, given the stored setting.
-
-    The sentinel is resolved here and nowhere else, which is what lets a vault
-    be moved without its backups carrying on into the old folder."""
+    """Where backups go, given the stored setting. The default sentinel is
+    resolved here and nowhere else, so a moved vault's backups follow it."""
     location = settings.get('backup_location') or preferences.BACKUP_LOCATION_DEFAULT
     if location == preferences.BACKUP_LOCATION_DEFAULT:
         return default_dir(vault_path)
@@ -100,18 +88,10 @@ def resolve_dir(settings: dict, vault_path=None) -> Path:
 def copy_vault(destination) -> Path:
     """Copies the open vault to destination, atomically. Returns the path.
 
-    sqlite3's own backup API rather than a file copy. The vault is a live
-    database on a rollback journal, and shutil.copy taken while a write is in
-    flight captures a file that is torn in exactly the way nobody notices until
-    they need it. The API copies pages under a read lock and produces a
-    consistent database whatever else is happening.
-
-    The copy is built under a temporary name in the destination folder, checked
-    for being a vault that opens, and only then renamed into place. A rename
-    within one filesystem is atomic, so the named file is either the previous
-    one or a complete new one, and never a half-written thing wearing a
-    backup's name.
-    """
+    Uses sqlite3's backup API rather than a file copy, which could capture a
+    file torn by a write in flight. The copy is built under a temporary name in
+    the destination folder, checked as a vault that opens, and only then renamed
+    into place."""
     if database.DB_PATH is None:
         raise BackupError('No vault is open.')
 
@@ -123,25 +103,21 @@ def copy_vault(destination) -> Path:
     except OSError as exc:
         raise BackupError(f"The backup folder could not be created: {exc}")
 
-    # Only a folder this call has just made. One the user picked is theirs; see
-    # database._harden_parent for the same rule and why it matters.
+    # Only a folder this call has just made; one the user picked is theirs.
     if created_folder:
         database.restrict_to_owner(folder)
 
     handle, temp_name = None, None
     try:
-        # Created owner-only before a byte goes in, so the copy is never briefly
-        # readable by everyone the way a file made under the ambient umask is.
+        # mkstemp creates the file 0o600; the ACL follows before a byte is
+        # copied in.
         handle, temp_name = tempfile.mkstemp(prefix=_TEMP_PREFIX, dir=str(folder))
         os.close(handle)
         handle = None
-        os.chmod(temp_name, 0o600)
         database.restrict_to_owner(Path(temp_name))
 
         _copy_database(Path(temp_name))
 
-        # Checked before the rename, not after: the point of the temporary name
-        # is that nothing which fails this is ever called a backup.
         if database.inspect_vault(temp_name) != 'ok':
             raise BackupError('The copy did not come out as a readable vault.')
 
@@ -155,9 +131,7 @@ def copy_vault(destination) -> Path:
         if handle is not None:
             os.close(handle)
         if temp_name is not None:
-            # A failed copy leaves nothing behind. Half a vault in a backups
-            # folder is worse than no vault: it is indistinguishable from one
-            # that worked until somebody tries to open it.
+            # Half a vault in a backups folder looks like one that worked.
             try:
                 os.unlink(temp_name)
             except OSError:
@@ -184,13 +158,8 @@ def _copy_database(target: Path):
 # -----------------------------------------------------------------------------
 
 def is_due(settings: dict, state: dict, today=None) -> bool:
-    """Whether a scheduled backup is owed.
-
-    A schedule that has been missed for months produces one backup, not one per
-    interval that went by: the vault only has one state to copy, and filling the
-    retention window with copies of the same moment is how the older ones get
-    pushed out.
-    """
+    """Whether a scheduled backup is owed. A schedule missed for months produces
+    one backup, not one per missed interval."""
     if not settings.get('auto_backup_enabled'):
         return False
 
@@ -198,8 +167,7 @@ def is_due(settings: dict, state: dict, today=None) -> bool:
     last = _parse_date(state.get('last_backup_date'))
     if last is None:
         return True
-    # A recorded date in the future is a clock that has been moved, not a
-    # backup from next week. Treat it as due rather than waiting it out.
+    # A recorded date in the future is a clock that moved; treat it as due.
     if last > today:
         return True
 
@@ -208,19 +176,15 @@ def is_due(settings: dict, state: dict, today=None) -> bool:
 
 
 def is_default_dir(settings: dict, folder=None) -> bool:
-    """Whether backups are going to the folder beside the vault.
-
-    The default needs no confirming: it travels with the vault, it is covered by
-    whatever protects the vault's own folder, and the user never chose it."""
+    """Whether backups are going to the folder beside the vault, which needs no
+    confirming: it travels with the vault and the user never chose it."""
     folder = folder or resolve_dir(settings)
     return os.path.normcase(str(folder)) == os.path.normcase(str(default_dir()))
 
 
 def destination_confirmed(folder) -> bool:
-    """Whether the user has agreed to backups going to this folder.
-
-    The record is sealed, so it says what the user approved rather than what the
-    file claims they approved."""
+    """Whether the user has agreed to backups going to this folder. The record
+    is sealed, so this is only meaningful after check_seal has run."""
     confirmed = preferences.get_backup_state().get('confirmed_dir') or ''
     if not confirmed:
         return False
@@ -228,13 +192,9 @@ def destination_confirmed(folder) -> bool:
 
 
 def destination_warning(folder) -> str:
-    """What is worth saying about where this folder is, or ''.
-
-    A backup is the whole vault in one file. It is encrypted, so this is not a
-    disclosure — but a copy somewhere the user does not control is a copy
-    somebody else can take away and spend as long as they like guessing at, and
-    that is worth a sentence before it starts happening on a schedule rather
-    than after."""
+    """What is worth saying about where this folder is, or ''. A backup is the
+    whole vault, encrypted; a copy somewhere the user does not control can be
+    taken away and attacked offline at leisure."""
     text = str(folder)
     if text.startswith('\\\\') or text.startswith('//'):
         return ("That folder is on a network share. Each backup is a complete "
@@ -248,10 +208,8 @@ def destination_warning(folder) -> str:
 
 
 def _is_removable(folder) -> bool:
-    """Whether the folder sits on removable media. False when it cannot be told.
-
-    Windows only, and best effort: this decides whether to add a sentence, so
-    being unable to answer means saying nothing rather than guessing."""
+    """Whether the folder sits on removable media. Windows only; False when it
+    cannot be told."""
     if os.name != 'nt':
         return False
     try:
@@ -268,20 +226,15 @@ def _is_removable(folder) -> bool:
 def check_seal() -> str:
     """Confirms the stored backup configuration is this vault's own.
 
-    Returns 'ok' when it is, 'sealed' when a vault that had never configured a
-    backup was sealed just now, and 'reset' when a configuration that could not
-    be vouched for was discarded — which is the answer the caller has to tell
-    the user about, because their automatic backups have just been turned off.
+    Returns 'ok' when it is, 'sealed' when a never-configured vault was sealed
+    just now, and 'reset' when a configuration that could not be vouched for
+    was discarded — which the caller must tell the user about, because their
+    automatic backups have just been turned off.
 
-    Called before anything reads the backup settings. The rows say where to copy
-    the vault and which files may be deleted, and until this has run they are
-    only what was in the file."""
+    Must run before anything reads the backup settings to act on them."""
     if preferences.backup_config_is_sealed():
         return 'ok'
     if preferences.backup_config_is_pristine():
-        # Nothing configured, so nothing to discard and nobody to tell. This is
-        # every vault's first run, and the upgrade path for one that never
-        # turned backups on.
         preferences.seal_backup_config()
         return 'sealed'
     preferences.reset_backup_config()
@@ -292,23 +245,14 @@ def run_if_due(settings: dict, today=None) -> dict | None:
     """Takes the scheduled backup if one is owed. None when nothing was due.
 
     Returns {'ok', 'path'|'message', 'pruned'} so the caller can report the
-    outcome, which is also recorded for Settings to show. Never raises: a
-    backup that cannot be written must not be able to interrupt an unlock.
-    """
+    outcome. Never raises: a backup that cannot be written must not interrupt an
+    unlock."""
     today = today or datetime.date.today()
 
-    # Before the settings are read for anything. A configuration that cannot be
-    # vouched for is discarded rather than acted on, and the caller is told so
-    # it can say why the backups it had set up have stopped.
-    seal = check_seal()
-    if seal == 'reset':
-        return {'ok': False, 'reset': True, 'pruned': 0, 'message':
-                "The stored backup settings did not match this vault and have "
-                "been reset. Automatic backups are off until you turn them on "
-                "again in Settings."}
-    # Past here the seal vouches for the stored rows, so the settings the caller
-    # read out of them are as good as re-reading. On 'reset' we never get here,
-    # and the caller reloads — see MainWindow._run_scheduled_backup.
+    # Checked again even when the caller already has: this function must never
+    # act on rows that were not vouched for.
+    if check_seal() == 'reset':
+        return {'ok': False, 'reset': True, 'pruned': 0, 'message': RESET_MESSAGE}
 
     state = _usable_state(settings)
     if not is_due(settings, state, today):
@@ -318,15 +262,10 @@ def run_if_due(settings: dict, today=None) -> dict | None:
     name = backup_name(when=today)
     destination = folder / name
 
-    # Today's backup already exists, so there is nothing to add — and, more to
-    # the point, nothing to overwrite. Without this a second unlock on the same
-    # day would rewrite the morning's backup with the evening's vault, which is
-    # how a good copy gets replaced by one taken after something went wrong.
-    #
-    # The date moves on but the file is *not* adopted into the record unless it
-    # is already there. Save a Copy offers this same folder and this same name
-    # by default, so the file sitting here can easily be one the user wrote by
-    # hand — and a file this app did not create is not one it may later delete.
+    # Today's backup already exists, and a second unlock must not overwrite the
+    # morning's copy with the evening's vault. The file is not adopted into the
+    # record unless it already is: Save a Copy offers this same name, so it may
+    # be one the user wrote by hand, and retention may only delete our own.
     if destination.exists():
         preferences.save_backup_date(today.isoformat())
         if any(entry.get('name') == name for entry in state.get('files', [])):
@@ -338,9 +277,7 @@ def run_if_due(settings: dict, today=None) -> dict | None:
     except BackupError as exc:
         outcome = {'date': today.isoformat(), 'ok': False, 'message': str(exc)}
         preferences.save_backup_outcome(outcome)
-        # last_backup_date is deliberately not moved on. A failed attempt has
-        # not backed anything up, and recording it as though it had would mean
-        # waiting out another whole interval before trying again.
+        # last_backup_date is not moved on, so the next unlock tries again.
         return {'ok': False, 'message': str(exc), 'pruned': 0}
 
     preferences.save_backup_date(today.isoformat())
@@ -349,16 +286,10 @@ def run_if_due(settings: dict, today=None) -> dict | None:
         {'date': today.isoformat(), 'ok': True, 'name': name})
     entries = _record_file(state, name, today)
 
-    # Only now, with a new backup on disk and verified. This ordering is the
-    # whole safety property of the retention setting: a destination that has
-    # stopped working never reaches here, so it stops the history growing
-    # rather than consuming it.
+    # Only now, with a new backup on disk and verified.
     pruned = prune(settings, entries, folder, today)
-    # Read back rather than trusted: copy_vault asks for owner-only and a
-    # filesystem that cannot express it says so by doing nothing. The vault's
-    # own hardening is reported at startup by main._warn_if_unhardened; a backup
-    # lands somewhere the user picked, which is likelier to be a share or a
-    # stick, so it is worth the same honesty.
+    # Read back rather than trusted: a share or a stick may not be able to
+    # express owner-only, and says so by doing nothing.
     return {'ok': True, 'path': destination, 'pruned': pruned,
             'hardened': database.verify_restricted(destination)}
 
@@ -370,24 +301,12 @@ def run_if_due(settings: dict, today=None) -> dict | None:
 def prune(settings: dict, entries: list, folder: Path, today=None) -> int:
     """Deletes recorded backups older than the retention window. Returns how many.
 
-    Three things it will not do:
+    Never deletes the newest backup whatever its age (retention means "stop
+    accumulating", never "end up with nothing"), never a file it has no record
+    of writing, and nothing when the window is 0 ("keep forever").
 
-      * delete the newest backup, whatever its age. Come back to a vault after
-        thirteen months with a twelve-month window and every backup in the
-        folder is expired; taken literally that empties the folder at the exact
-        moment somebody is least sure of themselves. Retention means "stop
-        accumulating", never "end up with nothing";
-      * delete a file it has no record of writing. A copy the user made by hand
-        can sit in this folder under a name of the same shape, and it is not
-        ours to tidy away;
-      * delete anything when the window is 0, which is the "keep forever"
-        setting.
-
-    Age comes from the date recorded with the file rather than its mtime: a
-    backup that was copied to a new machine, or restored from a sync service,
-    has a modification time that says today and tells you nothing about when it
-    was taken.
-    """
+    Age comes from the date recorded with the file, not its mtime, which a copy
+    to a new machine resets."""
     months = settings.get('backup_retention_months', 12)
     today = today or datetime.date.today()
     if not months:
@@ -395,9 +314,8 @@ def prune(settings: dict, entries: list, folder: Path, today=None) -> int:
         return 0
 
     dated = [(entry, _parse_date(entry.get('date'))) for entry in entries]
-    # An entry whose date will not parse is kept and never deleted: the record
-    # is the only evidence of when it was taken, so an unreadable one means the
-    # age is unknown, not that it is old.
+    # An entry whose date will not parse is never deleted: its age is unknown,
+    # not old.
     newest = max((date for _, date in dated if date), default=None)
 
     cutoff = _months_before(today, months)
@@ -410,20 +328,17 @@ def prune(settings: dict, entries: list, folder: Path, today=None) -> int:
             continue
         target = _deletable(folder, entry.get('name'))
         if target is None:
-            # Not a name this app could have written. Kept rather than deleted,
-            # and kept rather than dropped: forgetting it would only hide it.
+            # Not a name this app could have written: kept, and kept recorded.
             survivors.append(entry)
             continue
         try:
             target.unlink()
             deleted += 1
         except FileNotFoundError:
-            # Already gone — somebody tidied the folder. Drop the record and
-            # count nothing: no deletion happened here.
+            # Already gone; drop the record.
             pass
         except OSError:
-            # Still there and not removable. Keep the record, or the next run
-            # would forget the file exists and leave it behind forever.
+            # Still there and not removable; keep the record so it is retried.
             survivors.append(entry)
 
     _store(survivors)
@@ -431,12 +346,8 @@ def prune(settings: dict, entries: list, folder: Path, today=None) -> int:
 
 
 def expired_count(entries: list, months: int, today=None) -> int:
-    """How many recorded backups a retention window would eventually remove.
-
-    Answers the question Settings has to put in front of somebody shortening the
-    window, and answers it by the same rules prune does — the newest is never
-    counted, an undated entry is never counted, and 0 months counts nothing.
-    """
+    """How many recorded backups a retention window would eventually remove, by
+    the same rules prune follows."""
     today = today or datetime.date.today()
     if not months:
         return 0
@@ -450,15 +361,9 @@ def expired_count(entries: list, months: int, today=None) -> int:
 
 
 def _months_before(today: datetime.date, months: int) -> tuple:
-    """The (year, month) that many whole months back.
-
-    Compared as a pair rather than by subtracting days, so the window does not
-    depend on how long the months in it happened to be, and so there is never a
-    question about what "one month before the 31st" means. A backup is kept
-    while its own month is this one or later, which rounds the window up to the
-    nearest whole month — erring towards keeping backups is the only direction
-    to err in here.
-    """
+    """The (year, month) that many whole months back. A backup is kept while its
+    own month is this one or later, which rounds the window up — towards
+    keeping."""
     total = today.year * 12 + (today.month - 1) - months
     return total // 12, total % 12 + 1
 
@@ -470,18 +375,11 @@ def _months_before(today: datetime.date, months: int) -> tuple:
 def _usable_state(settings: dict) -> dict:
     """The backup history, unless it belongs to a different vault.
 
-    A backup is a copy of the whole vault file, app_config included, so opening
-    one as a live vault brings the original's backup settings and the original's
-    list of backup files with it. Left alone, the copy would write its backups
-    into the original's folder under the original's name, and prune the
-    original's history — from a file the user is probably only looking at
-    because something went wrong with the original.
-
-    Detected by the vault path recorded alongside: if it names a different file,
-    the history is forgotten and this vault starts its own. The settings survive
-    — wanting backups is a preference worth inheriting — but everything that
-    points at another vault's files does not.
-    """
+    A backup is a copy of the whole vault, app_config included, so a copy opened
+    as a live vault brings the original's list of backup files with it. Left
+    alone it would prune the original's history. Detected by the vault path
+    recorded alongside: if it names a different file, the history is forgotten.
+    The settings survive — wanting backups is a preference worth inheriting."""
     state = preferences.get_backup_state()
     source = state.get('source')
     if source and database.DB_PATH is not None:
@@ -494,18 +392,10 @@ def _usable_state(settings: dict) -> dict:
 def _deletable(folder: Path, name) -> Path | None:
     """The file inside `folder` that this name refers to, or None to leave it.
 
-    The last word before unlink(), and deliberately not the only one —
-    preferences._is_bare_filename refuses the same names as they are read. Both
-    exist because app_config is plaintext: someone who can write a vault file,
-    with no master password, can put any string in the recorded backup list, and
-    a name like 'C:/Users/you/taxes.pdf' or '../../Desktop/keys.pem' would
-    otherwise be handed to unlink() the next time retention ran.
-
-    Checked against what this app actually writes — backup_name()'s
-    '<stem>_backup_<YYYYMMDD>.vault' — rather than merely against escaping the
-    folder, so a name that stays put but names the user's own vault is refused
-    too. The resolved parent is compared as well, in case the folder itself is
-    reached through a link."""
+    The last check before unlink(), alongside preferences._is_bare_filename on
+    the way in. The name must have backup_name()'s exact shape — so it cannot
+    leave the folder or name the user's own vault — and its resolved parent must
+    be the folder, in case the folder is reached through a link."""
     if not isinstance(name, str) or not _BACKUP_NAME.fullmatch(name):
         return None
     target = folder / name
@@ -531,7 +421,4 @@ def _store(entries: list):
 
 
 def _parse_date(value):
-    try:
-        return datetime.date.fromisoformat(value)
-    except (TypeError, ValueError):
-        return None
+    return parse_iso_date(value) if isinstance(value, str) else None

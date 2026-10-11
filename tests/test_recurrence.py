@@ -16,10 +16,10 @@ import datetime
 
 import pytest
 
-import categories
-from categories import (
+from core import categories
+from core.categories import (
     ANNUAL, DUE_CYCLES, MONTHLY, ONE_OFF, QUARTERLY, WEEKLY, advance_cycle,
-    cycle_noun, cycle_of, due_date_level, is_recurring, next_due_date,
+    cycle_noun, cycle_of, due_date_level, next_due_date,
 )
 
 
@@ -61,8 +61,8 @@ def test_a_stored_cycle_is_read_by_any_of_its_spellings(stored, expected):
     (WEEKLY, True), (MONTHLY, True), (QUARTERLY, True), (ANNUAL, True),
     (ONE_OFF, False), ('', False), (None, False),
 ])
-def test_is_recurring_still_answers_for_every_cycle(cycle, recurring):
-    assert is_recurring(cycle) is recurring
+def test_every_cycle_reads_as_recurring_or_not(cycle, recurring):
+    assert (cycle_of(cycle) is not None) is recurring
 
 
 def test_every_category_with_a_due_date_offers_the_whole_ladder():
@@ -170,19 +170,19 @@ def test_a_recurring_date_can_never_be_lapsed(today, cycle):
     """next_due_date always answers with a day still ahead, which is the whole
     point of recording a cycle — 'lapsed' says the record was never rolled
     forward, and a recurring one rolls itself."""
-    assert due_date_level('2015-01-01', cycle) != 'lapsed'
+    assert due_date_level('2015-01-01', cycle, 'Credit Cards') != 'lapsed'
 
 
 def test_a_one_off_long_past_is_lapsed_rather_than_urgent(today):
-    assert due_date_level('2015-01-01', ONE_OFF) == 'lapsed'
+    assert due_date_level('2015-01-01', ONE_OFF, 'Credit Cards') == 'lapsed'
 
 
 def test_the_occurrence_still_ahead_is_what_sets_the_colour(today):
     # 2026-09-20 is three days off, which is 'danger' whatever year the anchor
     # was written in.
-    assert due_date_level('2020-09-20', ANNUAL) == 'danger'
+    assert due_date_level('2020-09-20', ANNUAL, 'Credit Cards') == 'danger'
     # 2026-09-30 is thirteen days off: 'warn'.
-    assert due_date_level('2020-09-30', ANNUAL) == 'warn'
+    assert due_date_level('2020-09-30', ANNUAL, 'Credit Cards') == 'warn'
 
 
 # -- the +1 button ------------------------------------------------------------

@@ -10,8 +10,8 @@
 
 import pytest
 
-import auth
-import encryption
+from core import auth
+from core import encryption
 from conftest import MASTER, NEW_MASTER, corrupt_column, make_account, snapshot_rows
 from services import accounts as accounts_service
 
@@ -69,7 +69,7 @@ def test_rotation_aborts_and_changes_nothing_when_a_field_will_not_decrypt(vault
 def test_rotation_aborts_on_broken_balance_history_too(vault):
     """balance_history.balance is in ENCRYPTED_FIELDS, so it is re-keyed as well
     and gets the same all-or-nothing treatment."""
-    import database
+    from core import database
 
     account = make_account(current_balance=1200)
     with database.connect() as db:

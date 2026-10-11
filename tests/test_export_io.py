@@ -82,7 +82,7 @@ def test_the_restriction_is_applied_before_the_file_takes_its_real_name(tmp_path
     try:
         export_io.write_export(tmp_path / 'export.csv', TEXT)
     finally:
-        from database import restrict_to_owner
+        from core.database import restrict_to_owner
         export_io.restrict_to_owner = restrict_to_owner
 
     assert len(seen) == 1
