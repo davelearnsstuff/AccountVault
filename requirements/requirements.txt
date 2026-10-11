@@ -6,14 +6,14 @@
 # after any bump here, or CI fails.
 
 # Direct
-PySide6==6.11.1
+PySide6==6.11.2
 cryptography==49.0.0
 argon2-cffi==25.1.0
 
 # Transitive — bump alongside their parent, not on their own.
-PySide6_Addons==6.11.1
-PySide6_Essentials==6.11.1
-shiboken6==6.11.1
+PySide6_Addons==6.11.2
+PySide6_Essentials==6.11.2
+shiboken6==6.11.2
 cffi==2.1.0
 pycparser==3.0
 argon2-cffi-bindings==25.1.0
