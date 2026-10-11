@@ -160,8 +160,8 @@ If your computer writes memory to disk (in a page file or a crash dump), some of
 **Linux and macOS:**
 
 ```bash
-git clone https://github.com/dgibbonsri/AccountVault2-PySide.git
-cd AccountVault2-PySide
+git clone https://github.com/davelearnsstuff/AccountVault
+cd AccountVault
 ./AccountVault_Mac_Linux.sh
 ```
 
