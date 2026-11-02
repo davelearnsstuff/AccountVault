@@ -14,6 +14,6 @@ argon2-cffi==25.1.0
 PySide6_Addons==6.11.1
 PySide6_Essentials==6.11.1
 shiboken6==6.11.1
-cffi==2.1.0
+cffi==2.1.1
 pycparser==3.0
 argon2-cffi-bindings==25.1.0
