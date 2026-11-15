@@ -10,11 +10,13 @@ from collections import defaultdict
 
 from core.auth import require_session
 from core.categories import (
-    CONTRIBUTION_PERIOD_KEY, CONTRIBUTIONS_PER_YEAR, normalize_category, parse_money,
+    BENEFIT_TYPES, CONTRIBUTION_PERIOD_KEY, CONTRIBUTIONS_PER_YEAR, EXCLUDE_DASHBOARD_KEY,
+    INCOME_TYPE_KEY, MONTHLY_BENEFIT_KEY, RECEIVING_KEY, is_checked, normalize_category,
+    parse_money,
 )
 from core.database import connect
-from core.encryption import field_aad, safe_decrypt
-from services.accounts import BALANCE_AAD, list_accounts
+from core.encryption import safe_decrypt_field
+from services.accounts import account_aad, balance_aad, list_accounts
 
 _MONTH_KEY = re.compile(r'\d{4}-\d{2}')
 
@@ -221,6 +223,13 @@ def balance_sheet(summary) -> dict:
     }
 
 
+def _left_out() -> set:
+    """The ids of the accounts ticked Exclude from Dashboard. The tick is in
+    extra_data, which only the decrypted accounts can say."""
+    return {account['id'] for account in list_accounts()
+            if is_checked(account.get(EXCLUDE_DASHBOARD_KEY))}
+
+
 def _empty() -> dict:
     """A fresh empty summary. Built per call so no two callers share its lists."""
     return {'months': [], 'categories': {}, 'net_worth': [], 'accounts': {}}
@@ -233,16 +242,20 @@ def monthly_summary() -> dict:
     {id, name, value}: the parts its latest figure is the sum of."""
     require_session()
 
+    left_out = _left_out()
     with connect() as db:
         account_rows = db.execute(
             "SELECT id, category, name, closed FROM accounts").fetchall()
 
-        # Exclude closed accounts and categories that don't belong in the trends view
+        # Exclude closed accounts, ones ticked to be left out, and categories
+        # that don't belong in the trends view
         accounts = {}
         names = {}
         for row in account_rows:
-            category = normalize_category(row['category'])
-            if not (row['closed'] or 0) and category not in _EXCLUDED_CATEGORIES:
+            category = normalize_category(
+                safe_decrypt_field(row['category'], account_aad('category', row['id'])) or '')
+            if not (row['closed'] or 0) and category not in _EXCLUDED_CATEGORIES \
+                    and row['id'] not in left_out:
                 accounts[row['id']] = category
                 names[row['id']] = row['name']
         if not accounts:
@@ -254,7 +267,7 @@ def monthly_summary() -> dict:
         # shows.
         placeholders = ','.join('?' * len(accounts))
         entries = db.execute(
-            f"SELECT account_id, balance, recorded_at FROM balance_history "
+            f"SELECT id, account_id, balance, recorded_at FROM balance_history "
             f"WHERE account_id IN ({placeholders}) "
             f"ORDER BY substr(recorded_at, 1, 10) ASC, id ASC",
             list(accounts.keys()),
@@ -263,7 +276,7 @@ def monthly_summary() -> dict:
     if not entries:
         return _empty()
 
-    # Latest balance per (account, month). safe_decrypt re-raises when locked,
+    # Latest balance per (account, month). safe_decrypt_field re-raises when locked,
     # so a lock surfaces rather than rendering an empty dashboard; an entry that
     # will not open comes back as the placeholder, which is not a number and is
     # skipped.
@@ -271,7 +284,8 @@ def monthly_summary() -> dict:
     usable_months = []
     for entry in entries:
         try:
-            balance = float(safe_decrypt(entry['balance'], BALANCE_AAD))
+            balance = float(safe_decrypt_field(entry['balance'],
+                                             balance_aad(entry['account_id'], entry['id'])))
         except (TypeError, ValueError):
             continue
         month_key = str(entry['recorded_at'] or '')[:7]
@@ -339,7 +353,8 @@ def monthly_summary() -> dict:
         name = names[account_id]
         category_accounts.setdefault(accounts[account_id], []).append({
             'id': account_id,
-            'name': safe_decrypt(name, field_aad('accounts', 'name')) if name else '',
+            'name': (safe_decrypt_field(name, account_aad('name', account_id))
+                     if name else ''),
             'value': series[-1],
         })
 
@@ -363,26 +378,35 @@ def investing_vs_income() -> dict:
 
     A row whose yearly figure is None is listed but not counted: an Income
     source with no pay entered, or a contribution with no period. Neither is
-    guessed at.
+    guessed at. Social Security and a pension count as twelve monthly
+    benefits, and only while ticked Receiving Now.
 
     Yearly rather than monthly: Income stores annual pay, and a year holds a
     whole number of every period, where a month holds two or three fortnightly
     paydays.
 
     Current figures only. Closed accounts are left out on both sides, or a
-    closed job's pay would count as income for good. An Investments account
+    closed job's pay would count as income for good, and so are accounts
+    ticked Exclude from Dashboard. An Investments account
     with no contribution amount, or zero, is not being paid into, and is left
     off the list rather than shown as a row of nothing."""
     income, contributions = [], []
     for account in list_accounts():
-        if account.get('closed'):
+        if account.get('closed') or is_checked(account.get(EXCLUDE_DASHBOARD_KEY)):
             continue
         category = normalize_category(account.get('category') or '')
         row = {'id': account['id'], 'name': account.get('name') or '',
                'category': category}
 
         if category == INCOME_CATEGORY:
-            row['yearly'] = parse_money(account.get('current_balance'))
+            if account.get(INCOME_TYPE_KEY) in BENEFIT_TYPES:
+                # Not yet paid is not income yet, and is left off the list.
+                if not is_checked(account.get(RECEIVING_KEY)):
+                    continue
+                monthly = parse_money(account.get(MONTHLY_BENEFIT_KEY))
+                row['yearly'] = None if monthly is None else monthly * 12
+            else:
+                row['yearly'] = parse_money(account.get('current_balance'))
             income.append(row)
 
         elif category == INVESTMENTS_CATEGORY:

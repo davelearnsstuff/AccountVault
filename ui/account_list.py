@@ -16,15 +16,15 @@
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QHBoxLayout, QLabel, QListWidgetItem, QSizePolicy, QVBoxLayout, QWidget,
+    QFrame, QHBoxLayout, QLabel, QListWidgetItem, QSizePolicy, QVBoxLayout, QWidget,
 )
 
 from core import preferences
 from core.categories import (
-    CATEGORY_CONFIG, DUE_CYCLE_KEY, attention_counts, due_date_level, format_date,
-    format_money, get_config, has_field, is_favorite, needs_attention,
-    next_due_date, normalize_category, searchable_fields, updated_age_level,
-    value_noun,
+    CATEGORY_CONFIG, DUE_CYCLE_KEY, attention_counts, due_date_level, format_age,
+    format_date, format_money, format_short_date, get_config, has_balance, is_favorite,
+    needs_attention, next_due_date, normalize_category,
+    searchable_fields, updated_age_level, value_noun,
 )
 from core.encryption import VaultLockedError
 from services import accounts as accounts_service
@@ -39,16 +39,29 @@ from ui.widgets import (
 ALL = '__all__'
 CLOSED = '__closed__'
 DASHBOARD = '__dashboard__'
+RETIREMENT = '__retirement__'
 ATTENTION = '__attention__'
 FAVORITES = '__favorites__'
 
 # Tabs that stand for a view across every category. They get no colour dot,
 # and Add is offered without a category preselected.
-AGGREGATE_TABS = (DASHBOARD, ATTENTION, FAVORITES, ALL, CLOSED)
+AGGREGATE_TABS = (DASHBOARD, RETIREMENT, ATTENTION, FAVORITES, ALL, CLOSED)
+
+# The start_tab setting's values, as tab keys.
+START_TABS = {'all': ALL, 'attention': ATTENTION, 'favorites': FAVORITES,
+              'dashboard': DASHBOARD, 'retirement': RETIREMENT}
+
+# Tabs that open a panel of their own in place of the list and detail panes.
+PANEL_TABS = (DASHBOARD, RETIREMENT)
 
 # Views selected out of existing accounts, with no category for a new record to
 # be filed under — so no Add button.
 NO_ADD_TABS = (CLOSED, ATTENTION, FAVORITES)
+
+# The tab bar's groups, in order, with a hairline between each: the lists
+# drawn from every category, then the panels, then the categories themselves,
+# then Closed. A tab in none of the others is a category.
+_LIST_TABS = (ATTENTION, FAVORITES, ALL)
 
 SORT_OPTIONS = [('name', 'A–Z'), ('due_date', 'Date Due'), ('last_updated', 'Last Updated')]
 
@@ -202,16 +215,19 @@ class AccountListMixin:
     # The category bar
     # -----------------------------------------------------------------
     def _category_keys(self) -> list[tuple[str, str]]:
-        """(key, label) for every tab to show, in display order. Dashboard leads
-        and is always offered. Needs Attention and Favorites appear only while
-        they hold something — a permanent "· 0" tab is one nobody reads."""
-        tabs = [(DASHBOARD, 'Dashboard')]
+        """(key, label) for every tab to show, in display order. All leads,
+        with Needs Attention and Favorites beside it; those two appear only
+        while they hold something — a permanent "· 0" tab is one nobody reads.
+        Dashboard and Retirement follow and are always offered. Closed trails the categories, in a group of its own: it
+        is the list visited least."""
+        tabs = []
+        if self.open_count > 0:
+            tabs.append((ALL, 'All'))
         if self.attention['total']:
             tabs.append((ATTENTION, f"Needs Attention · {self.attention['total']}"))
         if self.favorite_count:
             tabs.append((FAVORITES, f'Favorites · {self.favorite_count}'))
-        if self.open_count > 0:
-            tabs.append((ALL, 'All'))
+        tabs += [(DASHBOARD, 'Dashboard'), (RETIREMENT, 'Retirement')]
 
         known = [k for k in CATEGORY_CONFIG if self.category_counts.get(k, 0) > 0]
         custom = sorted(
@@ -219,10 +235,32 @@ class AccountListMixin:
             if k not in CATEGORY_CONFIG and count > 0
         )
         tabs += [(key, get_config(key)['title']) for key in known + custom]
-
         if self.closed_count > 0:
             tabs.append((CLOSED, 'Closed'))
         return tabs
+
+    @staticmethod
+    def _tab_group(key: str) -> int:
+        """Which of the tab bar's groups a tab is in: 0 the lists, 1 the
+        panels, 2 the categories, 3 Closed."""
+        if key in _LIST_TABS:
+            return 0
+        if key in PANEL_TABS:
+            return 1
+        return 3 if key == CLOSED else 2
+
+    @staticmethod
+    def _tab_divider(height: int) -> QWidget:
+        """The hairline between two groups of tabs, as tall as a tab."""
+        line = QFrame()
+        line.setObjectName('TabDivider')
+        line.setFixedWidth(1)
+        holder = QWidget()
+        layout = QHBoxLayout(holder)
+        layout.setContentsMargins(6, 5, 6, 5)
+        layout.addWidget(line)
+        holder.setFixedSize(13, height)
+        return holder
 
     def _rebuild_category_bar(self):
         for button in self.category_buttons.buttons():
@@ -231,9 +269,9 @@ class AccountListMixin:
         self._category_tabs = {}
 
         tabs = self._category_keys()
-        # The dashboard wins whenever it is the visible view.
-        if self._dashboard_open():
-            checked = DASHBOARD
+        # A panel wins whenever it is the visible view.
+        if self._open_panel():
+            checked = self._open_panel()
         else:
             # A category whose last account just went has no tab; leave the bar
             # unlit rather than lighting an unrelated one.
@@ -244,15 +282,24 @@ class AccountListMixin:
 
         self._tab_order = [key for key, _ in tabs]
 
+        group = None
         for index, (key, label) in enumerate(tabs):
             aggregate = key in AGGREGATE_TABS
             button = CategoryTab(label, None if aggregate else category_color(key))
             button.setChecked(key == checked)
 
+            if group is not None and self._tab_group(key) != group:
+                self._category_row.addWidget(
+                    self._tab_divider(button.sizeHint().height()))
+            group = self._tab_group(key)
+
             hint = ''
             if key == DASHBOARD:
                 hint = ('Net worth, assets and liabilities, investing against '
                         'income, and balance trends by category')
+            elif key == RETIREMENT:
+                hint = ('Your retirement plan: the chance your savings last, worked '
+                        'out from your Investments and Banking accounts')
             elif key == ATTENTION:
                 hint = self._attention_hint()
             elif key == FAVORITES:
@@ -286,12 +333,13 @@ class AccountListMixin:
     def _check_current_tab(self):
         """Lights the tab matching the view on screen, without triggering a load
         — `clicked` fires on user interaction, not setChecked."""
-        if self.search_query and not self._dashboard_open():
+        panel = self._open_panel()
+        if self.search_query and not panel:
             # Results span every category; no one tab stands for them.
             self._clear_tab_highlight()
             return
 
-        key = DASHBOARD if self._dashboard_open() else self.current_category
+        key = panel or self.current_category
         button = self._category_tabs.get(key)
         if button is not None:
             button.setChecked(True)
@@ -307,19 +355,19 @@ class AccountListMixin:
         self.category_buttons.setExclusive(True)
 
     def _on_tab_selected(self, key: str):
-        """One entry point for the whole tab bar, so the dashboard and the
+        """One entry point for the whole tab bar, so the panels and the
         category tabs cannot disagree about which tab is lit."""
         if not key:
             self._check_current_tab()
             return
 
-        on_dashboard = self._dashboard_open()
+        panel = self._open_panel()
 
         # Already showing exactly what was asked for.
-        if key == DASHBOARD and on_dashboard:
+        if key in PANEL_TABS and key == panel:
             self._check_current_tab()
             return
-        if key != DASHBOARD and key == self.current_category and not on_dashboard:
+        if key not in PANEL_TABS and key == self.current_category and not panel:
             self._check_current_tab()
             return
 
@@ -327,14 +375,14 @@ class AccountListMixin:
             # Put the highlight back until the user resolves the unsaved form.
             self._check_current_tab()
         if not self._confirm_leaving_form(
-                ('dashboard' if key == DASHBOARD else 'category', key, None)):
+                ('panel' if key in PANEL_TABS else 'category', key, None)):
             return
 
-        if key == DASHBOARD:
-            self._show_dashboard()
+        if key in PANEL_TABS:
+            self._show_panel(key)
             return
 
-        self._hide_dashboard()
+        self._hide_panels()
         if key == self.current_category:
             # Back from the dashboard to the list still loaded: keep its search
             # and selection.
@@ -485,9 +533,10 @@ class AccountListMixin:
         return widget
 
     def _row_meta(self, account: dict, config: dict,
-                  category: str) -> list[tuple[str, str]]:
-        """The (text, age level) captions under a row's name, in display order:
-        the dates, and in a search the category the result came from."""
+                  category: str) -> list[tuple[str, str, str]]:
+        """The (text, age level, tooltip) captions under a row's name, in
+        display order: in a search the category the result came from, then
+        the dates."""
         meta = []
 
         if self.search_query:
@@ -497,11 +546,15 @@ class AccountListMixin:
             caption = config['title']
             if matched.get('key') not in (None, config['name_field']):
                 caption += f" · matched {matched['label']}"
-            meta.append((caption, ''))
+            meta.append((caption, '', ''))
 
-        if account.get('last_updated'):
-            meta.append((f"Updated: {format_date(account['last_updated'])}",
-                         updated_age_level(account['last_updated'], category)))
+        # How long ago rather than the date: the question a row answers is
+        # whether this is fresh. The date itself is in the tooltip.
+        updated = account.get('last_updated')
+        age = format_age(updated)
+        if age:
+            meta.append((f"Updated {age}", updated_age_level(updated, category),
+                         format_date(updated)))
 
         cycle = account.get(DUE_CYCLE_KEY)
         due = next_due_date(account.get('due_date'), cycle)
@@ -510,10 +563,10 @@ class AccountListMixin:
             level = due_date_level(account.get('due_date'), cycle, category)
             # A lapsed date gets its own word, and the ordinary caption colour.
             caption = 'Lapsed' if level == 'lapsed' else 'Due'
-            meta.append((f"{caption}: {format_date(due)}", level))
+            meta.append((f"{caption} {format_short_date(due)}", level, format_date(due)))
         return meta
 
-    def _meta_block(self, meta: list[tuple[str, str]]):
+    def _meta_block(self, meta: list[tuple[str, str, str]]):
         """Lays the captions out at the current density: one line when compact,
         one each when comfortable. Each caption is its own label because the age
         colouring is per caption."""
@@ -523,15 +576,15 @@ class AccountListMixin:
             block = QVBoxLayout()
             block.setContentsMargins(indent, 0, 0, 0)
             block.setSpacing(2)
-            for text, level in meta:
-                block.addWidget(self._meta_label(text, level))
+            for text, level, tooltip in meta:
+                block.addWidget(self._meta_label(text, level, tooltip))
             return block
 
         block = QHBoxLayout()
         block.setContentsMargins(indent, 0, 0, 0)
         block.setSpacing(_META_GAP)
-        for text, level in meta:
-            block.addWidget(self._meta_label(text, level))
+        for text, level, tooltip in meta:
+            block.addWidget(self._meta_label(text, level, tooltip))
         block.addStretch(1)
         return block
 
@@ -542,8 +595,9 @@ class AccountListMixin:
 
         Bare on screen; labelled with the category's own noun for the accessible
         summary, where nothing around it says what it measures. Categories
-        without the field skip it even if a stale value survives in extra_data."""
-        if not has_field(category, 'current_balance'):
+        without the field skip it even if a stale value survives in extra_data,
+        and so does a record it does not apply to (Social Security in Income)."""
+        if not has_balance(category, account):
             return None
 
         value = account.get('current_balance')
@@ -554,11 +608,13 @@ class AccountListMixin:
         return f"{value_noun(category)}: {amount}" if labelled else amount
 
     @staticmethod
-    def _meta_label(text: str, level: str) -> QLabel:
+    def _meta_label(text: str, level: str, tooltip: str = '') -> QLabel:
         """A small caption under a row's name, tinted by how urgent it is —
         by object name, so the colour follows the theme."""
         label = plain_label(text)
         label.setObjectName(level_object_name('RowMeta', level))
+        if tooltip:
+            label.setToolTip(plain_text(tooltip))
         return label
 
     def _sorted_accounts(self) -> list[dict]:

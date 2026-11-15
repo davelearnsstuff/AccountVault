@@ -18,9 +18,10 @@
 
 import datetime
 import os
+from dataclasses import asdict
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QMimeData, QObject, Qt
+from PySide6.QtCore import QEvent, QMimeData, QObject, Qt, Signal, Slot
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QApplication, QDialog, QFileDialog, QMessageBox,
@@ -36,7 +37,8 @@ from services import backups as backups_service
 from services import csv_export
 from services import export_io
 from ui import dialogs
-from ui.account_list import ALL
+from ui import screen_capture
+from ui.account_list import ALL, START_TABS
 from ui.actions import _FAILED
 from ui.widgets import export_save_path, plain_text
 
@@ -51,10 +53,20 @@ _WM_WTSSESSION_CHANGE = 0x02B1
 _WTS_SESSION_LOCK = 0x7
 _NOTIFY_FOR_THIS_SESSION = 0
 
+# And going to sleep arrives as this one, sent to every top-level window with a
+# moment to act before the machine suspends.
+_WM_POWERBROADCAST = 0x0218
+_PBT_APMSUSPEND = 0x4
+
+# What the login screen says after each kind of system lock.
+LOCKED_BY_SYSTEM = 'Locked because the computer was locked.'
+LOCKED_BY_SLEEP = 'Locked because the computer went to sleep.'
+
 
 def _secret_mime(value: str) -> QMimeData:
     """Clipboard payload for a secret, opted out of Windows clipboard history
-    and cloud sync, which the auto-clear timer cannot reach.
+    and cloud sync, and of KDE's clipboard history, none of which the
+    auto-clear timer can reach.
 
     The two boolean formats want a little-endian DWORD 0; Windows treats a
     missing or malformed value as "allowed". Other platforms ignore them."""
@@ -63,7 +75,37 @@ def _secret_mime(value: str) -> QMimeData:
     mime.setData('ExcludeClipboardContentFromMonitorProcessing', b'\x00\x00\x00\x00')
     mime.setData('CanIncludeInClipboardHistory', b'\x00\x00\x00\x00')
     mime.setData('CanUploadToCloudClipboard', b'\x00\x00\x00\x00')
+    # KDE's Klipper keeps no history of an entry marked this way.
+    mime.setData('x-kde-passwordManagerHint', b'secret')
     return mime
+
+
+def warn_if_unprotected(parent=None):
+    """Says so when the open vault is less protected than it should be: its
+    file could not be restricted to the owner, or other accounts can change
+    files in its folder. Shown every time a vault opens, from startup and from
+    the chooser alike."""
+    problems = []
+    if not database.permissions_hardened:
+        problems.append(
+            "The vault file's permissions could not be restricted to your account, "
+            "so other users of this machine may be able to read it. This is most "
+            "likely because the vault is on a drive that cannot express file "
+            "permissions, such as a USB stick or a network share.")
+    if database.folder_open:
+        problems.append(
+            "Other accounts on this computer can change files in the folder that "
+            "holds this vault. They could replace the vault or tamper with it, "
+            "even though they can't read it. Move it to a folder only you can "
+            "change, such as Documents, with Manage > Move Vault.")
+    if not problems:
+        return
+    QMessageBox.warning(
+        parent, 'AccountVault',
+        plain_text('\n\n'.join(problems)
+                   + "\n\nYour data is still encrypted."
+                   + f"\n\nVault location: {database.DB_PATH}"),
+    )
 
 
 def watch_session_lock(hwnd: int) -> bool:
@@ -89,16 +131,81 @@ def unwatch_session_lock(hwnd: int):
         pass
 
 
-def is_session_lock(event_type, message) -> bool:
-    """Whether a native event is Windows reporting that the session locked."""
+def _windows_message(event_type, message):
+    """The MSG behind a native event, or None off Windows."""
     if os.name != 'nt' or bytes(event_type) != b'windows_generic_MSG':
-        return False
+        return None
     try:
         import ctypes.wintypes
-        msg = ctypes.wintypes.MSG.from_address(int(message))
+        return ctypes.wintypes.MSG.from_address(int(message))
     except (TypeError, ValueError, OSError):
-        return False
-    return msg.message == _WM_WTSSESSION_CHANGE and msg.wParam == _WTS_SESSION_LOCK
+        return None
+
+
+def is_session_lock(event_type, message) -> bool:
+    """Whether a native event is Windows reporting that the session locked."""
+    msg = _windows_message(event_type, message)
+    return (msg is not None and msg.message == _WM_WTSSESSION_CHANGE
+            and msg.wParam == _WTS_SESSION_LOCK)
+
+
+def is_suspend(event_type, message) -> bool:
+    """Whether a native event is Windows reporting that it is about to sleep.
+    Locking now, rather than at the first tick after waking, means the vault is
+    never on screen, unlocked, when the lid opens."""
+    msg = _windows_message(event_type, message)
+    return (msg is not None and msg.message == _WM_POWERBROADCAST
+            and msg.wParam == _PBT_APMSUSPEND)
+
+
+class LinuxLockWatcher(QObject):
+    """Emits locked(reason) when a Linux desktop locks its screen or the
+    machine is about to sleep, over D-Bus.
+
+    Three signals, because desktops disagree. org.freedesktop.ScreenSaver is
+    what KDE and most others send; GNOME sends org.gnome.ScreenSaver; and
+    logind's PrepareForSleep, on the system bus, covers a suspend whatever the
+    desktop. A desktop that sends none of them leaves the idle lock to do the
+    job, as it did before.
+
+    Written to the D-Bus specifications and not yet run on a Linux desktop."""
+
+    locked = Signal(str)
+
+    _SCREENSAVERS = (
+        ('org.freedesktop.ScreenSaver', '/org/freedesktop/ScreenSaver'),
+        ('org.gnome.ScreenSaver', '/org/gnome/ScreenSaver'),
+    )
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.watching = []
+        try:
+            from PySide6.QtCore import SLOT
+            from PySide6.QtDBus import QDBusConnection
+        except ImportError:
+            return
+        session = QDBusConnection.sessionBus()
+        for interface, path in self._SCREENSAVERS:
+            if session.connect('', path, interface, 'ActiveChanged', self,
+                               SLOT('_screensaver_changed(bool)')):
+                self.watching.append(interface)
+        system = QDBusConnection.systemBus()
+        if system.connect('org.freedesktop.login1', '/org/freedesktop/login1',
+                          'org.freedesktop.login1.Manager', 'PrepareForSleep', self,
+                          SLOT('_preparing_for_sleep(bool)')):
+            self.watching.append('org.freedesktop.login1')
+
+    @Slot(bool)
+    def _screensaver_changed(self, active: bool):
+        if active:
+            self.locked.emit(LOCKED_BY_SYSTEM)
+
+    @Slot(bool)
+    def _preparing_for_sleep(self, sleeping: bool):
+        # True going to sleep, False waking.
+        if sleeping:
+            self.locked.emit(LOCKED_BY_SLEEP)
 
 
 class VaultSessionMixin:
@@ -133,7 +240,7 @@ class VaultSessionMixin:
 
     def _show_login(self):
         self.screens.setCurrentWidget(self.login_screen)
-        self.login_screen.set_vault(database.DB_PATH)
+        self.login_screen.set_vault(database.DB_PATH, demo=preferences.is_demo_vault())
         self.login_screen.reset()
         self._session_timer.stop()
         self._start_shutdown_timer()
@@ -178,6 +285,7 @@ class VaultSessionMixin:
         vaultfile.remember(path)
         self._adopt_vault_settings()
         self.start()
+        warn_if_unprotected(self)
 
     def _new_vault_path(self, title: str, suggested: str) -> Path | None:
         """Asks where a new vault goes. None if the user cancelled or picked a
@@ -234,10 +342,12 @@ class VaultSessionMixin:
         vaultfile.remember(path)
         self._adopt_vault_settings()
         self.start()
+        warn_if_unprotected(self)
 
     def _create_demo_vault_dialog(self):
-        """Builds a vault full of made-up accounts, shows its password, and
-        lands on the login screen for it.
+        """Asks for the household's figures, builds a vault full of made-up
+        accounts sized to them, shows its password, and lands on the login
+        screen for it.
 
         Locked straight after the build. Setting the password hands back the
         key, and going in on that key would open the vault without anyone
@@ -246,6 +356,12 @@ class VaultSessionMixin:
         # lines of fictional household.
         from tools import make_demo_vault
 
+        asked = dialogs.DemoHouseholdDialog(self, asdict(make_demo_vault.Household()),
+                                            make_demo_vault.LIMITS)
+        if asked.exec() != QDialog.DialogCode.Accepted:
+            return
+        household = make_demo_vault.Household(**asked.values())
+
         path = self._new_vault_path('Create Demo Vault', make_demo_vault.DEFAULT_PATH.name)
         if path is None:
             return
@@ -253,7 +369,7 @@ class VaultSessionMixin:
         self.close_vault()
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            summary = make_demo_vault.build_vault(path)
+            summary = make_demo_vault.build_vault(path, household)
         except Exception as exc:
             # A build that got as far as opening the file leaves it open, and
             # unlocked if it got as far as the password.
@@ -277,6 +393,7 @@ class VaultSessionMixin:
         dialog.copy_requested.connect(self.copy_to_clipboard)
         dialog.exec()
         self.start()
+        warn_if_unprotected(self)
 
     def _switch_vault(self):
         """Back to the chooser from the login screen."""
@@ -310,6 +427,9 @@ class VaultSessionMixin:
         self._close_modal_dialogs()
         self._save_window_state()
         auth.lock_app()
+        # Before anything hides: a Your details field losing focus commits,
+        # and must find no plan to save into.
+        self.retirement_view.clear()
         self._discard_form()
         self._clipboard_timer.stop()
         self._clear_clipboard()
@@ -320,21 +440,52 @@ class VaultSessionMixin:
         self.selected_id = None
         self.selected_category = None
         self._drop_undo()
-        self._hide_dashboard()
+        self._hide_panels()
         self.detail_view.clear()
         self.account_list.clear()
         self.lock_chip.hide()
         self.clipboard_chip.hide()
+        self.demo_chip.hide()
 
         auth.reset_rate_limit_memory()
         database.close_vault()
+        # Vouched for by this vault's seal, so no use to the next one.
+        self._verified_settings = None
+        self._apply_capture_setting()
 
     def _adopt_vault_settings(self):
         """Applies the newly opened vault's own look before anything is drawn —
         theme and font size are per vault."""
         self.settings = preferences.get_settings()
         self.apply_appearance(self.settings['theme'], self.settings['font_size'])
+        self._apply_capture_setting()
         self._restore_geometry()
+
+    def _apply_capture_setting(self):
+        """Puts this vault's screen capture choice in force, but only while it
+        is unlocked and the seal has vouched for the choice. Anywhere else (the
+        chooser, the login screen, a vault just opened) it is the default:
+        kept out of captures. The stored choice is readable by anyone who can
+        edit the file, and the login screen is exactly where it would be
+        planted."""
+        verified = self._verified_settings
+        allow = (database.DB_PATH is not None and auth.is_unlocked()
+                 and verified is not None and bool(verified.get('allow_screen_capture')))
+        screen_capture.set_allowed(allow)
+
+    def _shutdown_minutes(self) -> int:
+        """How long after a lock the app closes, 0 for never.
+
+        After this vault has been unlocked, its verified setting. Before, at a
+        launch straight to the login screen, the stored setting has not been
+        vouched for, so it is only believed if it is no laxer than the default:
+        'Never' planted in the file must not keep the app open on the first
+        launch."""
+        if self._verified_settings is not None:
+            return self._verified_settings.get('shutdown_after_lock_minutes', 60)
+        default = preferences.default_setting('shutdown_after_lock_minutes')
+        stored = self.settings.get('shutdown_after_lock_minutes', default)
+        return stored if stored and stored <= default else default
 
     @staticmethod
     def _vault_browse_dir() -> Path:
@@ -363,9 +514,10 @@ class VaultSessionMixin:
             self.login_screen.show_error(str(exc))
             self.login_screen.password.clear()
             return
-        except auth.VaultConfigError as exc:
+        except (auth.VaultConfigError, database.ForeignSchemaError) as exc:
             # Not a wrong password, and must not be reported as one: no password
-            # will open this vault.
+            # will open this vault. A schema changed while the vault sat locked
+            # arrives here, since the chooser's check ran when it was opened.
             self.login_screen.show_error(str(exc))
             self.login_screen.password.clear()
             return
@@ -377,11 +529,44 @@ class VaultSessionMixin:
 
         self.login_screen.reset()
         self._enter_vault('Unlocked.')
+        self._warn_of_foreign_fields()
+
+    def _warn_of_foreign_fields(self):
+        """Says so when the vault holds values written without its key. They
+        already read as unreadable; this is so the user knows the file was
+        changed behind the app's back, rather than finding placeholders
+        later and taking them for damage."""
+        count = auth.foreign_field_count()
+        if not count:
+            return
+        if count == 1:
+            fields, were, them, they, have = "1 stored field", "wasn't", 'it', 'It shows', "hasn't"
+        else:
+            fields, were, them, they, have = (f"{count} stored fields", "weren't", 'them',
+                                              'They show', "haven't")
+        QMessageBox.warning(
+            self, 'Changes From Outside AccountVault',
+            plain_text(
+                f"{fields} in this vault {were} written by AccountVault. Another "
+                f"program, or someone with access to the vault file, may have "
+                f"changed {them}.\n\n"
+                f"{they} as ⚠ unreadable and {have} been trusted. Check the "
+                f"affected accounts, and restore from a backup if you didn't "
+                f"expect this."
+            ),
+        )
 
     def _enter_vault(self, message: str):
         self._shutdown_timer.stop()
-        self.settings = preferences.get_settings()
+        # First, before any setting is acted on: the security settings are only
+        # believed once the seal vouches for them, and the seal needs the key
+        # that has only just been installed.
+        reset = backups_service.check_seal() == 'reset'
+        if reset:
+            auth.apply_saved_settings()
+        self._reload_settings()
         self.apply_appearance(self.settings['theme'], self.settings['font_size'])
+        self._apply_capture_setting()
 
         self.current_category = ALL
         self._apply_saved_sort()
@@ -390,24 +575,51 @@ class VaultSessionMixin:
         # Refit for whatever this vault holds, once the screen is up.
         self._sidebar_fitted = False
 
+        self.demo_chip.setVisible(preferences.is_demo_vault())
         self.screens.setCurrentWidget(self.main_screen)
         self._session_timer.start(_SESSION_TICK_MS)
-        self.load_category(ALL)
+        self._open_start_tab()
         self.show_toast(message)
+        if reset:
+            # With the window up, so the warning has something behind it.
+            QMessageBox.warning(self, backups_service.RESET_TITLE,
+                                backups_service.RESET_MESSAGE)
 
         # Last, with the window up. Tied to the unlock so nothing is written
         # before somebody has proved they can open this vault.
         self._run_scheduled_backup()
 
+    def _reload_settings(self):
+        """Reads the settings again. While unlocked, after the seal has been
+        checked, they are also kept as the verified copy: what the screen
+        capture choice and the shutdown after the next lock go by."""
+        self.settings = preferences.get_settings()
+        if auth.is_unlocked():
+            self._verified_settings = dict(self.settings)
+
+    def _settings_were_reset(self, message: str):
+        """A seal check has just put the sealed settings back to their
+        defaults: put those in force at once, then say so. Not a toast:
+        backups the user set up are now off."""
+        auth.apply_saved_settings()
+        self._reload_settings()
+        self._apply_capture_setting()
+        QMessageBox.warning(self, backups_service.RESET_TITLE, message)
+
     def lock_vault(self):
         self._close_modal_dialogs()
         auth.lock_app()
+        # The login screen is always kept out of captures.
+        self._apply_capture_setting()
+        # Before anything hides: a Your details field losing focus commits,
+        # and must find no plan to save into.
+        self.retirement_view.clear()
         self._discard_form()
         self.accounts = []
         self.selected_id = None
         self.selected_category = None
         self._drop_undo()
-        self._hide_dashboard()
+        self._hide_panels()
         self.detail_view.clear()
         self.account_list.clear()
         # A copied secret must not outlive the vault it came from. The timer
@@ -419,14 +631,14 @@ class VaultSessionMixin:
         self._show_login()
         self.show_toast('Locked.')
 
-    def _on_session_locked(self):
-        """Windows was locked, so the vault locks too: whoever unlocks the
-        computer next should not find it open."""
+    def _on_session_locked(self, reason: str = LOCKED_BY_SYSTEM):
+        """The computer was locked or is going to sleep, so the vault locks too:
+        whoever unlocks the computer next should not find it open."""
         if not auth.is_unlocked():
             return
         self._session_timer.stop()
         self.lock_vault()
-        self.login_screen.show_error('Locked because Windows was locked.')
+        self.login_screen.show_error(reason)
 
     def _close_modal_dialogs(self):
         """Dismisses any open modal dialog before locking, so the login screen
@@ -513,7 +725,7 @@ class VaultSessionMixin:
         self._warned_of_lock = False
 
     def _start_shutdown_timer(self):
-        minutes = self.settings.get('shutdown_after_lock_minutes', 60)
+        minutes = self._shutdown_minutes()
         if minutes:
             self._shutdown_timer.start(minutes * 60 * 1000)
 
@@ -539,6 +751,12 @@ class VaultSessionMixin:
         if self._copied_value is not None and clipboard.text() == self._copied_value:
             clipboard.clear()
         self._copied_value = None
+
+    def _clear_clipboard_for_logoff(self, _session_manager):
+        """commitDataRequest's slot: the session is ending, so the auto-clear
+        timer will never fire."""
+        self._clipboard_timer.stop()
+        self._clear_clipboard()
 
     def _clear_clipboard_now(self):
         self._clipboard_timer.stop()
@@ -645,6 +863,7 @@ class VaultSessionMixin:
                 f"delete the original yourself — it holds a copy of everything."
             ),
         )
+        warn_if_unprotected(self)
 
     def _open_from_menu(self):
         """Open Vault… from inside an unlocked vault. Goes through the chooser,
@@ -678,6 +897,15 @@ class VaultSessionMixin:
             f"{written} account{'s' if written != 1 else ''} imported. "
             f"The file they came from is still plaintext — delete it.", 7000)
         self.load_category(ALL)
+
+    def _open_start_tab(self):
+        """The tab Settings names under Open On. All loads first either way: it
+        fills the counts that decide whether Needs Attention or Favorites has a
+        tab at all, and is what shows when the chosen one does not."""
+        self.load_category(ALL)
+        target = START_TABS.get(self.settings.get('start_tab'), ALL)
+        if target != ALL and target in self._tab_order:
+            self._on_tab_selected(target)
 
     def _export_csv(self):
         if dialogs.CsvWarningDialog(self).exec() != QDialog.DialogCode.Accepted:
@@ -777,8 +1005,9 @@ class VaultSessionMixin:
             self._apply_saved_appearance()
             return
 
-        self.settings = preferences.get_settings()
+        self._reload_settings()
         self._apply_saved_appearance()
+        self._apply_capture_setting()
         self.show_toast('Settings saved.')
 
     def _open_warnings(self):
@@ -844,10 +1073,7 @@ class VaultSessionMixin:
         they must not be acted on — or shown to the user as a folder to approve,
         which would let a forged destination be sealed by one click."""
         if backups_service.check_seal() == 'reset':
-            self.settings = preferences.get_settings()
-            # Not a toast: backups the user set up are now off.
-            QMessageBox.warning(self, 'Backup Settings Reset',
-                                backups_service.RESET_MESSAGE)
+            self._settings_were_reset(backups_service.RESET_MESSAGE)
             return
 
         if not self._confirm_backup_destination():
@@ -857,8 +1083,7 @@ class VaultSessionMixin:
         if result is None:
             return
         if result.get('reset'):
-            self.settings = preferences.get_settings()
-            QMessageBox.warning(self, 'Backup Settings Reset', result['message'])
+            self._settings_were_reset(result['message'])
             return
         if not result['ok']:
             self.show_toast(f"Automatic backup failed: {result['message']}", 8000)
@@ -903,7 +1128,7 @@ class VaultSessionMixin:
             return True
 
         preferences.save_settings(**{**self.settings, 'auto_backup_enabled': 0})
-        self.settings = preferences.get_settings()
+        self._reload_settings()
         self.show_toast('Automatic backups turned off.', 4000)
         return False
 

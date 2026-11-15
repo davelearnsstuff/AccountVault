@@ -5,15 +5,13 @@
 # is what actually gets installed — regenerate it with `python tools/genlock.py`
 # after any bump here, or CI fails.
 
-# Direct
-PySide6==6.11.1
-cryptography==49.0.0
+# Direct. Essentials, not PySide6, which adds Qt WebEngine and more, unused.
+PySide6_Essentials==6.12.0
+cryptography==50.0.1
 argon2-cffi==25.1.0
 
 # Transitive — bump alongside their parent, not on their own.
-PySide6_Addons==6.11.1
-PySide6_Essentials==6.11.1
-shiboken6==6.11.1
-cffi==2.1.0
+shiboken6==6.12.0
+cffi==2.1.1
 pycparser==3.0
 argon2-cffi-bindings==25.1.0

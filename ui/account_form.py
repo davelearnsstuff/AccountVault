@@ -13,10 +13,13 @@ from PySide6.QtWidgets import (
     QPushButton, QTextEdit, QVBoxLayout, QWidget,
 )
 
-from core.categories import CATEGORY_CONFIG, get_config, parse_money, trim_number
+from core.categories import (
+    CATEGORY_CONFIG, CHECKED, SPLIT_FIELDS, active_splits, add_amounts, field_shown,
+    format_money, get_config, is_checked, parse_money, trim_number,
+)
 from services.accounts import MAX_LENGTHS
 from ui.widgets import (
-    NO_DATE, GeneratorPanel, clear_layout, date_edit, field_label, plain_label,
+    NO_DATE, GeneratorPanel, date_edit, field_label, plain_label,
     reveal_toggle, to_qdate,
 )
 
@@ -59,6 +62,26 @@ def _is_full_width(field: dict) -> bool:
     return field['type'] in ('textarea', 'password')
 
 
+# Split totals whose two parts must both be entered on a Both account. A
+# balance is always a reading of what is there; a contribution can be nothing,
+# so its parts may both be left blank.
+_PARTS_REQUIRED = frozenset({'current_balance'})
+
+_TOTAL_HINT = 'Traditional + Roth'
+
+
+def _set_computed(widget: QLineEdit, computed: bool):
+    """Makes a total read-only and styled as worked out, or an ordinary input
+    again. Out of the Tab order while it cannot be typed into."""
+    if widget.isReadOnly() == computed:
+        return
+    widget.setReadOnly(computed)
+    widget.setFocusPolicy(Qt.NoFocus if computed else Qt.StrongFocus)
+    widget.setObjectName('ComputedValue' if computed else '')
+    widget.style().unpolish(widget)
+    widget.style().polish(widget)
+
+
 class AccountForm(QWidget):
     """Emits `saved` with a flat account dict; the caller writes it to the vault."""
 
@@ -73,6 +96,10 @@ class AccountForm(QWidget):
         # The field definition each live widget was built from. A rebuild reads
         # the old widgets after self._category already names the new schema.
         self._input_fields: dict[str, dict] = {}
+        # Each field's label-and-input block, placed or hidden by _place_fields.
+        self._containers: dict[str, QWidget] = {}
+        # The caption under each split total.
+        self._total_hints: dict[str, QWidget] = {}
         self._dirty = False
 
         # Adding from an aggregate view has no category yet, so the user picks
@@ -96,7 +123,8 @@ class AccountForm(QWidget):
         self._fields_layout.setColumnStretch(0, 1)
         self._fields_layout.setColumnStretch(1, 1)
 
-        self._closed = QCheckBox('Closed — account must be closed before it can be deleted')
+        self._closed = QCheckBox('Account closed: moves it to the Closed tab, where it '
+                                 'can be deleted')
         self._closed.setChecked(bool(account.get('closed')) if account else False)
         self._closed.checkStateChanged.connect(self._mark_dirty)
 
@@ -146,7 +174,6 @@ class AccountForm(QWidget):
 
     def _add_actions(self, row: QHBoxLayout):
         save = QPushButton('Save')
-        save.setObjectName('Primary')
         save.setToolTip('Save (Ctrl+S)')
         save.clicked.connect(self.submit)
 
@@ -237,10 +264,18 @@ class AccountForm(QWidget):
         }
 
     def _rebuild_fields(self):
-        # Captured before clear_layout deletes the widgets it reads from.
+        # Captured before the widgets it reads from are deleted.
         typed = self._current_input_values()
 
-        clear_layout(self._fields_layout)
+        # Every block goes, placed or hidden: clear_layout would only find the
+        # placed ones.
+        while self._fields_layout.count():
+            self._fields_layout.takeAt(0)
+        for container in self._containers.values():
+            container.setParent(None)
+            container.deleteLater()
+        self._containers.clear()
+        self._total_hints.clear()
         self._inputs.clear()
         self._input_fields.clear()
 
@@ -249,8 +284,6 @@ class AccountForm(QWidget):
             f"Edit {config['item_label']}" if self._is_edit else f"Add {config['item_label']}"
         )
 
-        first = None
-        row = col = 0
         for field in config['fields']:
             if field.get('hide_in_form'):
                 continue
@@ -259,30 +292,117 @@ class AccountForm(QWidget):
                 value = typed[field['key']]
             else:
                 value = self._account.get(field['key']) if self._account else ''
-            widget = self._build_field(field, value)
+            self._containers[field['key']] = self._build_field(field, value)
+
+        # A field others depend on re-places them as it changes, and the parts
+        # of a split total keep it in step as they are typed.
+        controllers = {field[rule][0] for field in config['fields']
+                       for rule in ('shown_when', 'hidden_when') if field.get(rule)}
+        for key in controllers:
+            widget = self._inputs.get(key)
+            if isinstance(widget, QComboBox):
+                widget.currentIndexChanged.connect(self._on_controller_changed)
+        for parts in SPLIT_FIELDS.values():
+            for key in parts:
+                widget = self._inputs.get(key)
+                if isinstance(widget, QLineEdit):
+                    widget.textChanged.connect(self._refresh_totals)
+
+        self._place_fields()
+        self._refresh_totals()
+
+        first = next((self._inputs[field['key']] for field in config['fields']
+                      if field['key'] in self._containers
+                      and not self._containers[field['key']].isHidden()), None)
+        if first is not None:
+            first.setFocus()
+
+    def _place_fields(self):
+        """Lays out the fields that apply to what the form holds now, two to a
+        row. The rest are hidden rather than deleted, so whatever was typed into
+        them comes back if they apply again before the save."""
+        while self._fields_layout.count():
+            self._fields_layout.takeAt(0)
+
+        values = self._current_input_values()
+        row = col = 0
+        for field in get_config(self._category)['fields']:
+            container = self._containers.get(field['key'])
+            if container is None:
+                continue
+            if not field_shown(self._category, field, values):
+                container.hide()
+                continue
 
             # Row-major, so Tab order (creation order) reads across then down.
             if _is_full_width(field):
                 if col:
                     row, col = row + 1, 0
-                self._fields_layout.addWidget(widget, row, 0, 1, 2)
+                self._fields_layout.addWidget(container, row, 0, 1, 2)
                 row += 1
             else:
                 # Top-aligned: a masked field's Show button makes its cell
                 # taller than a plain neighbour's.
-                self._fields_layout.addWidget(widget, row, col, Qt.AlignTop)
+                self._fields_layout.addWidget(container, row, col, Qt.AlignTop)
                 col += 1
                 if col == 2:
                     row, col = row + 1, 0
+            container.show()
 
-            if first is None:
-                first = self._inputs.get(field['key'])
+    def _on_controller_changed(self, *_args):
+        self._place_fields()
+        self._refresh_totals()
 
-        if first is not None:
-            first.setFocus()
+    def _refresh_totals(self, *_args):
+        """Keeps each split total in step with its parts: read-only and worked
+        out from them while the account is Both, an ordinary input otherwise.
+
+        Parts still as stored show the total as stored, which Balance History
+        may have moved since they were entered. The save keeps it, so an edit
+        to something else does not file the old parts' sum as a new balance."""
+        splits = active_splits(self._category, self._current_input_values())
+        for total, parts in SPLIT_FIELDS.items():
+            widget = self._inputs.get(total)
+            if not isinstance(widget, QLineEdit):
+                continue
+            computed = total in splits
+            _set_computed(widget, computed)
+            hint = self._total_hints.get(total)
+            if hint is not None:
+                hint.setVisible(computed)
+            if not computed:
+                continue
+
+            amounts = [parse_money(self._inputs[key].text()) for key in parts]
+            note = _TOTAL_HINT
+            if self._parts_as_stored(total, parts, amounts):
+                value = self._account.get(total)
+                adds_up = add_amounts(*amounts)
+                if parse_money(value) != adds_up:
+                    note = (f"Traditional + Roth add up to {format_money(adds_up)}, "
+                            f"not this total. Enter both again to update it.")
+            elif any(amount is not None for amount in amounts):
+                value = add_amounts(*(amount for amount in amounts if amount is not None))
+            else:
+                value = None
+            widget.setText('' if value is None else str(value))
+            if hint is not None:
+                hint.setText(note)
+
+    def _parts_as_stored(self, total: str, parts: tuple, amounts: list) -> bool:
+        """Whether the account was already split this way when the form opened
+        and its parts still hold the amounts it was stored with."""
+        if not self._account or total not in active_splits(self._category, self._account):
+            return False
+        stored = [None if isinstance(self._account.get(key), bool)
+                  else parse_money(self._account.get(key)) for key in parts]
+        return None not in stored and stored == amounts
 
     def _build_field(self, field: dict, value) -> QWidget:
-        container = QWidget()
+        # Parented to the grid's widget from the start: a block that is never
+        # placed must still belong to the form, not float as a window of its own.
+        container = QWidget(self._fields_layout.parentWidget())
+        container.hide()
         layout = QVBoxLayout(container)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
@@ -305,6 +425,15 @@ class AccountForm(QWidget):
             layout.addLayout(row)
         else:
             layout.addWidget(widget)
+
+        # Under a split total: what it is the sum of, shown while it is one.
+        if field['key'] in SPLIT_FIELDS:
+            hint = plain_label(_TOTAL_HINT)
+            hint.setObjectName('FieldHint')
+            hint.setWordWrap(True)
+            hint.hide()
+            layout.addWidget(hint)
+            self._total_hints[field['key']] = hint
 
         return container
 
@@ -332,6 +461,14 @@ class AccountForm(QWidget):
             index = widget.findData(value)
             widget.setCurrentIndex(index if index >= 0 else 0)
             widget.currentIndexChanged.connect(self._mark_dirty)
+            return widget
+
+        if kind == 'checkbox':
+            # The label above says what it is; the box's own text says what
+            # ticking it does.
+            widget = QCheckBox(field.get('text') or field['label'])
+            widget.setChecked(is_checked(value))
+            widget.checkStateChanged.connect(self._mark_dirty)
             return widget
 
         if kind == 'date':
@@ -433,7 +570,29 @@ class AccountForm(QWidget):
         if not str(values.get('name') or '').strip():
             self.show_error('Name is required.')
             return
+        problem = self._split_problem(values)
+        if problem:
+            self.show_error(problem)
+            return
         self.saved.emit(values)
+
+    def _split_problem(self, values: dict) -> str | None:
+        """Why a Both account's Traditional and Roth amounts cannot be saved as
+        they stand, or None. The service checks the amounts too; this says
+        which field, before anything is sent."""
+        for total, parts in active_splits(self._category, values).items():
+            labels = [self._input_fields[key]['label'] for key in parts]
+            for key, label in zip(parts, labels):
+                value = values.get(key)
+                # _read_widget hands back the text itself when it is no amount.
+                if isinstance(value, str):
+                    return f"{label} must be an amount, like 2,501.99."
+                if value is not None and value < 0:
+                    return f"{label} can't be negative."
+            blank = [values.get(key) is None for key in parts]
+            if any(blank) and (total in _PARTS_REQUIRED or not all(blank)):
+                return f"Enter both the {labels[0]} and the {labels[1]}. 0 is fine."
+        return None
 
     def _cancel(self):
         self.clear_dirty()
@@ -460,6 +619,9 @@ def _read_widget(widget: QWidget, field: dict):
 
     if isinstance(widget, QComboBox):
         return widget.currentData() or None
+
+    if isinstance(widget, QCheckBox):
+        return CHECKED if widget.isChecked() else None
 
     raw = widget.text()
     if kind == 'password':

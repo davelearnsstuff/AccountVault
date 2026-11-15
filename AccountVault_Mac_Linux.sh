@@ -3,17 +3,51 @@ cd "$(dirname "$0")" || exit 1
 
 VENV_PY=".venv/bin/python"
 REQUIRED_IMPORTS="import PySide6, cryptography, argon2"
+LOCK="requirements/requirements.lock"
+
+# A copy of the lock the .venv was installed from. When the lock changes (a
+# version bump), the two differ and the .venv is brought up to date, so it
+# never drifts from the hash-checked list.
+STAMP=".venv/installed-from.lock"
+
+# Packages earlier versions installed and this one does not: the PySide6
+# meta-package and the add-ons it pulled in (Qt WebEngine, a whole Chromium,
+# and Qt Pdf), none of which the app uses.
+DROPPED="PySide6 PySide6_Addons PySide6_WebEngine PySide6_Pdf"
 
 has_requirements() {
     "$1" -c "$REQUIRED_IMPORTS" >/dev/null 2>&1
 }
 
-# Prefer the project virtual environment if one has been created. If it is
-# there but incomplete (an interrupted install), finish the install into it.
-if [ -x "$VENV_PY" ]; then
-    if has_requirements "$VENV_PY"; then
+ask_yes() {
+    local answer
+    read -r -p "$1 [y/N] " answer
+    [[ "$answer" =~ ^[Yy] ]]
+}
+
+# Always the project's own .venv, never a system Python that happens to have
+# the packages: only the .venv was installed with --require-hashes, so only it
+# is known to hold the checked files.
+if [ -x "$VENV_PY" ] && has_requirements "$VENV_PY"; then
+    if cmp -s "$LOCK" "$STAMP"; then
         exec "$VENV_PY" main.py
     fi
+    # The lock changed. Without a terminal there is nobody to ask, and the
+    # .venv still works, so start it as it is rather than not at all.
+    if [ ! -t 0 ]; then
+        exec "$VENV_PY" main.py
+    fi
+    echo
+    echo "AccountVault's list of packages has changed since its .venv was set up,"
+    echo "most likely because a newer version is installed. Updating downloads the"
+    echo "new packages and checks each one against requirements.lock."
+    echo
+    if ! ask_yes "Update now?"; then
+        exec "$VENV_PY" main.py
+    fi
+    NEED_VENV=0
+elif [ -x "$VENV_PY" ]; then
+    # There but incomplete (an interrupted install): finish the install into it.
     NEED_VENV=0
 else
     if ! command -v python3 >/dev/null 2>&1; then
@@ -36,12 +70,6 @@ else
         echo "Install a newer Python 3, then run ./AccountVault_Mac_Linux.sh again."
         exit 1
     fi
-
-    # A system Python that already has the requirements is good enough - launch
-    # straight from it rather than building a virtual environment nobody asked for.
-    if has_requirements python3; then
-        exec python3 main.py
-    fi
     NEED_VENV=1
 fi
 
@@ -54,29 +82,29 @@ if [ ! -t 0 ]; then
     exit 1
 fi
 
-ask_yes() {
-    local answer
-    read -r -p "$1 [y/N] " answer
-    [[ "$answer" =~ ^[Yy] ]]
-}
-
-# requirements.lock holds hashes for the x86-64 Linux and Windows wheels on
-# Python 3.11-3.14. Anywhere else pip would refuse every package, so check up
-# front and offer the unverified install knowingly instead of failing midway.
+# requirements.lock holds hashes for 64-bit Linux (x86-64), macOS on Apple
+# silicon, and Windows, on Python 3.11-3.14. Not Intel Macs: cryptography
+# publishes no wheel for them. Anywhere else pip would
+# refuse every package, so check up front and offer the unverified install
+# knowingly instead of failing midway.
 if [ "$NEED_VENV" = 1 ]; then BASE_PY=python3; else BASE_PY="$VENV_PY"; fi
 LOCK_COVERED=0
-if [ "$(uname -s)" = "Linux" ] && [ "$(uname -m)" = "x86_64" ] \
+SYSTEM="$(uname -s)"
+MACHINE="$(uname -m)"
+if { { [ "$SYSTEM" = "Linux" ] && [ "$MACHINE" = "x86_64" ]; } \
+        || { [ "$SYSTEM" = "Darwin" ] && [ "$MACHINE" = "arm64" ]; }; } \
     && "$BASE_PY" -c 'import sys; sys.exit(not (3, 11) <= sys.version_info[:2] <= (3, 14))'; then
     LOCK_COVERED=1
 fi
 
 if [ "$NEED_VENV" = 1 ]; then
     echo
-    echo "AccountVault needs a few Python packages that aren't installed yet:"
+    echo "AccountVault needs a few Python packages:"
     grep -v '^#' requirements/requirements.txt | grep -v '^[[:space:]]*$'
     echo
-    echo "They can be installed into a .venv folder here, leaving your system"
-    echo "Python untouched. This downloads a few hundred MB and takes a few minutes."
+    echo "They are installed into a .venv folder here, leaving your system Python"
+    echo "untouched, and each is checked against requirements.lock. This downloads"
+    echo "a few hundred MB and takes a few minutes."
     echo
     if ! ask_yes "Set that up now?"; then
         echo
@@ -101,6 +129,12 @@ fi
 echo
 echo "Installing requirements ..."
 
+# Removed first, and everything reinstalled: the dropped packages share the
+# PySide6 folder with the ones kept, and uninstalling them takes shared files
+# with them.
+# shellcheck disable=SC2086  # DROPPED is a list of names
+"$VENV_PY" -m pip uninstall -y $DROPPED >/dev/null 2>&1
+
 # --require-hashes against requirements.lock, not a plain install of
 # requirements.txt: this pins the actual artifacts, so a substituted
 # cryptography or argon2-cffi wheel is refused rather than installed into the
@@ -108,22 +142,22 @@ echo "Installing requirements ..."
 # first - that would fetch and run an unverified copy of the tool about to do
 # the verifying.
 if [ "$LOCK_COVERED" = 1 ]; then
-    "$VENV_PY" -m pip install --require-hashes -r requirements/requirements.lock
+    "$VENV_PY" -m pip install --require-hashes --force-reinstall -r "$LOCK"
     status=$?
 else
     echo
-    echo "This computer ($(uname -s) $(uname -m), $("$BASE_PY" -V 2>&1)) is not covered by"
-    echo "requirements.lock, which holds verified fingerprints for x86-64 Linux and"
-    echo "Windows on Python 3.11-3.14 only. The packages can still be installed at the"
-    echo "pinned versions, but the downloaded files won't be checked against known"
-    echo "fingerprints."
+    echo "This computer ($SYSTEM $MACHINE, $("$BASE_PY" -V 2>&1)) is not covered by"
+    echo "requirements.lock, which holds verified fingerprints for 64-bit Linux (x86-64),"
+    echo "macOS on Apple silicon, and Windows, on Python 3.11-3.14 only. The packages can"
+    echo "still be installed at the pinned versions, but the downloaded files won't be"
+    echo "checked against known fingerprints."
     echo
     if ! ask_yes "Install without the fingerprint check?"; then
         echo
         echo "Nothing was installed. Run ./AccountVault_Mac_Linux.sh again when you're ready."
         exit 1
     fi
-    "$VENV_PY" -m pip install -r requirements/requirements.txt
+    "$VENV_PY" -m pip install --force-reinstall -r requirements/requirements.txt
     status=$?
 fi
 
@@ -134,6 +168,7 @@ if [ "$status" -ne 0 ] || ! has_requirements "$VENV_PY"; then
     echo "./AccountVault_Mac_Linux.sh again to retry."
     exit 1
 fi
+cp "$LOCK" "$STAMP"
 
 echo
 echo "Setup complete - starting AccountVault."

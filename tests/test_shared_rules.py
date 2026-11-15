@@ -227,7 +227,7 @@ def test_setup_refuses_a_password_that_fails_the_rules(tmp_path, monkeypatch,
     from core import database
 
     monkeypatch.setattr(database, 'DB_PATH', tmp_path / 'vault.vault')
-    monkeypatch.setattr(database, 'restrict_to_owner', lambda path: None)
+    monkeypatch.setattr(database, 'restrict_to_owner', lambda path: True)
     database.init_db()
     # The session key is a module global that outlives a database, so the
     # "nothing was installed" assertion below needs a known starting point.

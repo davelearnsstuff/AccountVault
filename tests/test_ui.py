@@ -11,6 +11,8 @@
 # Everything here drives widgets directly rather than synthesising input events.
 # -----------------------------------------------------------------------------
 
+from datetime import date
+
 import pytest
 
 from PySide6.QtWidgets import QLineEdit
@@ -446,6 +448,645 @@ def test_quick_update_keeps_a_real_decimal(vault, qt_app):
     dialog.deleteLater()
 
 
+def test_quick_update_files_an_unchanged_balance(window, monkeypatch):
+    """Saved as it opened, figure untouched: still a reading, so it reaches the
+    history. See update_account's confirm_balance."""
+    from PySide6.QtWidgets import QDialog
+    from ui import dialogs
+
+    account = make_account(category='Credit Cards', current_balance=100)
+    with database.connect() as db:
+        db.execute("UPDATE balance_history SET recorded_at = '2026-01-05' "
+                   "WHERE account_id = ?", (account['id'],))
+    accounts_service.invalidate_cache()
+    window.load_category('Credit Cards', select_first=False)
+    window._select_account(account['id'], 'Credit Cards')
+    shown = next(a for a in window.accounts if a['id'] == account['id'])
+    monkeypatch.setattr(dialogs.QuickUpdateDialog, 'exec',
+                        lambda self: QDialog.DialogCode.Accepted)
+
+    window._quick_update(shown)
+
+    assert len(accounts_service.list_balance_history(account['id'])) == 2
+
+
+# -- Traditional and Roth -------------------------------------------------------
+#
+# A Both account's balance is the sum of the Traditional and Roth amounts typed
+# into the form or Quick Update. These are stored fields the form hides and
+# shows as other fields change, which is how the form lost fields before.
+
+def both_401k(**fields) -> dict:
+    values = {'category': 'Investments', 'name': 'Work 401(k)', 'account_type': '401k',
+              'tax_treatment': 'Both', 'traditional_balance': 1000, 'roth_balance': 500}
+    values.update(fields)
+    return accounts_service.get_account(make_account(**values)['id'])
+
+
+def pick(combo, value):
+    combo.setCurrentIndex(combo.findData(value))
+
+
+def test_saving_an_unchanged_both_account_keeps_its_parts(vault, form_class):
+    account = both_401k()
+    form = form_class(dict(account), 'Investments')
+
+    saved = accounts_service.update_account(account['id'], form.values())
+
+    assert (saved['traditional_balance'], saved['roth_balance']) == (1000, 500)
+    assert saved['current_balance'] == 1500
+    assert len(accounts_service.list_balance_history(account['id'])) == 1
+
+
+def test_choosing_both_shows_the_parts_and_works_out_the_balance(vault, form_class):
+    account = accounts_service.get_account(make_account(
+        category='Investments', name='IRA', account_type='IRA',
+        tax_treatment='Traditional', current_balance=900)['id'])
+    form = form_class(dict(account), 'Investments')
+    assert form._containers['roth_balance'].isHidden()
+
+    pick(form._inputs['tax_treatment'], 'Both')
+    form._inputs['traditional_balance'].setText('1,000')
+    form._inputs['roth_balance'].setText('250.50')
+
+    assert not form._containers['roth_balance'].isHidden()
+    total = form._inputs['current_balance']
+    assert total.isReadOnly()
+    assert total.text() == '1250.5'
+    saved = accounts_service.update_account(account['id'], form.values())
+    assert saved['current_balance'] == 1250.5
+
+
+def test_the_form_refuses_a_both_account_missing_an_amount(vault, form_class):
+    account = accounts_service.get_account(make_account(
+        category='Investments', name='IRA', account_type='IRA', current_balance=900)['id'])
+    form = form_class(dict(account), 'Investments')
+    emitted = []
+    form.saved.connect(emitted.append)
+
+    pick(form._inputs['tax_treatment'], 'Both')
+    form._inputs['traditional_balance'].setText('1000')
+    form.submit()
+
+    assert emitted == []
+    assert 'Roth Balance' in form._errors[0].text()
+
+
+def test_a_type_that_decides_its_treatment_hides_and_clears_it(vault, form_class):
+    account = both_401k()
+    form = form_class(dict(account), 'Investments')
+
+    pick(form._inputs['account_type'], 'Brokerage')
+
+    assert form._containers['tax_treatment'].isHidden()
+    assert form._containers['traditional_balance'].isHidden()
+    assert not form._inputs['current_balance'].isReadOnly()
+    saved = accounts_service.update_account(account['id'], form.values())
+    assert 'tax_treatment' not in saved and 'roth_balance' not in saved
+    assert saved['current_balance'] == 1500
+
+
+def test_parts_as_stored_show_the_balance_history_left(vault, form_class):
+    """Balance History moved the balance after the parts were entered. The form
+    shows the balance it has, says the parts no longer add up to it, and a
+    save that changes nothing else files nothing."""
+    account = both_401k()
+    accounts_service.add_balance_entry(account['id'], '1600', date.today().isoformat())
+    form = form_class(accounts_service.get_account(account['id']), 'Investments')
+
+    assert form._inputs['current_balance'].text() == '1600'
+    assert '$1,500.00' in form._total_hints['current_balance'].text()
+    saved = accounts_service.update_account(account['id'], form.values())
+    assert saved['current_balance'] == 1600
+    assert len(accounts_service.list_balance_history(account['id'])) == 2
+
+
+def test_quick_update_on_a_both_account_takes_both_amounts(vault, qt_app):
+    from ui.dialogs import QuickUpdateDialog
+
+    dialog = QuickUpdateDialog(None, both_401k())
+    assert dialog._balance is None
+    dialog._parts['traditional_balance'].setText('1200')
+    dialog._parts['roth_balance'].setText('')
+    assert dialog._parts_problem() == 'Enter both amounts. 0 is fine.'
+
+    dialog._parts['roth_balance'].setText('$700.25')
+    assert dialog.changes() == {'traditional_balance': 1200, 'roth_balance': 700.25,
+                                'current_balance': 1900.25}
+    dialog.deleteLater()
+
+
+def test_enter_in_the_first_amount_moves_to_the_second(vault, qt_app):
+    """Enter would otherwise reach the dialog and press Save, filing the second
+    amount as it opened."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    from ui.dialogs import QuickUpdateDialog
+
+    dialog = QuickUpdateDialog(None, both_401k())
+    dialog.show()
+    first, second = dialog._parts.values()
+    first.setFocus()
+    QTest.keyClick(first, Qt.Key_Return)
+    assert dialog.result() != QuickUpdateDialog.DialogCode.Accepted
+    # The window is never activated here, so hasFocus() stays False.
+    assert dialog.focusWidget() is second
+
+    QTest.keyClick(second, Qt.Key_Return)
+    assert dialog.result() == QuickUpdateDialog.DialogCode.Accepted
+    dialog.deleteLater()
+
+
+def test_quick_update_saves_the_parts_and_files_their_sum(window, monkeypatch):
+    from PySide6.QtWidgets import QDialog
+    from ui import dialogs
+
+    account = both_401k()
+    window.load_category('Investments', select_first=False)
+    shown = next(a for a in window.accounts if a['id'] == account['id'])
+
+    def enter_statement(self):
+        self._parts['traditional_balance'].setText('1200')
+        self._parts['roth_balance'].setText('700')
+        return QDialog.DialogCode.Accepted
+    monkeypatch.setattr(dialogs.QuickUpdateDialog, 'exec', enter_statement)
+
+    window._quick_update(shown)
+
+    after = accounts_service.get_account(account['id'])
+    assert (after['traditional_balance'], after['roth_balance']) == (1200, 700)
+    assert after['current_balance'] == 1900
+    assert [e['balance'] for e in accounts_service.list_balance_history(account['id'])] \
+        == ['1900', '1500']
+
+
+# -- Retirement -----------------------------------------------------------------
+#
+# Your details writes the stored plan one field at a time, as each is committed.
+# It is a form over stored values, so it gets the account form's treatment: an
+# entry it cannot read must never replace what is stored, and a lock must leave
+# nothing of the plan in the window.
+
+@pytest.fixture
+def retirement_view(vault, qt_app):
+    from ui.retirement_view import RetirementView
+    view = RetirementView()
+    yield view
+    view.deleteLater()
+
+
+def stored_plan() -> dict:
+    from services import retirement as retirement_service
+    return retirement_service.load_plan()
+
+
+def commit(field, text: str):
+    """Types into a Your details field and commits it, as Enter would."""
+    field.widget.setText(text)
+    field.widget.editingFinished.emit()
+
+
+def test_your_details_saves_a_committed_change(retirement_view):
+    retirement_view.reload()
+    commit(retirement_view._details._fields['spending'], '84,000')
+    assert stored_plan()['details']['spending'] == 84000
+
+
+def test_an_entry_that_cannot_be_read_never_replaces_the_stored_one(retirement_view):
+    from services import retirement as retirement_service
+    retirement_service.save_plan({'details': {'spending': 84000}})
+    retirement_view.reload()
+    field = retirement_view._details._fields['spending']
+
+    commit(field, 'lots')
+
+    assert not field.error.isHidden()
+    assert stored_plan()['details']['spending'] == 84000
+
+
+def test_clearing_a_typed_savings_figure_goes_back_to_the_accounts(retirement_view):
+    make_account(category='Investments', name='Brokerage', account_type='Brokerage',
+                 current_balance=120000)
+    retirement_view.reload()
+    field = retirement_view._details._fields['taxable']
+
+    commit(field, '100,000')
+    assert stored_plan()['overrides'] == {'taxable': 100000}
+    commit(field, '')
+    assert stored_plan()['overrides'] == {}
+    assert '$120,000' in field.hint.text()
+
+
+def test_the_tab_shows_the_sample_until_the_plan_can_run_and_says_why(retirement_view):
+    retirement_view.reload()
+    assert not retirement_view._banner.isHidden()
+    assert 'birth month and year' in retirement_view._banner_text.text()
+
+
+READY_PLAN = {'details': {'birth_year': 1978, 'birth_month': 3, 'spending': 60000}}
+
+
+def test_turning_on_conversions_is_saved_and_survives_the_next_edit(retirement_view, qt_app):
+    """Withdrawals & taxes saves the setting, and Your details, which keeps
+    its own copy of the plan, must not put it back on its next save."""
+    from PySide6.QtWidgets import QCheckBox
+    from services import retirement as retirement_service
+    from ui.retirement_view import WITHDRAWALS
+
+    retirement_service.save_plan(READY_PLAN)
+    retirement_view.reload()
+    retirement_view.show_view(WITHDRAWALS)
+    retirement_view._pages[WITHDRAWALS].findChild(QCheckBox).setChecked(True)
+    qt_app.processEvents()
+    assert stored_plan()['details']['convert'] is True
+
+    commit(retirement_view._details._fields['spending'], '65,000')
+    assert stored_plan()['details'] == {**READY_PLAN['details'], 'spending': 65000,
+                                        'convert': True, 'convert_rate': 0.12}
+
+
+def test_the_samples_conversion_setting_cannot_be_changed(retirement_view):
+    from PySide6.QtWidgets import QCheckBox
+    from ui.retirement_view import WITHDRAWALS
+
+    retirement_view.reload()
+    retirement_view.show_view(WITHDRAWALS)
+    assert not retirement_view._pages[WITHDRAWALS].findChild(QCheckBox).isEnabled()
+
+
+def test_withdrawals_stop_where_the_money_runs_out(qt_app):
+    """Past that year there is nothing to draw. Rows of $0 would read as
+    spending that stopped, and the money left at the end is nothing either
+    way, so it is not offered as a difference."""
+    from PySide6.QtWidgets import QLabel, QTableWidget
+    from core import retirement
+    from ui.retirement_pages import WithdrawalsPage, compute
+
+    inputs = {**retirement.SAMPLE_HOUSEHOLD, 'pretax': 100000, 'roth': 0, 'taxable': 0,
+              'hsa': 0, 'save_pretax': 0, 'save_taxable': 0}
+    result = compute(inputs, sample=False)
+    ran_out = result.path.failed_at
+    assert ran_out is not None
+
+    page = WithdrawalsPage()
+    page.show_result(result)
+    table = page.findChild(QTableWidget)
+    assert table.rowCount() == ran_out - inputs['retire_age'] + 1
+    assert table.item(table.rowCount() - 1, 0).text() == f"{ran_out} · runs out"
+    texts = [label.text() for label in page.findChildren(QLabel)]
+    assert 'Runs out either way' in texts
+    assert not any(text.startswith('+$') for text in texts)
+    page.deleteLater()
+
+
+def test_pensions_are_saved_and_the_partners_shows_only_for_two(retirement_view):
+    retirement_view.reload()
+    fields = retirement_view._details._fields
+    assert fields['partner_pension'].block.isHidden()
+
+    commit(fields['pension'], '2,100')
+    fields['pension_cola'].widget.click()
+    assert stored_plan()['details'] == {'pension': 2100, 'pension_cola': True}
+
+    fields['partner'].widget.setCurrentIndex(1)
+    fields['partner'].widget.activated.emit(1)
+    assert not fields['partner_pension'].block.isHidden()
+    assert not fields['partner_pension_cola'].block.isHidden()
+
+
+def test_a_pension_shows_on_projection_and_gets_a_withdrawals_column(qt_app):
+    from PySide6.QtWidgets import QLabel, QTableWidget
+    from core import retirement
+    from ui.retirement_pages import ProjectionPage, WithdrawalsPage, compute
+
+    def headers(page):
+        table = page.findChild(QTableWidget)
+        return table, [table.horizontalHeaderItem(column).text()
+                       for column in range(table.columnCount())]
+
+    inputs = {**retirement.SAMPLE_HOUSEHOLD, 'pension': 1500, 'pension_age': 60,
+              'pension_cola': True, 'partner_pension': 900, 'partner_pension_age': 62}
+    result = compute(inputs, sample=False)
+    page = WithdrawalsPage()
+    page.show_result(result)
+    table, names = headers(page)
+    assert names[2:4] == ['Social Security', 'Pension']
+    # A row a year from retiring at 55. Your pension starts at 60, and the
+    # partner's at your 64, sixteen years from now: it's fixed, so it has lost
+    # sixteen years of inflation by then.
+    assert [table.item(row, 3).text() for row in (4, 5, 9)] == [
+        '—', '$18,000', f"${18000 + 10800 / 1.025 ** 16:,.0f}"]
+
+    projection = ProjectionPage()
+    projection.show_result(result)
+    assert ('$1,500 a month at 60 (rises with inflation), partner $900 at 62 (fixed)'
+            in [label.text() for label in projection.findChildren(QLabel)])
+
+    plain = WithdrawalsPage()
+    plain.show_result(compute(retirement.SAMPLE_HOUSEHOLD, sample=False))
+    assert 'Pension' not in headers(plain)[1]
+    for widget in (page, projection, plain):
+        widget.deleteLater()
+
+
+def open_whatif(view, plan: dict = READY_PLAN):
+    from services import retirement as retirement_service
+    from ui.retirement_view import WHAT_IF
+    retirement_service.save_plan(plan)
+    view.reload()
+    view.show_view(WHAT_IF)
+    return view._pages[WHAT_IF]
+
+
+def test_applying_a_what_if_writes_only_what_changed(retirement_view):
+    whatif = open_whatif(retirement_view)
+    whatif.preset({'retire_age': 62})
+    whatif._apply()
+    assert stored_plan()['details'] == {**READY_PLAN['details'], 'retire_age': 62}
+
+
+def test_a_saved_scenario_keeps_only_its_changes(retirement_view):
+    """Everything else follows the plan, so a later edit to the plan reaches
+    the scenario too."""
+    whatif = open_whatif(retirement_view)
+    whatif.preset({'spending': 50000})
+    whatif._save()
+    assert [(s['name'], s['levers']) for s in stored_plan()['scenarios']] == \
+        [('Spend $50,000', {'spending': 50000})]
+    assert stored_plan()['details'] == READY_PLAN['details']
+
+
+def test_a_fifth_scenario_is_refused_with_a_reason(retirement_view):
+    whatif = open_whatif(retirement_view, {**READY_PLAN, 'scenarios': [
+        {'id': f"s{n}", 'name': f"Scenario {n}", 'levers': {}} for n in range(4)]})
+
+    whatif._save()
+
+    assert len(stored_plan()['scenarios']) == 4
+    assert not whatif._status.isHidden() and 'room' in whatif._status.text()
+
+
+TRIP = {'id': 'trip', 'name': 'Travel', 'amount': 10000, 'start': 0, 'years': 10}
+COUPLE = {'details': {**READY_PLAN['details'], 'partner': True, 'partner_birth_year': 1980,
+                      'partner_birth_month': 6}}
+
+
+def test_the_partners_retirement_slider_shows_only_for_two(retirement_view):
+    whatif = open_whatif(retirement_view)
+    assert all(widget.isHidden() for widget in whatif._rows['partner_retire_age'])
+    whatif = open_whatif(retirement_view, COUPLE)
+    assert not any(widget.isHidden() for widget in whatif._rows['partner_retire_age'])
+    assert whatif._rows['retire_age'][0].text() == 'Your retirement age'
+
+
+def test_a_what_if_partner_retirement_is_applied_on_its_own(retirement_view):
+    whatif = open_whatif(retirement_view, COUPLE)
+    whatif.preset({'partner_retire_age': 60})
+    assert whatif._name.text() == 'Partner retires at 60'
+    whatif._apply()
+    assert stored_plan()['details'] == {**COUPLE['details'], 'partner_retire_age': 60}
+
+
+def test_a_blank_partner_retirement_age_is_stored_as_none(retirement_view):
+    from services import retirement as retirement_service
+    retirement_service.save_plan({'details': {**COUPLE['details'], 'partner_retire_age': 62}})
+    retirement_view.reload()
+    spin = retirement_view._details._fields['partner_retire_age'].widget
+    spin.setValue(spin.minimum())
+    assert 'partner_retire_age' not in stored_plan()['details']
+    assert spin.text() == 'Same year as you'
+
+
+def test_a_move_for_the_partner_moves_the_partners_slider():
+    from ui.retirement_view import MOVE_LEVERS
+    move = {'kind': 'work_longer', 'years': 2, 'retire_age': 62, 'partner': True}
+    assert MOVE_LEVERS['work_longer'](move) == {'partner_retire_age': 62}
+
+
+def test_extra_spending_items_are_added_edited_and_deleted(retirement_view):
+    from services import retirement as retirement_service
+    retirement_service.save_plan(READY_PLAN)
+    retirement_view.reload()
+    details = retirement_view._details
+
+    details._add_extra()
+    row = details._extra_rows[-1]
+    row['name'].setText('Wedding')
+    row['amount'].setText('25,000')
+    row['amount'].editingFinished.emit()
+    row['years'].setValue(2)
+    [item] = stored_plan()['details']['extras']
+    assert (item['name'], item['amount'], item['start'], item['years']) == ('Wedding', 25000, 0, 2)
+
+    details._delete_extra(item['id'])
+    assert 'extras' not in stored_plan()['details']
+
+
+def test_an_extra_item_that_cannot_be_read_never_replaces_the_stored_one(retirement_view):
+    from services import retirement as retirement_service
+    retirement_service.save_plan({'details': {**READY_PLAN['details'], 'extras': [TRIP]}})
+    retirement_view.reload()
+    details = retirement_view._details
+    row = details._extra_rows[0]
+
+    for name, amount in (('', '10,000'), ('Travel', 'lots')):
+        row['name'].setText(name)
+        row['amount'].setText(amount)
+        row['amount'].editingFinished.emit()
+        assert not details._extras_error.isHidden()
+        assert stored_plan()['details']['extras'] == [TRIP]
+
+
+def test_a_what_if_extra_amount_is_saved_and_applied_to_its_item(retirement_view):
+    from core import retirement
+    whatif = open_whatif(retirement_view,
+                         {'details': {**READY_PLAN['details'], 'extras': [TRIP]}})
+    box = whatif._values['extra:trip']
+
+    box.setText('$4,000')
+    box.editingFinished.emit()
+    assert whatif._name.text() == 'Travel $4,000'
+    whatif._save()
+    assert stored_plan()['scenarios'][0]['levers'] == {retirement.EXTRA_LEVER: {'trip': 4000}}
+    whatif._apply()
+    assert stored_plan()['details']['extras'] == [{**TRIP, 'amount': 4000}]
+
+
+def test_make_this_my_plan_and_delete(retirement_view, qt_app):
+    from PySide6.QtWidgets import QPushButton
+    from services import retirement as retirement_service
+    from ui.retirement_view import SCENARIOS
+
+    retirement_service.save_plan({**READY_PLAN, 'scenarios': [
+        {'id': 'early', 'name': 'Retire at 58', 'levers': {'retire_age': 58}}]})
+    retirement_view.reload()
+    retirement_view.show_view(SCENARIOS)
+    page = retirement_view._pages[SCENARIOS]
+
+    def press(text):
+        next(b for b in page.findChildren(QPushButton) if b.text() == text).click()
+        qt_app.processEvents()
+
+    press('Make this my plan')
+    assert stored_plan()['details']['retire_age'] == 58
+    retirement_view.show_view(SCENARIOS)
+    press('Delete')
+    assert stored_plan()['scenarios'] == []
+
+
+def test_next_best_moves_are_worked_out_a_step_at_a_time(retirement_view, qt_app):
+    """The search runs one simulation per turn of the event loop, and a move's
+    button opens What-if with the move already made."""
+    from PySide6.QtWidgets import QPushButton
+    from ui.retirement_view import PLAN, WHAT_IF
+
+    retirement_view.reload()
+    assert retirement_view.moves_running()
+    for _ in range(1000):
+        if not retirement_view.moves_running():
+            break
+        qt_app.processEvents()
+    assert not retirement_view.moves_running()
+
+    plan_page = retirement_view._pages[PLAN]
+    next(b for b in plan_page.findChildren(QPushButton) if b.text() == 'Try it').click()
+    assert retirement_view.current_view() == WHAT_IF
+    # The sample household's first move is to work 10 more years.
+    assert retirement_view._pages[WHAT_IF]._levers['retire_age'] == 65
+
+
+def test_a_lock_stops_the_moves_search(retirement_view):
+    retirement_view.reload()
+    assert retirement_view.moves_running()
+    retirement_view.clear()
+    assert not retirement_view.moves_running()
+
+
+def test_the_retirement_tab_sits_beside_the_dashboard(window):
+    from ui.account_list import DASHBOARD, RETIREMENT
+    at = window._tab_order.index(DASHBOARD)
+    assert window._tab_order[at:at + 2] == [DASHBOARD, RETIREMENT]
+    window._on_tab_selected(RETIREMENT)
+    assert window._open_panel() == RETIREMENT
+    assert window.content_area.isHidden()
+
+
+def test_the_tab_bar_reads_lists_panels_categories_then_closed(window):
+    from ui.account_list import (
+        ALL, ATTENTION, CLOSED, DASHBOARD, FAVORITES, RETIREMENT,
+    )
+    make_account(name='Chase', category='Banking', favorite='Yes')
+    closed = make_account(name='Old', category='Banking')
+    accounts_service.set_closed([closed['id']], True)
+    window.load_category(ALL)
+
+    order = [k for k in window._tab_order if k != ATTENTION]
+    assert order == [ALL, FAVORITES, DASHBOARD, RETIREMENT, 'Banking', CLOSED]
+
+
+@pytest.mark.parametrize('start,expected', [
+    ('dashboard', '__dashboard__'),
+    ('retirement', '__retirement__'),
+    ('all', '__all__'),
+])
+def test_the_window_opens_on_the_chosen_tab(window, start, expected):
+    make_account(name='Chase', category='Banking')
+    window.settings['start_tab'] = start
+    window._open_start_tab()
+
+    assert (window._open_panel() or window.current_category) == expected
+
+
+def test_an_empty_start_tab_falls_back_to_all(window):
+    """Favorites has no tab while nothing is pinned."""
+    from ui.account_list import ALL
+
+    make_account(name='Chase', category='Banking')
+    window.settings['start_tab'] = 'favorites'
+    window._open_start_tab()
+
+    assert window._open_panel() is None
+    assert window.current_category == ALL
+
+
+def test_locking_drops_the_plan_from_the_window(window):
+    from services import retirement as retirement_service
+    from ui.account_list import RETIREMENT
+    from ui.retirement_view import DETAILS
+
+    retirement_service.save_plan({'details': {'spending': 84000}})
+    window._on_tab_selected(RETIREMENT)
+    view = window.retirement_view
+    view.show_view(DETAILS)
+    field = view._details._fields['spending']
+    assert field.widget.text() == '84,000'
+
+    window.lock_vault()
+
+    assert view._plan is None and view._savings is None
+    assert field.widget.text() == ''
+    # A field losing focus as the window hides commits. There is no plan left
+    # to save into, so nothing reaches for the vault.
+    field.widget.setText('90,000')
+    field.widget.editingFinished.emit()
+    assert field.error.isHidden()
+
+
+# -- Enter saves --------------------------------------------------------------
+#
+# With no default button set, Qt makes the first button after the focused field
+# the default. Enter in Quick Update's date fields pressed "+1 month" on a credit
+# card and Cancel elsewhere, so the update never reached history; in the entry
+# editor it pressed Delete.
+
+@pytest.mark.parametrize('category,field', [
+    ('Credit Cards', '_as_of'), ('Credit Cards', '_due'), ('Banking', '_as_of'),
+])
+def test_enter_in_a_quick_update_date_field_saves(vault, qt_app, category, field):
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    from ui.dialogs import QuickUpdateDialog
+
+    account = accounts_service.get_account(make_account(
+        category=category, current_balance=100, due_date='2026-11-05')['id'])
+    dialog = QuickUpdateDialog(None, account)
+    dialog.show()
+    due_before = dialog._due.date() if dialog._due else None
+    dialog._balance.setText('250')
+
+    target = getattr(dialog, field)
+    target.setFocus()
+    QTest.keyClick(target, Qt.Key_Return)
+
+    assert dialog.result() == QuickUpdateDialog.DialogCode.Accepted
+    assert dialog.changes()['current_balance'] == 250
+    if due_before is not None:
+        assert dialog._due.date() == due_before
+    dialog.deleteLater()
+
+
+def test_enter_in_the_entry_editor_date_saves_rather_than_deletes(vault, qt_app,
+                                                                  monkeypatch):
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QMessageBox
+    from ui.dialogs import BalanceEntryDialog
+
+    asked = []
+    monkeypatch.setattr(QMessageBox, 'question', staticmethod(
+        lambda *args: asked.append(args[1]) or QMessageBox.No))
+    dialog = BalanceEntryDialog(None, '900', '2024-01-05')
+    dialog.show()
+
+    dialog._date.setFocus()
+    QTest.keyClick(dialog._date, Qt.Key_Return)
+
+    assert asked == []
+    assert not dialog.delete_requested
+    assert dialog.result() == BalanceEntryDialog.DialogCode.Accepted
+    dialog.deleteLater()
+
+
 @pytest.mark.parametrize('typed,expected', [
     ('1200', '1200'), ('1200.00', '1200'), ('$2,501.99', '2501.99'), ('-40', '-40'),
 ])
@@ -630,6 +1271,31 @@ def test_a_falling_figure_is_good_news_only_for_a_debt_or_a_bill(
     line = _change_line(view)
     assert line.text().startswith('▼')
     assert line.objectName() == expected
+    view.deleteLater()
+
+
+# -- double-click to edit -----------------------------------------------------
+
+def test_double_clicking_the_pane_opens_the_form_but_not_on_a_value(vault, qt_app):
+    """A selectable value takes its own double-click, to select a word to copy."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QLabel
+    from ui.detail_view import DetailView
+
+    account = make_account(category='Banking', name='Chase', username='jsmith')
+    view = DetailView('dark')
+    view.show_account(accounts_service.get_account(account['id']))
+    asked = []
+    view.edit_requested.connect(asked.append)
+
+    title = next(l for l in view.findChildren(QLabel) if l.objectName() == 'DetailTitle')
+    QTest.mouseDClick(title, Qt.LeftButton)
+    assert [a['id'] for a in asked] == [account['id']]
+
+    value = next(l for l in view.findChildren(QLabel) if l.text() == 'jsmith')
+    QTest.mouseDClick(value, Qt.LeftButton)
+    assert len(asked) == 1
     view.deleteLater()
 
 

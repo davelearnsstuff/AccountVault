@@ -50,9 +50,13 @@ class BackupError(Exception):
 
 
 # What the user is told when check_seal discards a configuration.
-RESET_MESSAGE = ("The stored backup settings did not match this vault and have "
-                 "been reset. Automatic backups are off until you turn them on "
-                 "again in Settings.")
+RESET_MESSAGE = ("The stored backup and security settings did not match this vault, "
+                 "so something other than AccountVault may have changed them. They "
+                 "have been reset to their defaults: automatic backups are off, and "
+                 "the lock timeout, clipboard clearing, auto-shutdown and screen "
+                 "capture are back to their standard values. Check them in Settings.")
+
+RESET_TITLE = 'Settings Reset'
 
 
 # -----------------------------------------------------------------------------
@@ -144,6 +148,10 @@ def copy_vault(destination) -> Path:
 def _copy_database(target: Path):
     source = sqlite3.connect(database.DB_PATH)
     try:
+        # A trigger copied into a backup would come back with any restore.
+        problem = database.schema_problem(source)
+        if problem:
+            raise BackupError(database.foreign_schema_message(problem))
         copy = sqlite3.connect(target)
         try:
             source.backup(copy)

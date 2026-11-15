@@ -10,10 +10,12 @@
 # up inside another.
 # -----------------------------------------------------------------------------
 
+import datetime
+
 import pytest
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QGuiApplication
-from PySide6.QtWidgets import QFileDialog, QMessageBox
+from PySide6.QtWidgets import QDialog, QFileDialog, QMessageBox
 
 from core import auth
 from core import database
@@ -126,6 +128,17 @@ def test_a_missing_extension_is_added(window, tmp_path, monkeypatch):
 
 # -- the demo vault -----------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def household_box(monkeypatch):
+    """The household figures each demo build asks for first, answered with
+    the defaults: exec() would block the test. Autouse, so every test that
+    reaches the demo button gets past it; the rest never see it."""
+    from ui import dialogs
+
+    monkeypatch.setattr(dialogs.DemoHouseholdDialog, 'exec',
+                        lambda self: QDialog.DialogCode.Accepted)
+
+
 @pytest.fixture
 def demo_box(monkeypatch):
     """The password box each demo build shows, kept rather than run: exec()
@@ -181,6 +194,46 @@ def test_the_demo_password_copies_like_any_other_secret(window, tmp_path, monkey
 
     assert QGuiApplication.clipboard().text() == make_demo_vault.PASSWORD
     assert window._clipboard_timer.isActive()
+
+
+def test_cancelling_the_household_builds_nothing(window, tmp_path, monkeypatch):
+    """Cancel is the way out of the button, before any file is asked for."""
+    from ui import dialogs
+
+    asked = []
+    monkeypatch.setattr(dialogs.DemoHouseholdDialog, 'exec',
+                        lambda self: QDialog.DialogCode.Rejected)
+    monkeypatch.setattr(QFileDialog, 'getSaveFileName',
+                        staticmethod(lambda *a, **k: asked.append(a) or ('', '')))
+    before = database.DB_PATH
+
+    window._create_demo_vault_dialog()
+
+    assert asked == []
+    assert database.DB_PATH == before
+    assert auth.is_unlocked()
+
+
+def test_the_household_answers_reach_the_build(window, tmp_path, monkeypatch, demo_box):
+    from ui import dialogs
+
+    def two_incomes(self):
+        self.incomes.setCurrentIndex(self.incomes.findData(True))
+        self.partner_age.setValue(52)
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(dialogs.DemoHouseholdDialog, 'exec', two_incomes)
+    pick(monkeypatch, tmp_path / 'springfield.vault')
+    answer(monkeypatch, QMessageBox.Yes)
+
+    window._create_demo_vault_dialog()
+    window._handle_login(demo_box[0].password.text())
+
+    jobs = [a['name'] for a in accounts_service.list_accounts('Income') if not a['closed']]
+    assert 'Springfield Elementary — Front Office' in jobs
+    plan = preferences.get_retirement_plan()
+    year = datetime.date.today().year
+    assert plan['details']['partner_birth_year'] in (year - 52, year - 53)
 
 
 def test_the_demo_vault_never_overwrites_a_file(window, tmp_path, monkeypatch):

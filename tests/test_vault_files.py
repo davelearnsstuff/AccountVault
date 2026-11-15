@@ -28,7 +28,7 @@ def registry(tmp_path, monkeypatch):
     """
     home = tmp_path / 'appdata'
     monkeypatch.setattr(database, 'app_data_dir', lambda: home)
-    monkeypatch.setattr(database, 'restrict_to_owner', lambda path: None)
+    monkeypatch.setattr(database, 'restrict_to_owner', lambda path: True)
     monkeypatch.delenv(vaultfile.ENV_OVERRIDE, raising=False)
     return home
 
@@ -132,7 +132,7 @@ def test_creating_over_an_existing_file_is_refused(vault, tmp_path):
 def test_opening_a_path_that_is_not_there_does_not_create_one(tmp_path, monkeypatch):
     """Reached from a recent-files entry whose file has been moved, a new empty
     vault is indistinguishable from the old one having been emptied."""
-    monkeypatch.setattr(database, 'restrict_to_owner', lambda path: None)
+    monkeypatch.setattr(database, 'restrict_to_owner', lambda path: True)
     missing = tmp_path / 'moved.vault'
 
     with pytest.raises(database.VaultFileError):
@@ -326,7 +326,7 @@ def test_an_existing_vault_at_the_old_location_is_adopted_without_asking(
         registry, tmp_path, monkeypatch):
     """Nobody should have to go and find their own vault because the app
     changed how it records the location."""
-    monkeypatch.setattr(database, 'restrict_to_owner', lambda path: None)
+    monkeypatch.setattr(database, 'restrict_to_owner', lambda path: True)
     legacy = registry / database.LEGACY_DB_NAME
     monkeypatch.setattr(database, 'DB_PATH', legacy)
     database.init_db()

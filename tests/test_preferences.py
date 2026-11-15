@@ -31,13 +31,15 @@ def test_a_fresh_vault_reads_the_documented_defaults(vault):
     assert settings['theme'] == 'dark'
     assert settings['font_size'] == 'default'
     assert settings['list_density'] == 'compact'
+    assert settings['start_tab'] == 'all'
 
 
 def test_saved_settings_read_back(vault):
     preferences.save_settings(30, 60, 120, 'light', 'large', 'comfortable',
                               auto_backup_enabled=1, backup_frequency='daily',
                               backup_retention_months=6,
-                              backup_location=r'D:\Vault Backups')
+                              backup_location=r'D:\Vault Backups',
+                              allow_screen_capture=1, start_tab='dashboard')
     assert preferences.get_settings() == {
         'lock_timeout_minutes': 30,
         'clipboard_clear_seconds': 60,
@@ -49,6 +51,8 @@ def test_saved_settings_read_back(vault):
         'backup_frequency': 'daily',
         'backup_retention_months': 6,
         'backup_location': r'D:\Vault Backups',
+        'allow_screen_capture': 1,
+        'start_tab': 'dashboard',
     }
 
 
@@ -87,6 +91,7 @@ def test_a_zero_lock_timeout_on_disk_does_not_reach_the_session(vault):
     ('theme', 'solarized'),
     ('font_size', 'enormous'),
     ('list_density', 'roomy'),
+    ('start_tab', '__all__'),
 ])
 def test_a_value_outside_the_valid_set_falls_back_to_its_default(vault, key, bad):
     """Falling back rather than passing it through is what keeps the Settings

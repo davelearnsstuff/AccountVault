@@ -13,6 +13,7 @@ import os
 import base64
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from argon2 import extract_parameters
 from argon2.low_level import hash_secret_raw, Type
 
 
@@ -89,6 +90,35 @@ def valid_kdf_params(params) -> dict | None:
     return clean
 
 
+# Lengths a stored master hash may record, in bytes. argon2-cffi writes 16 and
+# 32; these only refuse what no build of this app ever wrote.
+_HASH_SALT_BOUNDS = (8, 64)
+_HASH_LEN_BOUNDS  = (16, 64)
+
+
+def valid_password_hash(stored_hash) -> bool:
+    """Whether a stored master hash is an Argon2id hash whose work factors fall
+    inside the bounds kdf_params is held to.
+
+    Verifying a hash runs the work factors written inside it, and the hash is
+    read before anything is authenticated. Unchecked, a vault recording
+    t=4294967295 or gigabytes of memory would freeze the app at the password
+    prompt. Parsing computes nothing, so this is safe to call on any file."""
+    if not isinstance(stored_hash, str):
+        return False
+    try:
+        params = extract_parameters(stored_hash)
+    except Exception:
+        return False
+    if params.type != Type.ID:
+        return False
+    if valid_kdf_params({'t': params.time_cost, 'm': params.memory_cost,
+                         'p': params.parallelism}) is None:
+        return False
+    return (_HASH_SALT_BOUNDS[0] <= params.salt_len <= _HASH_SALT_BOUNDS[1]
+            and _HASH_LEN_BOUNDS[0] <= params.hash_len <= _HASH_LEN_BOUNDS[1])
+
+
 def derive_key(password: str, salt: bytes, params: dict | None = None) -> bytes:
     """Returns 32 raw bytes via Argon2id. Suitable as an AES-256-GCM key.
 
@@ -162,6 +192,63 @@ def field_aad(table: str, column: str) -> bytes:
     return f'{table}.{column}'.encode()
 
 
+def row_aad(table: str, column: str, *row_key) -> bytes:
+    """Associated data binding a field to its column and its row, for vaults at
+    format 3: `accounts.password:17`, `balance_history.balance:17:203`.
+
+    field_aad stops a token moving between columns; this also stops one moving
+    between rows, which would let anyone who can write the file swap two
+    accounts' passwords or routing numbers, or move a balance entry onto another
+    account. Ids survive everything that keeps ciphertext: undo restores a row
+    under its own id, and a backup is a copy of the file."""
+    return f"{table}.{column}:{':'.join(str(part) for part in row_key)}".encode()
+
+
+# -----------------------------------------------------------------------------
+# Padding
+#
+# AES-GCM keeps the plaintext's length, so without this the file shows every
+# password's length and how many digits each balance has. A field is stored as
+# a 4-byte length, the value, and zeros up to a multiple of PAD_BLOCK. Most
+# passwords, usernames and balances fit one block and look the same on disk;
+# a long note still shows its size, to the nearest block.
+# -----------------------------------------------------------------------------
+
+PAD_BLOCK = 64
+_LENGTH_BYTES = 4
+
+
+def pad(data: bytes) -> bytes:
+    body = len(data).to_bytes(_LENGTH_BYTES, 'big') + data
+    return body + b'\x00' * (-len(body) % PAD_BLOCK)
+
+
+def unpad(data: bytes) -> bytes:
+    """Undoes pad, or ValueError for anything pad would not have produced."""
+    if len(data) < PAD_BLOCK or len(data) % PAD_BLOCK:
+        raise ValueError('not a padded field')
+    length = int.from_bytes(data[:_LENGTH_BYTES], 'big')
+    end = _LENGTH_BYTES + length
+    if end > len(data) or any(data[end:]):
+        raise ValueError('not a padded field')
+    return data[_LENGTH_BYTES:end]
+
+
+def encrypt_field(value: str, aad: bytes) -> str:
+    """Encrypts a stored field, padded. For the record tables at format 3;
+    app_config's encrypted rows use encrypt()."""
+    if _key_instance is None:
+        raise VaultLockedError("Encryption key not initialized — app is locked")
+    return encrypt_with(_key_instance, pad(value.encode()), aad)
+
+
+def decrypt_field(value: str, aad: bytes) -> str:
+    """Decrypts a token produced by encrypt_field."""
+    if _key_instance is None:
+        raise VaultLockedError("Encryption key not initialized — app is locked")
+    return unpad(decrypt_with(_key_instance, value, aad)).decode()
+
+
 def encrypt(value: str, aad: bytes = b'') -> str:
     """Encrypts a string under the session key. Returns
     base64url(nonce || ciphertext || tag)."""
@@ -216,19 +303,26 @@ def decrypt_with(key, token: str, aad: bytes = b'') -> bytes:
     return _as_cipher(key).decrypt(nonce, ct, aad)
 
 
-def reencrypt(value: str, new_key, aad: bytes = b'', new_aad: bytes = b'') -> str:
+def reencrypt(value: str, new_key, aad: bytes = b'', new_aad: bytes = b'',
+              transform=None) -> str:
     """Decrypts with the current key and re-encrypts with new_key, which may be
     raw 32 bytes or a cipher from cipher_for.
 
     The two associated-data values differ only while a vault moves onto a format
     that binds fields differently (see auth._rekey_fields). Neither defaults to
-    the other: a re-key that reads or writes the wrong binding is unrecoverable."""
+    the other: a re-key that reads or writes the wrong binding is unrecoverable.
+
+    transform, when given, rewrites the plaintext bytes on the way through: pad,
+    for a vault moving onto the padded format. Without it the bytes pass
+    through untouched, padding and all."""
     if _key_instance is None:
         raise VaultLockedError("Encryption key not initialized — app is locked")
     if not value:
         return value
     nonce, ct = _split_token(value)
     plaintext = _key_instance.decrypt(nonce, ct, aad)
+    if transform is not None:
+        plaintext = transform(plaintext)
     return encrypt_with(new_key, plaintext, new_aad)
 
 
@@ -238,7 +332,7 @@ def _b64decode_strict(value: str) -> bytes:
 
     The lenient decoder discards characters outside the alphabet, so long prose
     could decode to something token-sized and be mistaken for ciphertext — then
-    skipped by the plaintext migration and left unencrypted."""
+    skipped by the format-0 upgrade and left unencrypted."""
     return base64.b64decode(value, altchars=b'-_', validate=True)
 
 
@@ -265,25 +359,52 @@ def is_unreadable(value) -> bool:
 def safe_decrypt(value: str, aad: bytes = b'') -> str:
     """Decrypt value, tolerating rows this vault did not write.
 
-    Legacy plaintext is returned as-is and undecryptable ciphertext returns
-    UNREADABLE, so one corrupt field degrades to a placeholder. A locked vault
-    re-raises, so callers cannot stamp placeholders over a vault that is merely
-    closed."""
-    if not looks_encrypted(value):
+    Anything that will not decrypt returns UNREADABLE, so one corrupt field
+    degrades to a placeholder. A locked vault re-raises, so callers cannot stamp
+    placeholders over a vault that is merely closed.
+
+    Plaintext is UNREADABLE too, not passed through. Fields are read only after
+    the login has brought the vault onto the current format, which encrypts any
+    plaintext a format-0 vault held. Plaintext found after that was written by
+    someone without the key, and showing it as the value would let anyone who
+    can write the file forge a website, a note or a routing number."""
+    return _safe(decrypt, value, aad)
+
+
+def safe_decrypt_field(value: str, aad: bytes) -> str:
+    """safe_decrypt for a token written by encrypt_field. A token that opens
+    but is not padded is unreadable too."""
+    return _safe(decrypt_field, value, aad)
+
+
+def _safe(opener, value, aad):
+    if not value:
         return value
+    if _key_instance is None:
+        raise VaultLockedError("Encryption key not initialized — app is locked")
+    if not looks_encrypted(value):
+        return UNREADABLE
     try:
-        return decrypt(value, aad)
+        return opener(value, aad)
     except VaultLockedError:
         raise
     except Exception:
         return UNREADABLE
 
 
-def safe_reencrypt(value: str, new_key, aad: bytes = b'', new_aad: bytes = b'') -> str:
+def safe_reencrypt(value: str, new_key, aad: bytes = b'', new_aad: bytes = b'',
+                   transform=None) -> str:
     """Reencrypt with new_key, encrypting legacy plaintext directly.
+
+    Only for upgrading a vault from before a column was encrypted, the one
+    place plaintext is legitimate; auth._rekey_fields refuses it anywhere else.
+    transform applies to legacy plaintext as it does in reencrypt.
 
     Ciphertext that will not decrypt raises rather than being treated as
     plaintext: wrapping the token would lose the real value for good."""
     if not looks_encrypted(value):
-        return encrypt_with(new_key, value.encode(), new_aad)
-    return reencrypt(value, new_key, aad, new_aad)
+        plaintext = value.encode()
+        if transform is not None:
+            plaintext = transform(plaintext)
+        return encrypt_with(new_key, plaintext, new_aad)
+    return reencrypt(value, new_key, aad, new_aad, transform)

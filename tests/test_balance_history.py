@@ -134,16 +134,44 @@ def test_same_day_save_does_move_the_headline(vault):
     assert updated['current_balance'] == 500
 
 
+def _file_history_on(account_id: int, day: str):
+    """Moves every history entry, and the account's last_updated, to `day`."""
+    from core import database
+    with database.connect() as db:
+        db.execute("UPDATE accounts SET last_updated = ? WHERE id = ?", (day, account_id))
+        db.execute("UPDATE balance_history SET recorded_at = ? WHERE account_id = ?",
+                   (day, account_id))
+    accounts_service.invalidate_cache()
+
+
+def _entries(account_id: int) -> list[tuple[str, str]]:
+    return [(e['recorded_at'][:10], e['balance'])
+            for e in accounts_service.list_balance_history(account_id)]
+
+
 def test_touch_account_snapshots_without_changing_the_balance(vault):
     account = make_account(current_balance=100)
-    entries_before = len(accounts_service.list_balance_history(account['id']))
+    _file_history_on(account['id'], '2026-01-05')
 
     accounts_service.touch_account(account['id'])
 
     fresh = accounts_service.get_account(account['id'])
     assert fresh['current_balance'] == 100
     assert fresh['last_updated'] == today()
-    assert len(accounts_service.list_balance_history(account['id'])) == entries_before + 1
+    assert _entries(account['id']) == [(today(), '100'), ('2026-01-05', '100')]
+
+
+def test_touch_account_skips_the_figure_today_already_ends_on(vault):
+    """Two clicks in a day add one entry, the same check Quick Update makes. The
+    date still moves: the click is a check either way."""
+    account = make_account(current_balance=100)
+    _file_history_on(account['id'], '2026-01-05')
+
+    accounts_service.touch_account(account['id'])
+    accounts_service.touch_account(account['id'])
+
+    assert accounts_service.get_account(account['id'])['last_updated'] == today()
+    assert _entries(account['id']) == [(today(), '100'), ('2026-01-05', '100')]
 
 
 def test_touch_account_recovers_a_balance_left_empty(vault):
@@ -152,6 +180,7 @@ def test_touch_account_recovers_a_balance_left_empty(vault):
     Change is what repairs it: the entries say what the balance is, so it comes
     back off the newest one instead of the account reading blank beside them."""
     account = make_account(current_balance=100)
+    _file_history_on(account['id'], '2026-01-05')
     cleared = dict(account)
     cleared['current_balance'] = ''
     accounts_service.update_account(account['id'], cleared)
@@ -162,7 +191,7 @@ def test_touch_account_recovers_a_balance_left_empty(vault):
     fresh = accounts_service.get_account(account['id'])
     assert fresh['current_balance'] == 100
     # And the snapshot it files carries the recovered figure, not nothing.
-    assert accounts_service.list_balance_history(account['id'])[0]['balance'] == '100'
+    assert _entries(account['id']) == [(today(), '100'), ('2026-01-05', '100')]
 
 
 def test_touch_account_leaves_a_balance_free_account_alone(vault):
@@ -175,6 +204,66 @@ def test_touch_account_leaves_a_balance_free_account_alone(vault):
     assert fresh['last_updated'] == today()
     assert fresh.get('current_balance') is None
     assert accounts_service.list_balance_history(account['id']) == []
+
+
+# -- confirm_balance: Quick Update files a reading even when it has not moved ---
+
+def test_a_confirmed_save_files_an_unchanged_figure(vault):
+    """A due date moved on, the balance left as it was: still a reading, and the
+    history says so."""
+    account = make_account(category='Credit Cards', current_balance=100)
+    _file_history_on(account['id'], '2026-01-05')
+
+    edit = dict(accounts_service.get_account(account['id']), due_date='2026-02-05')
+    accounts_service.update_account(account['id'], edit, confirm_balance=True)
+
+    assert _entries(account['id']) == [(today(), '100'), ('2026-01-05', '100')]
+
+
+def test_an_ordinary_save_still_files_only_a_moved_figure(vault):
+    """The full form's rule is unchanged: editing a note adds no history."""
+    account = make_account(current_balance=100)
+    _file_history_on(account['id'], '2026-01-05')
+
+    edit = dict(accounts_service.get_account(account['id']), notes='new note')
+    accounts_service.update_account(account['id'], edit)
+
+    assert _entries(account['id']) == [('2026-01-05', '100')]
+
+
+def test_a_confirmed_save_skips_the_figure_the_day_already_ends_on(vault):
+    """Saving twice in a day adds one entry, not two."""
+    account = make_account(current_balance=100)
+
+    accounts_service.update_account(account['id'], dict(account), confirm_balance=True)
+
+    assert _entries(account['id']) == [(today(), '100')]
+
+
+def test_a_confirmed_save_files_a_figure_seen_earlier_in_the_day(vault):
+    """100, then 600, then 100 again is a real reading. Skipping it would leave
+    the account on 100 with its history ending on 600."""
+    account = make_account(current_balance=100)
+
+    accounts_service.update_account(account['id'], dict(account, current_balance=600),
+                                    confirm_balance=True)
+    updated = accounts_service.update_account(
+        account['id'], dict(account, current_balance=100), confirm_balance=True)
+
+    assert updated['current_balance'] == 100
+    assert [balance for _, balance in _entries(account['id'])] == ['100', '600', '100']
+
+
+def test_a_confirmed_backdated_save_skips_a_repeat_of_that_day(vault):
+    """The guard applies to the day being filed, which for an As Of date is that
+    day, not today."""
+    account = make_account(current_balance=100)
+    accounts_service.add_balance_entry(account['id'], '75', '2026-01-05')
+
+    accounts_service.update_account(account['id'], dict(account, current_balance=75),
+                                    balance_date='2026-01-05', confirm_balance=True)
+
+    assert _entries(account['id']) == [(today(), '100'), ('2026-01-05', '75')]
 
 
 def test_non_numeric_history_is_not_copied_onto_the_account(vault):

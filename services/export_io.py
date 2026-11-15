@@ -7,6 +7,7 @@
 
 import os
 import tempfile
+import unicodedata
 from pathlib import Path
 
 from core.database import restrict_to_owner
@@ -26,6 +27,24 @@ FORMULA_LEAD = ('=', '+', '-', '@', '\t', '\r')
 # and show the real value.
 _TEXT_MARKER = "'"
 
+# Spaces a spreadsheet may skip before deciding a cell is a formula: the
+# ordinary one, the no-break space and the ideographic space.
+_LEADING_SPACES = '  　'
+
+
+def _needs_marker(text: str) -> bool:
+    """Whether a cell has to be marked as text: it starts with the marker
+    itself, or with what a spreadsheet could read as the start of a formula.
+
+    Checked after any leading spaces, and on the character's compatibility form
+    (NFKC), so a full-width '＝' or a space before '=' counts as '='. Whether
+    current spreadsheets do act on those has not been confirmed; marking one
+    costs an apostrophe that the spreadsheet hides anyway."""
+    if text[:1] == _TEXT_MARKER:
+        return True
+    lead = text.lstrip(_LEADING_SPACES)[:1]
+    return bool(lead) and unicodedata.normalize('NFKC', lead)[:1] in FORMULA_LEAD
+
 
 def defuse(value) -> str:
     """Renders a value as CSV text a spreadsheet will show rather than execute.
@@ -34,7 +53,7 @@ def defuse(value) -> str:
     take exactly one off and hand back what was stored — otherwise a password
     beginning "'=" would come back from a round trip without its apostrophe."""
     text = '' if value is None else str(value)
-    if text[:1] in FORMULA_LEAD or text[:1] == _TEXT_MARKER:
+    if _needs_marker(text):
         return _TEXT_MARKER + text
     return text
 
@@ -44,8 +63,7 @@ def undefuse(value) -> str:
     cell defuse would have marked. A value that merely starts with an
     apostrophe and some other character is left alone."""
     text = '' if value is None else str(value)
-    if text[:1] == _TEXT_MARKER and (text[1:2] in FORMULA_LEAD
-                                     or text[1:2] == _TEXT_MARKER):
+    if text[:1] == _TEXT_MARKER and _needs_marker(text[1:]):
         return text[1:]
     return text
 

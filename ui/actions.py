@@ -241,6 +241,9 @@ class ActionsMixin:
         self._actions['theme'].setChecked(theme == 'dark')
         self.detail_view.set_theme(theme)
         self.dashboard_view.set_theme(theme)
+        # The planner's charts paint from the palette as they go; only its
+        # accounts table holds a colour of its own.
+        self.retirement_view.refresh_theme()
 
         # Icons are pixmaps with their colour baked in; redraw every one.
         for widget in (self.findChildren(IconButton) + self.findChildren(ThemedIcon)

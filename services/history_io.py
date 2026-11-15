@@ -121,8 +121,8 @@ def _build(year: int, month: int, day: int) -> str | None:
 def _from_numeric(first: int, second: int, year: int) -> str | None:
     """Reads a slash-or-dash date whose field order the format does not state.
 
-    Month first, because that is what this app displays (format_date renders
-    MM-DD-YYYY) and what a US export writes. The exception is the one case
+    Month first, because that is what a US export writes and what this app
+    used to display. The exception is the one case
     where month-first is provably wrong — a first field past 12 — which is
     read day-first rather than thrown away."""
     if first > 12 and second <= 12:
@@ -550,7 +550,7 @@ def read_file(path) -> str:
 def export_csv(entries, noun: str = DEFAULT_VALUE_NOUN) -> dict:
     """Renders history entries as CSV text. Returns {text, written, unreadable}.
 
-    Dates are written ISO, not in the MM-DD-YYYY the app displays: this is the
+    Dates are written ISO, not in the 'Oct 24, 2026' the app displays: this is the
     one spelling parse_date can never read two ways, so the file reads back into
     the same days it was written from no matter whose machine opens it.
 

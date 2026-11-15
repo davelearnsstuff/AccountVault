@@ -31,6 +31,16 @@ def _scheme_of(text: str) -> str | None:
     return _SCHEME_NOISE.sub('', raw).lower()
 
 
+def _bare_mailto(text: str) -> str:
+    """A mailto: link reduced to its address. Everything after '?' is fields
+    for the mail client, and some clients have honoured ones that attach a
+    file from this machine (attach=, attachment=) to the message they open. A
+    stored website value can come from an import, so it gets no say in what a
+    new message carries. '' when no address is left."""
+    address = text.split('?', 1)[0].split('#', 1)[0]
+    return address if address[len('mailto:'):].strip() else ''
+
+
 def normalize_url(value) -> str:
     """Prepends https:// when no safe scheme is present. Blocks script-ish schemes.
 
@@ -44,7 +54,9 @@ def normalize_url(value) -> str:
 
     if _scheme_of(text) in _BLOCKED_SCHEMES:
         return ''
-    if re.match(r'^(https?://|mailto:)', text, re.I):
+    if re.match(r'^mailto:', text, re.I):
+        return _bare_mailto(text)
+    if re.match(r'^https?://', text, re.I):
         return text
     # Everything else is treated as a hostname and prefixed. Unknown schemes are
     # not refused: 'example.com:8080' is a host and a port, and is

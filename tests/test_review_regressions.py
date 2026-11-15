@@ -248,18 +248,51 @@ def test_the_excepthook_survives_a_missing_stderr(monkeypatch, quiet_hook):
     assert [exc_type for exc_type, _ in quiet_hook] == [ValueError]
 
 
-def test_the_excepthook_still_prints_a_traceback(monkeypatch, quiet_hook):
+def _raise_through_hook(monkeypatch, debug: str | None):
+    """Sends an error whose message carries a secret through the hook, and
+    returns what reached stderr."""
     import io
+    import main as main_module
 
+    if debug is None:
+        monkeypatch.delenv(main_module.DEBUG_ENV, raising=False)
+    else:
+        monkeypatch.setenv(main_module.DEBUG_ENV, debug)
     stream = io.StringIO()
     monkeypatch.setattr(sys, 'stderr', stream)
 
     try:
-        raise ValueError('boom')
+        float('hunter2-secret')
     except ValueError:
         sys.excepthook(*sys.exc_info())
+    return stream.getvalue()
 
-    assert 'ValueError: boom' in stream.getvalue()
+
+def test_the_excepthook_still_prints_a_traceback(monkeypatch, quiet_hook):
+    """Where it failed, without what it was holding: stderr is the system
+    journal or ~/.xsession-errors when launched from a desktop shortcut."""
+    printed = _raise_through_hook(monkeypatch, debug=None)
+
+    assert 'ValueError' in printed
+    assert '_raise_through_hook' in printed
+    assert 'hunter2-secret' not in printed
+
+
+@pytest.mark.parametrize('value', ['0', 'yes', ''])
+def test_only_the_exact_debug_value_prints_the_message(monkeypatch, quiet_hook, value):
+    assert 'hunter2-secret' not in _raise_through_hook(monkeypatch, debug=value)
+
+
+def test_the_debug_switch_prints_the_full_traceback(monkeypatch, quiet_hook):
+    """For development: the message is what a developer needs."""
+    assert 'hunter2-secret' in _raise_through_hook(monkeypatch, debug='1')
+
+
+def test_the_log_never_carries_the_message_even_in_debug(monkeypatch, tmp_path, quiet_hook):
+    _raise_through_hook(monkeypatch, debug='1')
+    logged = (tmp_path / 'errors.log').read_text(encoding='utf-8')
+    assert 'ValueError' in logged
+    assert 'hunter2-secret' not in logged
 
 
 # -- 10. the undecryptable-entry toast fired on every reload ------------------
@@ -310,9 +343,9 @@ def test_counting_accounts_decrypts_nothing(vault, monkeypatch):
     accounts_service.invalidate_cache()
 
     calls = []
-    real = accounts_service.safe_decrypt
-    monkeypatch.setattr(accounts_service, 'safe_decrypt',
-                        lambda value: calls.append(value) or real(value))
+    real = accounts_service.safe_decrypt_field
+    monkeypatch.setattr(accounts_service, 'safe_decrypt_field',
+                        lambda value, aad: calls.append(value) or real(value, aad))
 
     assert accounts_service.count_accounts() == 2
     assert calls == []

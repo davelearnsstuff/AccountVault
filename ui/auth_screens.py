@@ -14,9 +14,11 @@ from PySide6.QtWidgets import (
 )
 
 from core import auth
+from core import preferences
 from core import vaultfile
 from ui.widgets import (
     IconButton, ThemedIcon, password_field, password_requirements, plain_label,
+    plain_text,
 )
 
 
@@ -47,6 +49,14 @@ class _AuthScreen(QWidget):
         self.vault_caption.setWordWrap(True)
         self.vault_caption.hide()
 
+        # Under the vault's name when that vault is a demo, whose password is
+        # public. See preferences.DEMO_NOTICE.
+        self.demo_notice = plain_label(preferences.DEMO_NOTICE)
+        self.demo_notice.setObjectName('LevelWarn')
+        self.demo_notice.setAlignment(Qt.AlignCenter)
+        self.demo_notice.setWordWrap(True)
+        self.demo_notice.hide()
+
         # Errors quote file names and exception text.
         self.error = plain_label()
         self.error.setObjectName('ErrorLabel')
@@ -67,6 +77,7 @@ class _AuthScreen(QWidget):
         card_layout.addWidget(title)
         card_layout.addWidget(self.subtitle)
         card_layout.addWidget(self.vault_caption)
+        card_layout.addWidget(self.demo_notice)
         card_layout.addSpacing(10)
         card_layout.addLayout(self.form)
         card_layout.addWidget(self.error)
@@ -89,15 +100,16 @@ class _AuthScreen(QWidget):
         self.error.clear()
         self.error.hide()
 
-    def set_vault(self, path):
+    def set_vault(self, path, demo: bool = False):
         """Names the vault this screen is about: the filename, with the full
-        path as the tooltip."""
+        path as the tooltip, and the demo warning when it is a demo vault."""
+        self.demo_notice.setVisible(bool(path) and demo)
         if not path:
             self.vault_caption.hide()
             return
         path = Path(path)
         self.vault_caption.setText(path.name)
-        self.vault_caption.setToolTip(str(path))
+        self.vault_caption.setToolTip(plain_text(path))
         self.vault_caption.show()
 
     @staticmethod
@@ -241,13 +253,13 @@ class ChooserScreen(_AuthScreen):
             item = QListWidgetItem(Path(path).name)
             item.setData(Qt.UserRole, str(path))
             if status == 'ok':
-                item.setToolTip(str(path))
+                item.setToolTip(plain_text(path))
             else:
                 # Listed greyed rather than dropped: a vault that vanishes off
                 # the list reads as lost, one marked unavailable as a drive to
                 # plug in.
                 item.setText(f"{Path(path).name}  —  {_SHORT_STATUS.get(status, 'unavailable')}")
-                item.setToolTip(vaultfile.describe(status, path))
+                item.setToolTip(plain_text(vaultfile.describe(status, path)))
                 item.setFlags(item.flags() & ~Qt.ItemIsEnabled)
             self.recent.addItem(item)
 
@@ -304,6 +316,8 @@ _SHORT_STATUS = {
     'empty': 'empty file',
     'not-sqlite': 'not a vault',
     'not-vault': 'not a vault',
+    'altered': 'changed by another program',
+    'damaged': 'password record damaged',
     'unreadable': 'unreadable',
 }
 

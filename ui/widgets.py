@@ -372,6 +372,10 @@ class _DateEdit(QDateEdit):
         return bool(self.specialValueText()) and self.date() == self.minimumDate()
 
 
+# How every date field shows its date: the same spelling as format_date, so
+# a field and the value beside it read alike.
+DATE_DISPLAY_FORMAT = 'MMM d, yyyy'
+
 # Width a date field needs beyond its text: the popup arrow, Qt's frame, and the
 # stylesheet's padding and border. Qt's own sizeHint clips the year.
 _DATE_FIELD_CHROME = 62
@@ -379,11 +383,12 @@ _DATE_FIELD_CHROME = 62
 
 def date_edit(date: QDate | None = None, *, minimum: QDate | None = None,
               maximum: QDate | None = None, no_date_text: str | None = None) -> QDateEdit:
-    """A calendar-popup date field in the app's MM-dd-yyyy format, defaulting to
-    today. no_date_text turns the minimum into an empty-value sentinel."""
+    """A calendar-popup date field in the app's 'Oct 24, 2026' format,
+    defaulting to today. no_date_text turns the minimum into an empty-value
+    sentinel."""
     field = _DateEdit()
     field.setCalendarPopup(True)
-    field.setDisplayFormat('MM-dd-yyyy')
+    field.setDisplayFormat(DATE_DISPLAY_FORMAT)
     # Bounds before the value, so a date outside them clamps immediately.
     if minimum is not None:
         field.setMinimumDate(minimum)
@@ -396,8 +401,12 @@ def date_edit(date: QDate | None = None, *, minimum: QDate | None = None,
     calendar.installEventFilter(field)
     _add_today_button(calendar, field)
     field.ensurePolished()
+    # The widest month name the field can show, on the widest day and year.
+    metrics = field.fontMetrics()
+    widest = max(metrics.horizontalAdvance(QDate(2000, month, 28).toString('MMM'))
+                 for month in range(1, 13))
     field.setMinimumWidth(
-        field.fontMetrics().horizontalAdvance('00-00-0000') + _DATE_FIELD_CHROME
+        widest + metrics.horizontalAdvance(' 00, 0000') + _DATE_FIELD_CHROME
     )
     return field
 
@@ -609,6 +618,29 @@ class FlowLayout(QLayout):
         return y + line_height - rect.y() + bottom
 
 
+# The least an axis spans, as a share of the largest figure on it. Fitted
+# tightly to the data, a house value moving 0.8% in a year drew as a cliff;
+# with this floor it moves a tenth of the chart's height, which is about what
+# it is.
+_MIN_AXIS_SPAN = 0.10
+
+
+def _value_axis(values) -> tuple[float, float]:
+    """(low, high) for a chart's value axis: the data's own range, widened
+    evenly to _MIN_AXIS_SPAN of the largest figure when it is narrower. Never
+    widened below zero for figures that are all zero or more."""
+    low, high = min(values), max(values)
+    floor = max(abs(low), abs(high)) * _MIN_AXIS_SPAN
+    if high - low < floor:
+        pad = (floor - (high - low)) / 2
+        widened_low, high = low - pad, high + pad
+        if low >= 0 > widened_low:
+            high -= widened_low
+            widened_low = 0.0
+        low = widened_low
+    return low, high
+
+
 class LineChart(QWidget):
     """Filled line chart with a value axis, sparse x labels and per-point tooltips."""
 
@@ -645,7 +677,7 @@ class LineChart(QWidget):
         if width <= 0 or height <= 0:
             return
 
-        low, high = min(self._values), max(self._values)
+        low, high = _value_axis(self._values)
         value_range = (high - low) or 1.0
         count = len(self._values)
 
@@ -801,8 +833,16 @@ def build_series_chart(months, values, color, theme, height=120) -> LineChart | 
     return build_chart(cleaned, labels, tooltips, color, theme, height)
 
 
+# Where the toast sits: centred at the top of the window, inside the nav bar's
+# empty middle, so it never covers a figure or a button the user is reading.
+# The room kept clear either side is the brand on the left and the nav buttons
+# on the right.
+_TOAST_TOP = 8
+_TOAST_SIDE_ROOM = 210
+
+
 class Toast(QFrame):
-    """Brief status message floating over the bottom of its parent window,
+    """Brief status message floating over the top of its parent window,
     optionally with one action (the undo after a delete).
 
     The action and its callback are dropped with every new message and on
@@ -846,7 +886,7 @@ class Toast(QFrame):
 
         parent = self.parentWidget()
         if parent is not None:
-            self._label.setMaximumWidth(max(240, parent.width() - 160))
+            self._label.setMaximumWidth(max(240, parent.width() - 2 * _TOAST_SIDE_ROOM))
         self.adjustSize()
         self.reposition()
         self.show()
@@ -871,8 +911,7 @@ class Toast(QFrame):
         if not parent:
             return
         x = (parent.width() - self.width()) // 2
-        y = parent.height() - self.height() - 28
-        self.move(max(0, x), max(0, y))
+        self.move(max(0, x), _TOAST_TOP)
 
 
 # -----------------------------------------------------------------------------

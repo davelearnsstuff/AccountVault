@@ -160,6 +160,17 @@ def window(vault, qt_app):
     _destroy(window, qt_app)
 
 
+def _closed_account(window, **fields) -> dict:
+    """Makes an account, closes it, and returns it as the Closed tab lists it:
+    only a closed account can be deleted."""
+    from ui.account_list import CLOSED
+
+    account = make_account(**fields)
+    accounts_service.set_closed([account['id']], True)
+    window.load_category(CLOSED)
+    return window.accounts[0]
+
+
 def _delete_confirmed(window, account, monkeypatch):
     """Runs _delete_account with the confirmation answered Yes."""
     from PySide6.QtWidgets import QMessageBox
@@ -169,11 +180,7 @@ def _delete_confirmed(window, account, monkeypatch):
 
 
 def test_the_window_offers_an_undo_and_it_works(window, monkeypatch):
-    from ui.account_list import ALL
-
-    make_account(name='Chase', category='Banking')
-    window.load_category(ALL)
-    account = window.accounts[0]
+    account = _closed_account(window, name='Chase', category='Banking')
 
     _delete_confirmed(window, account, monkeypatch)
     assert accounts_service.list_accounts() == []
@@ -195,11 +202,7 @@ def test_the_offer_is_dropped_when_the_vault_locks(window, monkeypatch):
     deleted. Restored after a lock it would be written into whatever vault is
     open next, as rows nothing there can open — an account made permanently
     unreadable by a button labelled Undo."""
-    from ui.account_list import ALL
-
-    make_account(name='Chase')
-    window.load_category(ALL)
-    account = window.accounts[0]
+    account = _closed_account(window, name='Chase')
 
     _delete_confirmed(window, account, monkeypatch)
     token = window._undo_delete
@@ -215,11 +218,7 @@ def test_the_offer_is_dropped_when_the_vault_locks(window, monkeypatch):
 
 
 def test_an_undo_whose_token_is_no_longer_held_does_nothing(window, monkeypatch):
-    from ui.account_list import ALL
-
-    make_account(name='Chase')
-    window.load_category(ALL)
-    account = window.accounts[0]
+    account = _closed_account(window, name='Chase')
 
     _delete_confirmed(window, account, monkeypatch)
     token = window._undo_delete
@@ -232,11 +231,8 @@ def test_an_undo_whose_token_is_no_longer_held_does_nothing(window, monkeypatch)
 
 def test_declining_the_confirmation_deletes_nothing(window, monkeypatch):
     from PySide6.QtWidgets import QMessageBox
-    from ui.account_list import ALL
 
-    make_account(name='Chase')
-    window.load_category(ALL)
-    account = window.accounts[0]
+    account = _closed_account(window, name='Chase')
 
     monkeypatch.setattr(QMessageBox, 'question',
                         staticmethod(lambda *a, **k: QMessageBox.No))
@@ -244,3 +240,65 @@ def test_declining_the_confirmation_deletes_nothing(window, monkeypatch):
 
     assert len(accounts_service.list_accounts()) == 1
     assert window._undo_delete is None
+
+
+# -- closing and reopening from the detail pane ------------------------------
+
+def test_delete_on_an_open_account_does_nothing(window):
+    """The pane offers Delete only on a closed account; one arriving anyway is
+    ignored rather than deleting an open account."""
+    from ui.account_list import ALL
+
+    make_account(name='Chase')
+    window.load_category(ALL)
+    window._delete_account(window.accounts[0])
+
+    [stored] = accounts_service.list_accounts()
+    assert not stored['closed']
+    assert window._undo_delete is None
+
+
+def _answer_close(monkeypatch, accept: bool):
+    """Answers the Close Account confirmation without showing it."""
+    from PySide6.QtWidgets import QMessageBox
+
+    def clicked(box):
+        role = QMessageBox.AcceptRole if accept else QMessageBox.RejectRole
+        return next(b for b in box.buttons() if box.buttonRole(b) == role)
+
+    monkeypatch.setattr(QMessageBox, 'exec', lambda box: 0)
+    monkeypatch.setattr(QMessageBox, 'clickedButton', clicked)
+
+
+def test_declining_the_close_confirmation_changes_nothing(window, monkeypatch):
+    from ui.account_list import ALL
+
+    make_account(name='Chase')
+    window.load_category(ALL)
+
+    _answer_close(monkeypatch, accept=False)
+    window._set_account_closed(window.accounts[0], True)
+
+    [stored] = accounts_service.list_accounts()
+    assert not stored['closed']
+
+
+def test_close_and_reopen_from_the_detail_pane(window, monkeypatch):
+    """Closing asks first; reopening does not."""
+    from ui.account_list import ALL
+
+    make_account(name='Chase')
+    window.load_category(ALL)
+    account = window.accounts[0]
+
+    _answer_close(monkeypatch, accept=True)
+    window._set_account_closed(account, True)
+    [stored] = accounts_service.list_accounts()
+    assert stored['closed']
+
+    from ui.account_list import CLOSED
+    window.load_category(CLOSED)
+    _answer_close(monkeypatch, accept=False)
+    window._set_account_closed(window.accounts[0], False)
+    [stored] = accounts_service.list_accounts()
+    assert not stored['closed']

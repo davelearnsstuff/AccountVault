@@ -14,12 +14,15 @@ import sqlite3
 from argon2 import PasswordHasher
 from core import categories
 from core import preferences
-from core.database import ENCRYPTED_FIELDS, connect, read_config, vacuum, write_config
+from core.database import (
+    ENCRYPTED_FIELDS, ROW_KEY, connect, read_config, vacuum, write_config,
+)
 from core.encryption import (
     ARGON2_MEMORY_COST, ARGON2_PARALLELISM, ARGON2_TIME_COST, LEGACY_KDF_PARAMS,
     VaultLockedError, cipher_for, current_kdf_params, decrypt, encrypt_with,
     field_aad, generate_salt, derive_key, install_key, release_key, is_unlocked,
-    looks_encrypted, on_key_change, safe_reencrypt, encrypt, valid_kdf_params,
+    looks_encrypted, on_key_change, pad, row_aad, safe_reencrypt, encrypt,
+    valid_kdf_params, valid_password_hash,
 )
 
 # Session state — mutable so the settings dialog can update it at runtime.
@@ -37,11 +40,34 @@ MIN_PASSWORD_LENGTH = 15
 #   1  every field bound to its column via encryption.field_aad, the work
 #      factors recorded in app_config, and a key-check token stored so a key
 #      that does not open this vault is caught at the door.
+#   2  the category column encrypted too. Custom category names are vault
+#      content, and the counts per category say what kinds of accounts exist.
+#   3  every field in the record tables bound to its row as well as its column
+#      (encryption.row_aad), and padded to a whole number of blocks
+#      (encryption.pad) so its length does not show. The app_config rows keep
+#      format 1's binding and no padding: each is one row, with nothing to swap.
 #
 # migrate_vault_format moves a vault forward at login, the one moment the
 # plaintext password is in hand. It runs before any field is read, and a login
 # it cannot finish is a login that fails.
-VAULT_FORMAT = 1
+VAULT_FORMAT = 3
+
+# The format fields started being bound to their rows and padded.
+_ROW_BOUND_SINCE = 3
+
+# The format each column started being encrypted at; 1 for any not listed.
+# Plaintext in a column is legitimate only in a vault older than this, and is
+# encrypted as the vault is upgraded. Anywhere else it was written without the
+# key (see "Fields written without the key").
+_ENCRYPTED_SINCE = {('accounts', 'category'): 2}
+
+# The format the key check arrived with. A vault claiming an older one has no
+# check yet; one claiming this or later must have one.
+_KEY_CHECK_SINCE = 1
+
+
+def _plaintext_allowed(table: str, column: str, format_version: int) -> bool:
+    return format_version < _ENCRYPTED_SINCE.get((table, column), 1)
 
 _FORMAT_KEY = 'vault_format'
 _KDF_KEY    = 'kdf_params'
@@ -55,6 +81,11 @@ _CANARY_KEY = 'key_check'
 # instead of destructive.
 _CANARY_TEXT = 'accountvault key check'
 _CANARY_AAD  = b'app_config.key_check'
+
+_INVALID_HASH_MESSAGE = (
+    "This vault's password record isn't valid, so it can't be checked safely. "
+    "Restore from a backup."
+)
 
 _MISMATCHED_KEY_MESSAGE = (
     "This vault's password and encryption salt do not belong to each other, so "
@@ -77,6 +108,8 @@ _LOCKOUT_CAP_SECONDS   = 300
 # persisted copy is wall-clock and clamped instead.
 _lockout_deadline_monotonic = 0.0
 
+# The last activity as (wall clock, monotonic), or None while locked. See
+# _idle_seconds for why it takes both.
 _last_activity = None
 
 # Held at the same cost as the key derivation: a stolen database exposes both,
@@ -144,9 +177,12 @@ def read_vault_crypto(db=None) -> tuple[int, dict]:
     return format_version, params or dict(LEGACY_KDF_PARAMS)
 
 
-def _stored_aad(table: str, column: str, format_version: int) -> bytes:
-    """The associated data a stored field carries at this format. Format 0
-    predates field binding and carries none."""
+def _stored_aad(table: str, column: str, row, format_version: int) -> bytes:
+    """The associated data a stored field in this row carries at this format.
+    Format 0 predates field binding and carries none; from format 3 the row is
+    named too."""
+    if format_version >= _ROW_BOUND_SINCE:
+        return row_aad(table, column, *(row[key] for key in ROW_KEY[table]))
     return field_aad(table, column) if format_version >= 1 else b''
 
 
@@ -162,10 +198,14 @@ def require_working_key(format_version: int):
     every way the login can fail.
 
     A format-0 vault has no token yet: migrate_vault_format is about to re-read
-    every field, which is a stronger check, and writes the token afterwards."""
+    every field, which is a stronger check, and writes the token afterwards.
+
+    Measured against the format the token arrived with, not the current one.
+    Every vault since format 1 carries one, so a vault claiming format 1 without
+    it has had it removed, and is refused rather than waved through."""
     stored = read_config(_CANARY_KEY)
     if stored is None:
-        if format_version < VAULT_FORMAT:
+        if format_version < _KEY_CHECK_SINCE:
             return
         raise VaultConfigError(
             "This vault's key check is missing, so there is no way to confirm "
@@ -193,8 +233,13 @@ def _rekey_fields(db, new_cipher, from_format: int, *,
     upgrade steps over a field that will not decrypt (it is already lost) rather
     than shutting the owner out of the whole vault. A password rotation refuses,
     raising ReencryptionError: it can wait until the field is repaired, and a
-    vault half under each password has no password that opens all of it."""
+    vault half under each password has no password that opens all of it.
+
+    Every field is written the way the current format stores it. One read from
+    before padding is padded on the way through; one already padded passes
+    through as it is, so a rotation never pads twice."""
     seen = opened = 0
+    transform = pad if from_format < _ROW_BOUND_SINCE else None
     for table, fields in ENCRYPTED_FIELDS.items():
         for row in _encrypted_rows(db, table, fields):
             updates = {}
@@ -206,10 +251,18 @@ def _rekey_fields(db, new_cipher, from_format: int, *,
                 if was_encrypted:
                     seen += 1
                 try:
+                    if not was_encrypted and not _plaintext_allowed(table, field,
+                                                                    from_format):
+                        # Only a vault from before this column was encrypted
+                        # can legitimately hold plaintext in it. Here it was
+                        # written without the key, and re-encrypting it would
+                        # make the forgery indistinguishable from data.
+                        raise ValueError('plaintext where the format encrypts')
                     updates[field] = safe_reencrypt(
                         value, new_cipher,
-                        aad=_stored_aad(table, field, from_format),
-                        new_aad=field_aad(table, field),
+                        aad=_stored_aad(table, field, row, from_format),
+                        new_aad=_stored_aad(table, field, row, VAULT_FORMAT),
+                        transform=transform,
                     )
                 except VaultLockedError:
                     # The vault closed underneath the re-key; nothing is corrupt.
@@ -255,10 +308,11 @@ def _rekeyed_config(new_cipher) -> tuple:
 
     Read under the session key, so this runs before install_key swaps it. Left
     out of the transaction, these rows would stay under a key nothing can derive
-    any more: the warning settings would read as the defaults, and a stale
-    backup seal would turn the user's automatic backups off and report them as
-    tampered with."""
+    any more: the warning settings would read as the defaults, the retirement
+    plan would be gone, and a stale backup seal would turn the user's automatic
+    backups off and report them as tampered with."""
     rows = (preferences.rekeyed_warning_settings(new_cipher),
+            preferences.rekeyed_retirement_plan(new_cipher),
             preferences.resealed_backup_config(new_cipher))
     return tuple(row for row in rows if row)
 
@@ -317,7 +371,6 @@ def setup_master_password(password: str):
         _write_crypto_config(db, encrypt(_CANARY_TEXT, _CANARY_AAD), salt, params)
 
     apply_saved_settings()
-    _migrate_plaintext_fields_quietly()
     # Clears any lockout left in app_config by an earlier vault at this path.
     record_successful_login()
     reset_activity_timer()
@@ -345,6 +398,7 @@ def verify_master_password(password: str) -> bool:
             return False
 
         stored_salt = read_config('salt', db)
+    _require_valid_hash(stored_hash)
     if stored_salt is None:
         raise VaultConfigError(
             "This vault has a master password recorded but no encryption salt, "
@@ -384,9 +438,18 @@ def verify_master_password(password: str) -> bool:
         raise VaultConfigError(str(exc)) from exc
 
     apply_saved_settings()
-    _migrate_plaintext_fields_quietly()
     reset_activity_timer()
     return True
+
+
+def _require_valid_hash(stored_hash: str):
+    """Raises VaultConfigError for a master hash whose work factors are out of
+    bounds, before anything runs them (see encryption.valid_password_hash).
+
+    Not recorded as a failed login: no password would get past it, and a
+    lockout would only send the owner away to retype a correct one."""
+    if not valid_password_hash(stored_hash):
+        raise VaultConfigError(_INVALID_HASH_MESSAGE)
 
 
 def _burn_verification_time(password: str):
@@ -416,7 +479,7 @@ def _upgrade_stored_hash(stored_hash: str, password: str):
 
 def reset_activity_timer():
     global _last_activity
-    _last_activity = time.time()
+    _last_activity = (time.time(), time.monotonic())
 
 
 def record_activity():
@@ -425,12 +488,25 @@ def record_activity():
         reset_activity_timer()
 
 
+def _idle_seconds() -> float:
+    """How long since the last activity, by whichever clock says longer.
+
+    Neither clock is enough alone. The wall clock can be set back, which would
+    stretch an unlocked session for as long as the clock was moved. The
+    monotonic clock cannot be, but on Linux and macOS it stops while the
+    computer sleeps, so a vault left open overnight would wake as if seconds
+    had passed. The larger of the two can be neither stretched nor slept
+    through; setting the clock forward only locks early."""
+    wall, monotonic = _last_activity
+    return max(time.time() - wall, time.monotonic() - monotonic)
+
+
 def seconds_until_lock() -> float:
     """Seconds of idle time remaining before the vault auto-locks.
     Returns 0 when locked or already past the timeout."""
     if not is_unlocked() or _last_activity is None:
         return 0.0
-    return max(0.0, _lock_timeout_seconds - (time.time() - _last_activity))
+    return max(0.0, _lock_timeout_seconds - _idle_seconds())
 
 
 def check_session() -> bool:
@@ -439,7 +515,7 @@ def check_session() -> bool:
     if not is_unlocked() or _last_activity is None:
         return False
 
-    if time.time() - _last_activity > _lock_timeout_seconds:
+    if _idle_seconds() > _lock_timeout_seconds:
         lock_app()
         return False
 
@@ -568,8 +644,10 @@ def reset_rate_limit_memory():
 # -----------------------------------------------------------------------------
 
 def _encrypted_rows(db, table: str, fields: list) -> list:
-    """Every row of table, with its id and its encrypted columns."""
-    col_list = ', '.join(['id'] + fields)
+    """Every row of table, with its id, the columns that name it in associated
+    data (database.ROW_KEY), and its encrypted columns."""
+    keys = [key for key in ROW_KEY[table] if key != 'id']
+    col_list = ', '.join(['id', *keys, *fields])
     return db.execute(f"SELECT {col_list} FROM {table}").fetchall()
 
 
@@ -586,42 +664,31 @@ def _write_field_updates(db, table: str, row_id, updates: dict):
 
 
 # -----------------------------------------------------------------------------
-# Legacy plaintext migration
+# Fields written without the key
+#
+# Plaintext is legitimate only in a vault older than the format that started
+# encrypting its column (_ENCRYPTED_SINCE), and migrate_vault_format encrypts it
+# on the way in. In a vault at the current format, a plaintext value
+# in an encrypted column was put there by someone who could write the file but
+# not open it. It reads as unreadable (encryption.safe_decrypt) and is never
+# encrypted, so it cannot pass for the user's own data. This counts it so the
+# UI can say so.
 # -----------------------------------------------------------------------------
 
-def migrate_plaintext_fields():
-    """Encrypts any fields in ENCRYPTED_FIELDS still stored as plaintext.
-    Idempotent, so safe to run on every login."""
-    for table, fields in ENCRYPTED_FIELDS.items():
-        # A connection per table, so one table that fails cannot roll back the
-        # others. A failed table is retried on the next login.
-        try:
-            with connect() as db:
-                for row in _encrypted_rows(db, table, fields):
-                    updates = {}
-                    for field in fields:
-                        value = row[field]
-                        if not value or looks_encrypted(value):
-                            # The value's shape, not whether it decrypts:
-                            # encrypting a broken field would wrap the token
-                            # and destroy the original.
-                            continue
-                        updates[field] = encrypt(value, field_aad(table, field))
-
-                    _write_field_updates(db, table, row['id'], updates)
-        except sqlite3.Error:
-            continue
-
-
-def _migrate_plaintext_fields_quietly():
-    """migrate_plaintext_fields, unable to fail a login that has already
-    succeeded. A locked vault still re-raises: that is a fault in the caller."""
+def foreign_field_count() -> int:
+    """How many encrypted columns hold a value that is not ciphertext. Call
+    after a login, when the vault is at the current format. 0 if the vault
+    cannot be read."""
+    count = 0
     try:
-        migrate_plaintext_fields()
-    except VaultLockedError:
-        raise
-    except Exception:
-        pass
+        with connect() as db:
+            for table, fields in ENCRYPTED_FIELDS.items():
+                for row in _encrypted_rows(db, table, fields):
+                    count += sum(1 for field in fields
+                                 if row[field] and not looks_encrypted(row[field]))
+    except sqlite3.Error:
+        return 0
+    return count
 
 
 # -----------------------------------------------------------------------------
@@ -730,6 +797,7 @@ def change_master_password(current_password: str, new_password: str) -> bool:
     if stored_hash is None:
         record_failed_login()
         return False
+    _require_valid_hash(stored_hash)
 
     try:
         ph.verify(stored_hash, current_password)

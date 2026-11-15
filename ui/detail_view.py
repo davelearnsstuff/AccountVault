@@ -15,9 +15,10 @@ from PySide6.QtWidgets import (
 )
 
 from core.categories import (
-    DUE_CYCLE_KEY, account_category, due_date_level, format_value, get_config,
-    is_favorite, lapsed_after_days, next_due_date, normalize_category,
-    updated_age_level, value_noun,
+    CONTRIBUTION_PERIOD_KEY, DUE_CYCLE_KEY, MONTHLY_BENEFIT_KEY, RECEIVING_KEY,
+    TAX_TREATMENT_KEY, account_category, due_date_level, field_shown, format_value,
+    get_config, has_balance, is_favorite, lapsed_after_days, last_four, next_due_date,
+    normalize_category, updated_age_level, value_noun,
 )
 from core.encryption import VaultLockedError
 from core.urls import normalize_url
@@ -32,6 +33,25 @@ from ui.widgets import (
 )
 
 MASK = '••••••••'
+# A masked card or account number that shows its last four: '•••• 4821'.
+_MASK_PREFIX = '••••'
+
+# The groups the detail view sorts a category's fields into, in display order.
+# Every field lands in exactly one: long text in Notes, the sign-in fields in
+# Login, figures and the dates and settings that go with them in Money, and the
+# rest (names, numbers, types) in Account.
+_ACCOUNT, _MONEY, _LOGIN, _NOTES = 'Account', 'Money', 'Login', 'Notes'
+
+# Login's fields, in the order they show: username and password on one row,
+# then where to use them.
+_LOGIN_ORDER = ('username', 'password', 'website', 'email',
+                'security_question', 'security_answer')
+
+# Money fields that are not themselves an amount or a rate.
+_MONEY_KEYS = frozenset({
+    'due_date', DUE_CYCLE_KEY, 'payoff_date', CONTRIBUTION_PERIOD_KEY,
+    TAX_TREATMENT_KEY, 'auto_pay', MONTHLY_BENEFIT_KEY, RECEIVING_KEY,
+})
 
 # Field grid width; long-text fields span the whole row instead.
 _COLUMNS = 2
@@ -83,6 +103,7 @@ class DetailView(QWidget):
 
     edit_requested = Signal(dict)
     delete_requested = Signal(dict)
+    close_requested = Signal(dict, bool)  # account, True to close
     favorite_toggled = Signal(dict, bool)   # account, the state asked for
     quick_update_requested = Signal(dict)
     touch_requested = Signal(dict)
@@ -159,11 +180,20 @@ class DetailView(QWidget):
         layout.addLayout(self._build_header(account, config))
         layout.addLayout(self._build_fields(account, config))
 
-        if any(f['key'] == 'current_balance' for f in config['fields']) and account.get('id'):
+        if has_balance(category, account) and account.get('id'):
             layout.addWidget(self._build_history(account['id'], category))
 
         layout.addStretch(1)
         self._layout.addWidget(self._content)
+
+    def mouseDoubleClickEvent(self, event):
+        """Opens the full form. Only double-clicks nothing else took arrive here:
+        a selectable value keeps selecting a word, and the history table and
+        the buttons keep theirs."""
+        if self._account is not None and event.button() == Qt.LeftButton:
+            self.edit_requested.emit(self._account)
+            return
+        super().mouseDoubleClickEvent(event)
 
     # -- header ------------------------------------------------------------
 
@@ -215,43 +245,58 @@ class DetailView(QWidget):
         actions.setSpacing(8)
 
         keys = {f['key'] for f in config['fields']}
-        has_balance, has_due = 'current_balance' in keys, 'due_date' in keys
-        if has_balance or has_due:
-            noun = value_noun(account.get('_category') or account.get('category'))
-            fields = ([noun.lower()] if has_balance else []) + (['due date'] if has_due else [])
+        category = account.get('_category') or account.get('category')
+        balance, has_due = has_balance(category, account), 'due_date' in keys
+        if balance or has_due:
+            noun = value_noun(category)
+            fields = ([noun.lower()] if balance else []) + (['due date'] if has_due else [])
             actions.addWidget(self._action(
                 'Quick Update', lambda: self.quick_update_requested.emit(account),
                 tooltip=f"Change the {' or '.join(fields)} without opening the full form",
             ))
 
         actions.addWidget(self._action(
-            'No Change', lambda: self.touch_requested.emit(account),
-            tooltip='Refresh the last-updated date and record a balance snapshot',
+            'Mark Checked', lambda: self.touch_requested.emit(account),
+            tooltip=('Nothing has changed: set Last Updated to today and record the '
+                     'current balance'),
         ))
-        actions.addWidget(self._action(
+        edit = self._action(
             'Edit', lambda: self.edit_requested.emit(account),
-            tooltip='Open the full form to change any field on this account',
-        ))
+            tooltip=('Open the full form to change any field on this account. '
+                     'Double-clicking the pane does the same.'),
+        )
+        # A little wider than its label: the action that reaches every field.
+        edit.setObjectName('SmallWide')
+        actions.addWidget(edit)
+
+        # The ones used rarely, past the stretch, away from the everyday
+        # actions. An open account offers Close, not Delete: only a closed one
+        # can be deleted, so a Delete there would only ever have offered to
+        # close it.
+        actions.addStretch(1)
         actions.addWidget(self._action(
             'Export', lambda: self._export_account(account, config),
             tooltip='Save this account to a CSV file — details, history, or both',
         ))
-
-        # Always on screen, disabled until the account is closed, with a tooltip
-        # that says why.
-        closed = bool(account.get('closed'))
-        delete = self._action(
-            'Delete', lambda: self.delete_requested.emit(account),
-            tooltip=('Delete this account and its history. There is a short '
-                     'window to undo it afterwards.') if closed else
-                    ('Only closed accounts can be deleted. Open Edit and tick '
-                     '"Closed" first.'),
-        )
-        delete.setObjectName('Danger')
-        delete.setEnabled(closed)
-        actions.addWidget(delete)
-
-        actions.addStretch(1)
+        if account.get('closed'):
+            actions.addWidget(self._action(
+                'Reopen', lambda: self.close_requested.emit(account, False),
+                tooltip='Move this account back to its category and the dashboard',
+            ))
+            delete = self._action(
+                'Delete', lambda: self.delete_requested.emit(account),
+                tooltip=('Delete this account and its history. There is a short '
+                         'window to undo it afterwards.'),
+            )
+            # Small's size, red only on hover.
+            delete.setObjectName('SmallDanger')
+            actions.addWidget(delete)
+        else:
+            actions.addWidget(self._action(
+                'Close Account', lambda: self.close_requested.emit(account, True),
+                tooltip=('Move this account to the Closed tab and out of the '
+                         'dashboard. It can be reopened or deleted from there.'),
+            ))
 
         header = QVBoxLayout()
         header.setSpacing(10)
@@ -278,31 +323,63 @@ class DetailView(QWidget):
 
     # -- fields ------------------------------------------------------------
 
-    def _build_fields(self, account: dict, config: dict) -> QGridLayout:
+    def _build_fields(self, account: dict, config: dict) -> QVBoxLayout:
+        """The account's fields under their group headings, two to a row. A
+        group with nothing to show is left out, heading and all."""
+        sections = QVBoxLayout()
+        sections.setContentsMargins(0, 0, 0, 0)
+        sections.setSpacing(18)
+
+        cycle = account.get(DUE_CYCLE_KEY)
+        category = account_category(account)
+        for title, fields in self._sections(config):
+            shown = []
+            for field in fields:
+                # A tax treatment left on an account whose type no longer asks
+                # for one, say, until its next save clears it.
+                if not field_shown(category, field, account):
+                    continue
+                value = account.get(field['key'])
+                # A recurring due date shows the occurrence still ahead, not the
+                # anchor on file.
+                if field['key'] == 'due_date':
+                    value = next_due_date(value, cycle) or value
+                # Blank optional fields are skipped; a blank required name still
+                # shows, so the gap is visible.
+                if not field.get('required') and (value is None or value == ''):
+                    continue
+                shown.append((field, value))
+            if not shown:
+                continue
+
+            heading = plain_label(title)
+            heading.setObjectName('DetailSection')
+            section = QVBoxLayout()
+            section.setSpacing(10)
+            section.addWidget(heading)
+            section.addLayout(self._field_grid(shown, title))
+            sections.addLayout(section)
+
+        return sections
+
+    def _field_grid(self, shown: list, title: str) -> QGridLayout:
+        """(field, value) pairs two to a row; long text takes a row of its own.
+        A field named the same as its group's heading (Notes under Notes) goes
+        without its own caption."""
         layout = QGridLayout()
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setHorizontalSpacing(28)
+        layout.setHorizontalSpacing(_GRID_GAP)
         layout.setVerticalSpacing(12)
         layout.setColumnStretch(0, 1)
         layout.setColumnStretch(1, 1)
 
         row, column = 0, 0
-        cycle = account.get(DUE_CYCLE_KEY)
-        for field in self._ordered_fields(config):
-            value = account.get(field['key'])
-            # A recurring due date shows the occurrence still ahead, not the
-            # anchor on file.
-            if field['key'] == 'due_date':
-                value = next_due_date(value, cycle) or value
-            # Blank optional fields are skipped; a blank required name still
-            # shows, so the gap is visible.
-            if not field.get('required') and (value is None or value == ''):
-                continue
-
+        for field, value in shown:
             # Long text gets its own full-width row, and is told so, because the
             # value is sized differently there.
             full_width = bool(field.get('type') == 'textarea' or field.get('multiline'))
-            widget = self._build_field(field, value, full_width)
+            widget = self._build_field(field, value, full_width,
+                                       caption=field['label'] != title)
             if full_width:
                 if column:
                     row, column = row + 1, 0
@@ -314,26 +391,33 @@ class DetailView(QWidget):
             column += 1
             if column == _COLUMNS:
                 row, column = row + 1, 0
-
         return layout
 
     @staticmethod
-    def _ordered_fields(config: dict) -> list:
-        """Website sits immediately after the name, whatever order the category
-        declares, so the link is always in the same spot."""
-        fields = list(config['fields'])
-        website = next((f for f in fields if f['key'] == 'website'), None)
-        if website is None:
-            return fields
-        fields.remove(website)
-        after_name = next(
-            (i for i, f in enumerate(fields) if f['key'] == config['name_field']), -1
-        )
-        fields.insert(after_name + 1, website)
-        return fields
+    def _sections(config: dict) -> list[tuple[str, list]]:
+        """(heading, fields) for each group, in display order. Within a group
+        the category's own order holds, except that Login follows _LOGIN_ORDER
+        and Money leads with the balance."""
+        groups = {_ACCOUNT: [], _MONEY: [], _LOGIN: [], _NOTES: []}
+        for field in config['fields']:
+            key = field['key']
+            if field.get('type') == 'textarea' or field.get('multiline'):
+                groups[_NOTES].append(field)
+            elif key in _LOGIN_ORDER:
+                groups[_LOGIN].append(field)
+            elif field.get('money') or field.get('percent') or key in _MONEY_KEYS:
+                groups[_MONEY].append(field)
+            else:
+                groups[_ACCOUNT].append(field)
+        groups[_LOGIN].sort(key=lambda f: _LOGIN_ORDER.index(f['key']))
+        # Stable, so everything after the balance keeps its declared order.
+        groups[_MONEY].sort(key=lambda f: f['key'] != 'current_balance')
+        return list(groups.items())
 
-    def _build_field(self, field: dict, value, full_width: bool = False) -> QWidget:
-        """Builds one field's label / value block."""
+    def _build_field(self, field: dict, value, full_width: bool = False,
+                     caption: bool = True) -> QWidget:
+        """Builds one field's label / value block. caption False leaves the
+        label off, keeping any buttons that sit beside it."""
         container = QWidget()
         layout = QVBoxLayout(container)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -341,7 +425,8 @@ class DetailView(QWidget):
 
         label_row = QHBoxLayout()
         label_row.setSpacing(8)
-        label_row.addWidget(field_label(field['label']))
+        if caption:
+            label_row.addWidget(field_label(field['label']))
 
         row = QHBoxLayout()
         row.setSpacing(8)
@@ -454,20 +539,25 @@ class DetailView(QWidget):
         a sliver the revealed secret then has to wrap inside. It also keeps the
         on-screen width from hinting at the secret's length."""
         real = '' if value is None else str(value)
-        display = plain_label(MASK if real else '—')
+        # A card or account number keeps its last four on show, the way a
+        # statement prints it, so two cards can be told apart without Show.
+        ending = last_four(real) if field.get('last4') else None
+        masked = f"{_MASK_PREFIX} {ending}" if ending else MASK
+        hidden = f"hidden, ending {ending}" if ending else 'hidden'
+        display = plain_label(masked if real else '—')
         display.setObjectName('MaskedValue')
         display.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        display.setAccessibleName(f"{field['label']}: hidden" if real
+        display.setAccessibleName(f"{field['label']}: {hidden}" if real
                                   else f"{field['label']}: empty")
 
         self._wrap_label(display)
 
         def on_change(shown: bool):
             display.setText(format_value(real, field) if shown
-                            else (MASK if real else '—'))
+                            else (masked if real else '—'))
             display.setObjectName('' if shown else 'MaskedValue')
             display.setAccessibleName(
-                f"{field['label']}: {'shown' if shown else 'hidden'}" if real
+                f"{field['label']}: {'shown' if shown else hidden}" if real
                 else f"{field['label']}: empty"
             )
             # Re-polish so the object-name-driven style change takes effect.
@@ -512,8 +602,8 @@ class DetailView(QWidget):
 
         category = account.get('_category') or account.get('category')
         noun = value_noun(category)
-        # Categories with no balance field have no history to offer.
-        has_history = any(f['key'] == 'current_balance' for f in config['fields'])
+        # Records with no balance have no history to offer.
+        has_history = has_balance(category, account)
 
         dialog = ExportAccountDialog(self, noun, has_history)
         if dialog.exec() != ExportAccountDialog.Accepted:

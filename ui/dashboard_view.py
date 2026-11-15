@@ -21,9 +21,11 @@ from services.dashboard import (
 from ui.ranges import (
     DEFAULT_RANGE, basis_text, change_label, month_name, range_buttons,
 )
+from ui.retirement_charts import MixBar
 from ui.theme import category_color, palette
 from ui.widgets import (
-    build_series_chart, clear_layout, dot_pixmap, plain_label, plain_text, selectable,
+    build_series_chart, clear_layout, dot_pixmap, field_label, plain_label, plain_text,
+    selectable,
 )
 
 _CARD_COLUMNS = 2
@@ -35,6 +37,10 @@ _INVESTING = 'Investing vs. Income'
 
 # Figures in the dashboard's tables, as in the balance history table.
 _FIGURE_ALIGN = Qt.AlignRight | Qt.AlignVCenter
+
+# How far back the net worth headline's change line looks, whatever range the
+# Trends buttons are on: a year is the comparison people ask for.
+_HEADLINE_MONTHS = 12
 
 # How far an account sits in from the category it is listed under. Spaces, as
 # a table item has no indent of its own; copying strips them.
@@ -347,7 +353,7 @@ class DashboardView(QWidget):
 
         # Current figures, then the trends the range buttons apply to, then the
         # other current figures.
-        balances = self._balance_section(balance_sheet(data))
+        balances = self._balance_section(balance_sheet(data), data)
         if balances:
             self._add_section(_BALANCES, balances)
         # A single month has no range to choose.
@@ -361,7 +367,7 @@ class DashboardView(QWidget):
 
     # -- sections ----------------------------------------------------------
 
-    def _balance_section(self, sheet) -> QWidget | None:
+    def _balance_section(self, sheet, data) -> QWidget | None:
         """Each side as a table of its categories and their total, then the
         net worth the two totals make. A side with nothing on it is left out.
         Under each category, the accounts its figure is made of: clicking a
@@ -397,14 +403,79 @@ class DashboardView(QWidget):
             table.horizontalHeader().setMinimumSectionSize(_GUTTER_WIDTH)
             table.setColumnWidth(0, _GUTTER_WIDTH)
 
-        card = _Card()
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(16, 14, 16, 14)
-        layout.setSpacing(12)
+        column = QVBoxLayout()
+        column.setSpacing(12)
         for table in tables:
             _fit(table)
-            layout.addWidget(table, 0, Qt.AlignLeft)
+            column.addWidget(table, 0, Qt.AlignLeft)
+        column.addStretch(1)
+
+        # The tables beside the headline rather than over the whole width:
+        # they are as wide as their figures, which left half the card empty.
+        card = _Card()
+        layout = QHBoxLayout(card)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(20)
+        layout.addLayout(column)
+        # Shares the room left over with the stretch after it, so it sits
+        # beside the tables at a readable width rather than across the card.
+        layout.addWidget(self._headline(sheet, data), 1, Qt.AlignTop)
+        layout.addStretch(1)
         return _section(_BALANCES, card)
+
+    def _headline(self, sheet, data) -> QWidget:
+        """Net worth in large type with its change over the past year, then
+        what each side is made of as a bar in the categories' colours."""
+        theme = palette(self._theme)
+        net_worth = sheet['net_worth']
+
+        figure = selectable(QLabel(format_money(net_worth)))
+        figure.setObjectName('HeroValue')
+        if net_worth < 0:
+            figure.setStyleSheet(f"color: {theme['danger']};")
+
+        box = QVBoxLayout()
+        box.setSpacing(6)
+        box.addWidget(field_label(_NET_WORTH))
+        box.addWidget(figure)
+
+        months = trailing_window(self._months(), _HEADLINE_MONTHS)
+        window = trailing_window(data['net_worth'], _HEADLINE_MONTHS)
+        change = _change_label(window, months, _HEADLINE_MONTHS, higher_is_better=True)
+        if change:
+            box.addWidget(change)
+
+        assets = sheet['assets']['total']
+        owed = sheet['liabilities']['total']
+        for label, side in (('What you own', sheet['assets']),
+                            ('What you owe', sheet['liabilities'])):
+            rows = [row for row in side['rows'] if row['value'] > 0]
+            if not rows:
+                continue
+            box.addSpacing(10)
+            heading = QHBoxLayout()
+            heading.addWidget(field_label(label), 1)
+            heading.addWidget(selectable(plain_label(format_money(side['total']))))
+            box.addLayout(heading)
+            box.addWidget(MixBar(
+                [(category_color(row['category']), row['value']) for row in rows],
+                height=14,
+                tooltips=[plain_text(f"{row['category']}: {format_money(row['value'])}")
+                          for row in rows],
+            ))
+        if assets > 0 and owed > 0:
+            box.addSpacing(4)
+            ratio = _note(f"You owe {_share_text(owed / assets)} of what you own.")
+            ratio.setWordWrap(True)
+            box.addWidget(ratio)
+
+        # Narrow enough at its least to sit beside the tables in the smallest
+        # window without the page scrolling sideways.
+        holder = QWidget()
+        holder.setMinimumWidth(200)
+        holder.setMaximumWidth(460)
+        holder.setLayout(box)
+        return holder
 
     def _side_table(self, title: str, side: dict, columns: list[str]) -> QTableWidget:
         """One side's table: a row per category, with its accounts folded

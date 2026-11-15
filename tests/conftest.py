@@ -95,7 +95,7 @@ def vault(tmp_path, monkeypatch, cheap_argon2):
     asserting against filenames the app never produces.
     """
     monkeypatch.setattr(database, 'DB_PATH', tmp_path / 'vault.vault')
-    monkeypatch.setattr(database, 'restrict_to_owner', lambda path: None)
+    monkeypatch.setattr(database, 'restrict_to_owner', lambda path: True)
     database.init_db()
     auth.setup_master_password(MASTER)
     yield
@@ -142,12 +142,44 @@ def raw_column(account_id: int, column: str):
 def decrypted_column(account_id: int, column: str) -> str:
     """What a stored column actually holds, opened the way the app opens it.
 
-    Every field is bound to the column it lives in, so a bare decrypt() of what
-    raw_column returns raises InvalidTag — that is the binding working, not the
-    value being wrong. Tests that want the plaintext want this.
+    Every field is bound to its column and its row and is padded, so a bare
+    decrypt() of what raw_column returns raises InvalidTag — that is the binding
+    working, not the value being wrong. Tests that want the plaintext want this.
     """
-    return encryption.decrypt(raw_column(account_id, column),
-                              encryption.field_aad('accounts', column))
+    return encryption.decrypt_field(raw_column(account_id, column),
+                                    accounts_service.account_aad(column, account_id))
+
+
+def rewrite_as_format(version: int):
+    """Rewrites the open vault the way format 1 or 2 stored it, and records that
+    format: fields bound to their column only and unpadded, with the category in
+    the clear at format 1. The key, salt and key check stay as they are, which
+    is all those formats differ in from this one. Leaves the vault locked, for a
+    test of what the next login does."""
+    assert version in (1, 2)
+    with database.connect() as db:
+        for table, fields in database.ENCRYPTED_FIELDS.items():
+            key_columns = [k for k in database.ROW_KEY[table] if k != 'id']
+            for row in db.execute(
+                    f"SELECT {', '.join(['id', *key_columns, *fields])} FROM {table}"):
+                updates = {}
+                for field in fields:
+                    if not row[field]:
+                        continue
+                    aad = encryption.row_aad(table, field,
+                                             *(row[k] for k in database.ROW_KEY[table]))
+                    value = encryption.decrypt_field(row[field], aad)
+                    if version == 1 and (table, field) == ('accounts', 'category'):
+                        updates[field] = value
+                    else:
+                        updates[field] = encryption.encrypt(
+                            value, encryption.field_aad(table, field))
+                for field, value in updates.items():
+                    db.execute(f"UPDATE {table} SET {field} = ? WHERE id = ?",
+                               (value, row['id']))
+    database.write_config(auth._FORMAT_KEY, str(version))
+    auth.lock_app()
+    accounts_service.invalidate_cache()
 
 
 # Login rate-limiting bookkeeping. Excluded from snapshot_rows because it is

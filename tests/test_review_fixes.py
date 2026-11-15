@@ -343,7 +343,7 @@ def test_a_windows_lock_locks_the_vault(window):
 
     assert not auth.is_unlocked()
     assert window.screens.currentWidget() is window.login_screen
-    assert 'Windows was locked' in window.login_screen.error.text()
+    assert 'computer was locked' in window.login_screen.error.text()
 
 
 # -- notes are not searched ------------------------------------------------------------

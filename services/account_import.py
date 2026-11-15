@@ -23,7 +23,8 @@ import re
 from collections import Counter
 
 from core.categories import (
-    CATEGORY_CONFIG, FAVORITE_KEY, GENERIC_CONFIG, normalize_category,
+    CATEGORY_CONFIG, CHECKBOX_KEYS, CHECKED, FAVORITE_KEY, GENERIC_CONFIG,
+    normalize_category,
 )
 from core.encryption import is_unreadable
 from services import export_io
@@ -334,6 +335,12 @@ def prepare(text: str, existing=None, default_category: str = 'Websites') -> dic
                 # An unreadable flag leaves the account open and unpinned.
                 if read_boolean(value):
                     row[field] = True
+                continue
+            if field in CHECKBOX_KEYS:
+                # Stored the one way the form writes it, whatever the file
+                # said; an unreadable cell leaves the box unticked.
+                if read_boolean(value):
+                    row[field] = CHECKED
                 continue
             if value != '':
                 row[field] = value

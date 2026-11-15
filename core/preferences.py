@@ -4,8 +4,8 @@
 #
 # Nearly all of it is stored in app_config, unencrypted and readable while the
 # vault is locked, because the window has to be built and themed before anyone
-# logs in. Two exceptions: the backup rows are sealed, and the warning settings
-# are encrypted — see their sections below. The vault's crypto rows
+# logs in. Exceptions: the backup rows are sealed, and the warning settings and
+# the retirement plan are encrypted — see their sections below. The vault's crypto rows
 # (master_hash, salt, kdf_params, vault_format, key_check) belong to auth.py.
 #
 # Named "preferences" rather than "settings" because `settings` is the name of
@@ -19,6 +19,7 @@ import sqlite3
 
 from core import categories
 from core import encryption
+from core import retirement
 from core.database import connect, read_config, write_config
 
 # -----------------------------------------------------------------------------
@@ -39,6 +40,12 @@ VALID_FONT_SIZES        = tuple(key for key, _ in FONT_SIZE_CHOICES)
 # 'compact' folds the balance, updated and due captions onto one line;
 # 'comfortable' gives each its own.
 VALID_LIST_DENSITIES    = ('compact', 'comfortable')
+# The tab the window opens on after login. Only the fixed tabs: a category's
+# name is vault content, and this row is plaintext. In Settings' order.
+START_TAB_CHOICES       = (('all', 'All'), ('attention', 'Needs Attention'),
+                           ('favorites', 'Favorites'), ('dashboard', 'Dashboard'),
+                           ('retirement', 'Retirement'))
+VALID_START_TABS        = tuple(key for key, _ in START_TAB_CHOICES)
 
 VALID_BACKUP_FREQUENCIES = ('daily', 'weekly', 'monthly')
 # How long backups are kept, in months. 0 means forever.
@@ -55,15 +62,24 @@ _SETTING_DEFAULTS = {
     'theme':                       'dark',
     'font_size':                   'default',
     'list_density':                'compact',
+    'start_tab':                   'all',
     'auto_backup_enabled':         0,
     'backup_frequency':            'weekly',
     'backup_retention_months':     12,
     'backup_location':             BACKUP_LOCATION_DEFAULT,
+    # Off: the windows are kept out of screenshots, recordings, screen sharing
+    # and Windows Recall. See ui/screen_capture.py.
+    'allow_screen_capture':        0,
 }
 
 _INT_SETTINGS = ('lock_timeout_minutes', 'clipboard_clear_seconds',
                  'shutdown_after_lock_minutes', 'auto_backup_enabled',
-                 'backup_retention_months')
+                 'backup_retention_months', 'allow_screen_capture')
+
+
+def default_setting(key: str):
+    """A setting's built-in default."""
+    return _SETTING_DEFAULTS[key]
 
 
 def get_settings() -> dict:
@@ -90,11 +106,13 @@ def get_settings() -> dict:
                        ('clipboard_clear_seconds',     VALID_CLIPBOARD_CLEARS),
                        ('shutdown_after_lock_minutes', VALID_SHUTDOWN_TIMEOUTS),
                        ('auto_backup_enabled',         (0, 1)),
+                       ('allow_screen_capture',        (0, 1)),
                        ('backup_frequency',            VALID_BACKUP_FREQUENCIES),
                        ('backup_retention_months',     VALID_BACKUP_RETENTION_MONTHS),
                        ('theme',                       VALID_THEMES),
                        ('font_size',                   VALID_FONT_SIZES),
-                       ('list_density',                VALID_LIST_DENSITIES)):
+                       ('list_density',                VALID_LIST_DENSITIES),
+                       ('start_tab',                   VALID_START_TABS)):
         if settings[key] not in valid:
             settings[key] = _SETTING_DEFAULTS[key]
 
@@ -109,7 +127,8 @@ def save_settings(lock_timeout_minutes: int, clipboard_clear_seconds: int,
                   list_density: str = 'compact', auto_backup_enabled: int = 0,
                   backup_frequency: str = 'weekly',
                   backup_retention_months: int = 12,
-                  backup_location: str = BACKUP_LOCATION_DEFAULT):
+                  backup_location: str = BACKUP_LOCATION_DEFAULT,
+                  allow_screen_capture: int = 0, start_tab: str = 'all'):
     """Validates and persists all settings.
 
     Persists only; callers follow with auth.apply_saved_settings to put the lock
@@ -134,6 +153,10 @@ def save_settings(lock_timeout_minutes: int, clipboard_clear_seconds: int,
         raise ValueError("Invalid backup retention value")
     if not isinstance(backup_location, str) or not backup_location.strip():
         raise ValueError("Invalid backup location")
+    if int(allow_screen_capture) not in (0, 1):
+        raise ValueError("Invalid screen capture value")
+    if start_tab not in VALID_START_TABS:
+        raise ValueError("Invalid start tab value")
 
     pairs = [
         ('lock_timeout_minutes',        str(lock_timeout_minutes)),
@@ -146,6 +169,8 @@ def save_settings(lock_timeout_minutes: int, clipboard_clear_seconds: int,
         ('backup_frequency',            backup_frequency),
         ('backup_retention_months',     str(backup_retention_months)),
         ('backup_location',             backup_location.strip()),
+        ('allow_screen_capture',        str(int(allow_screen_capture))),
+        ('start_tab',                   start_tab),
     ]
 
     def write():
@@ -182,6 +207,10 @@ _BACKUP_STATE_KEYS = ('last_backup_date', 'last_backup_outcome', 'backup_files',
 # encrypted under the session key. The rows stay readable (a locked window still
 # needs them), but only someone who can open the vault can produce a seal.
 #
+# The security settings (SECURITY_SETTING_KEYS) are sealed with them, for the
+# same reason: they are instructions too, about how long an open vault stays
+# open and who may see it.
+#
 # Failure is closed: no valid seal means the configuration is reset to the
 # defaults — automatic backups off — and resealed. Adopting what is there would
 # defeat the control, since deleting the seal row is no harder than forging the
@@ -193,21 +222,31 @@ _BACKUP_AUTH_KEY = 'backup_auth'
 
 # Every row the backup run reads. A key missed here is one an attacker gets to
 # write, so check this against _SETTING_DEFAULTS whenever either changes.
-_AUTHENTICATED_BACKUP_KEYS = (
+_BACKUP_SEALED_KEYS = (
     'auto_backup_enabled', 'backup_frequency', 'backup_retention_months',
     'backup_location', 'backup_confirmed_dir', *_BACKUP_STATE_KEYS,
 )
+
+# The settings that decide how exposed an open vault is. Sealed with the backup
+# rows, so someone who can edit the file cannot quietly lengthen the lock or the
+# clipboard, keep the app running after a lock, or let screenshots in. The
+# appearance settings stay unsealed: they only change how the window looks.
+SECURITY_SETTING_KEYS = (
+    'lock_timeout_minutes', 'clipboard_clear_seconds',
+    'shutdown_after_lock_minutes', 'allow_screen_capture',
+)
+
+_AUTHENTICATED_BACKUP_KEYS = (*_BACKUP_SEALED_KEYS, *SECURITY_SETTING_KEYS)
 
 
 def _backup_aad() -> bytes:
     return encryption.field_aad('app_config', _BACKUP_AUTH_KEY)
 
 
-def _backup_fingerprint() -> str:
-    """Canonical text over every backup row. None and '' fold together: a row
+def _backup_fingerprint(keys=_AUTHENTICATED_BACKUP_KEYS) -> str:
+    """Canonical text over every sealed row. None and '' fold together: a row
     never written and one written empty mean the same thing here."""
-    return json.dumps({key: (_read_config(key) or '')
-                       for key in _AUTHENTICATED_BACKUP_KEYS},
+    return json.dumps({key: (_read_config(key) or '') for key in keys},
                       sort_keys=True, separators=(',', ':'))
 
 
@@ -225,15 +264,36 @@ def seal_backup_config() -> bool:
     return True
 
 
-def backup_config_is_sealed() -> bool:
-    """Whether the stored backup rows carry this vault's own seal."""
+def _seal_covers() -> str | None:
+    """'current' when the seal vouches for every sealed row as it stands,
+    'backup-only' when it is a seal from before the security settings were
+    sealed and vouches for the backup rows, None otherwise. Writes nothing."""
     stored = _read_config(_BACKUP_AUTH_KEY)
     if not stored:
-        return False
+        return None
     try:
-        return encryption.decrypt(stored, _backup_aad()) == _backup_fingerprint()
+        sealed = encryption.decrypt(stored, _backup_aad())
     except Exception:
-        return False
+        return None
+    if sealed == _backup_fingerprint():
+        return 'current'
+    if sealed == _backup_fingerprint(_BACKUP_SEALED_KEYS):
+        return 'backup-only'
+    return None
+
+
+def backup_config_is_sealed() -> bool:
+    """Whether the stored sealed rows carry this vault's own seal.
+
+    A seal from before the security settings joined it is accepted once and
+    reissued over the full set, so the upgrade costs nobody their backup
+    settings. It cannot be replayed afterwards: the format 3 upgrade re-keys
+    every vault, and resealed_backup_config reissues the seal over the full set
+    under the new key, so any older seal is under a key nothing derives."""
+    covers = _seal_covers()
+    if covers == 'backup-only':
+        return seal_backup_config()
+    return covers == 'current'
 
 
 def backup_config_is_pristine() -> bool:
@@ -268,17 +328,21 @@ def resealed_backup_config(cipher) -> tuple[str, str] | None:
     """The seal row re-issued under cipher, as a (key, value) pair for a re-key
     to commit alongside the fields it rewrites. None when the current rows do
     not carry a valid seal — a stale seal stays stale, so check_seal still
-    catches whatever it was protecting against."""
-    if not backup_config_is_sealed():
+    catches whatever it was protecting against.
+
+    Always reissued over the full set, so a backup-only seal does not survive
+    a re-key. Writes nothing itself: it runs before the re-key's transaction."""
+    if _seal_covers() is None:
         return None
     token = encryption.encrypt_with(cipher, _backup_fingerprint().encode(), _backup_aad())
     return _BACKUP_AUTH_KEY, token
 
 
 def reset_backup_config():
-    """Puts the backup rows back to their defaults and seals them. The record of
-    written files is emptied so retention has nothing it believes it may
-    delete."""
+    """Puts every sealed row back to its default — the backup rows and the
+    security settings — and seals them. The record of written files is emptied
+    so retention has nothing it believes it may delete. Callers re-apply the
+    settings afterwards (auth.apply_saved_settings)."""
     pairs = [(key, str(_SETTING_DEFAULTS[key]))
              for key in _AUTHENTICATED_BACKUP_KEYS if key in _SETTING_DEFAULTS]
     pairs += [(key, '') for key in _AUTHENTICATED_BACKUP_KEYS
@@ -433,6 +497,68 @@ def rekeyed_warning_settings(cipher) -> tuple[str, str] | None:
 
 
 # -----------------------------------------------------------------------------
+# Retirement plan
+#
+# The planner's details and typed-over savings figures, as JSON in one row; see
+# "The stored plan" in retirement.py for the shape. Vault content (birth dates,
+# spending, Social Security), so encrypted with the vault key and bound to its
+# row, the way the warning settings are. It travels with the vault file, so a
+# backup carries it and another vault never sees it.
+# -----------------------------------------------------------------------------
+
+_RETIREMENT_KEY = 'retirement_plan'
+
+
+def _retirement_aad() -> bytes:
+    return encryption.field_aad('app_config', _RETIREMENT_KEY)
+
+
+def get_retirement_plan() -> dict | None:
+    """The saved plan, or None when there is none, or it will not decrypt.
+
+    Unlike the warning settings, a locked vault raises VaultLockedError rather
+    than reading as no plan: a caller that took None for "nothing saved" would
+    go on to save an empty plan over the real one."""
+    stored = read_config(_RETIREMENT_KEY)
+    if not stored:
+        return None
+    try:
+        plain = encryption.decrypt(stored, _retirement_aad())
+    except encryption.VaultLockedError:
+        raise
+    except Exception:
+        return None
+    try:
+        return retirement.validate_plan(json.loads(plain))
+    except ValueError:
+        return None
+
+
+def save_retirement_plan(plan: dict) -> dict:
+    """Validates and stores the plan, encrypted. Returns what was stored.
+    VaultLockedError when there is no key."""
+    clean = retirement.validate_plan(plan)
+    token = encryption.encrypt(json.dumps(clean, sort_keys=True), _retirement_aad())
+    write_config(_RETIREMENT_KEY, token)
+    return clean
+
+
+def rekeyed_retirement_plan(cipher) -> tuple[str, str] | None:
+    """The plan's row re-encrypted under cipher, for a re-key to commit with
+    the fields it rewrites. None when there is no row; emptied when it will not
+    decrypt, since nothing could open it after the re-key anyway."""
+    stored = _read_config(_RETIREMENT_KEY)
+    if not stored:
+        return None
+    aad = _retirement_aad()
+    try:
+        plain = encryption.decrypt(stored, aad)
+    except Exception:
+        return _RETIREMENT_KEY, ''
+    return _RETIREMENT_KEY, encryption.encrypt_with(cipher, plain.encode(), aad)
+
+
+# -----------------------------------------------------------------------------
 # View state
 #
 # Stored per item rather than through save_settings, because these change as
@@ -454,6 +580,29 @@ def _write_config(key: str, value: str):
         write_config(key, value)
     except sqlite3.Error:
         pass
+
+
+# -----------------------------------------------------------------------------
+# Demo vaults
+#
+# A vault tools/make_demo_vault.py built. Its password is published with the
+# app, so the window says so for as long as the vault is in use, in case
+# someone starts keeping real accounts in it. Unsealed: the flag only ever adds
+# a warning, and removing it costs nobody anything they had.
+# -----------------------------------------------------------------------------
+
+_DEMO_KEY = 'demo_vault'
+
+DEMO_NOTICE = ("This is a demo vault. Its accounts are made up, and its password "
+               "is published with AccountVault, so don't keep real accounts in it.")
+
+
+def is_demo_vault() -> bool:
+    return _read_config(_DEMO_KEY) == '1'
+
+
+def mark_demo_vault():
+    _write_config(_DEMO_KEY, '1')
 
 
 VALID_SORT_KEYS = ('name', 'due_date', 'last_updated')

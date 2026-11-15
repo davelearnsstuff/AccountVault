@@ -1,13 +1,16 @@
 # -----------------------------------------------------------------------------
 # tests/test_migration.py
-# The legacy plaintext migration that runs on every login.
+# Plaintext in a vault that is already at the current format.
 #
-# It walks every encrypted column in the vault and rewrites what it finds, which
-# makes it the single most destructive thing that happens automatically. The
-# cases that matter are the ones where it must do *nothing*: a field already
-# encrypted, a field encrypted but broken, and a run that fails partway.
+# Plaintext is legitimate only in a format-0 vault, and the login upgrade
+# encrypts it (see test_vault_format). Anywhere else it was written by someone
+# who could change the file but not open it. These tests hold the line that it
+# is never shown as the value and never encrypted, because once encrypted under
+# the user's key a forged website or routing number is indistinguishable from
+# the user's own.
 # -----------------------------------------------------------------------------
 
+import json
 import sqlite3
 
 import pytest
@@ -16,174 +19,129 @@ from core import auth
 from core import database
 from core import encryption
 from conftest import (
-    MASTER, corrupt_column, decrypted_column, make_account, raw_column,
-    snapshot_rows,
+    MASTER, NEW_MASTER, make_account, raw_column, snapshot_rows,
 )
+from services import accounts as accounts_service
 
 
 def store_plaintext(account_id: int, column: str, value: str):
-    """Writes a column in the clear, as a version that did not encrypt it would."""
+    """Writes a column in the clear, as someone editing the file would."""
     with database.connect() as db:
         db.execute(f"UPDATE accounts SET {column} = ? WHERE id = ?", (value, account_id))
+    accounts_service.invalidate_cache()
 
 
-# -- what it is for -------------------------------------------------------------
+# -- it is not believed ---------------------------------------------------------
 
-def test_a_plaintext_field_is_encrypted_in_place(vault):
-    account = make_account(name='Legacy', notes='readable on disk')
-    store_plaintext(account['id'], 'notes', 'readable on disk')
-    assert raw_column(account['id'], 'notes') == 'readable on disk'
+def test_a_plaintext_field_reads_as_unreadable(vault):
+    account = make_account(name='Bank', website='bank.example')
+    store_plaintext(account['id'], 'website', 'https://evil.example')
 
-    auth.migrate_plaintext_fields()
-
-    on_disk = raw_column(account['id'], 'notes')
-    assert on_disk != 'readable on disk'
-    assert encryption.looks_encrypted(on_disk)
-    assert decrypted_column(account['id'], 'notes') == 'readable on disk'
+    assert encryption.is_unreadable(accounts_service.get_account(account['id'])['website'])
+    listed = {a['id']: a for a in accounts_service.list_accounts()}
+    assert encryption.is_unreadable(listed[account['id']]['website'])
 
 
-def test_every_encrypted_column_is_walked(vault):
-    account = make_account(name='Legacy')
-    for column in ('name', 'username', 'password', 'website', 'notes'):
-        store_plaintext(account['id'], column, f'plain {column}')
+def test_plaintext_extra_data_contributes_nothing(vault):
+    """The routing-number case: a plaintext blob is not read as fields."""
+    account = make_account(name='Bank', category='Banking')
+    store_plaintext(account['id'], 'extra_data',
+                    json.dumps({'routing_number': '999999999'}))
 
-    auth.migrate_plaintext_fields()
-
-    for column in ('name', 'username', 'password', 'website', 'notes'):
-        assert decrypted_column(account['id'], column) == f'plain {column}'
+    assert 'routing_number' not in accounts_service.get_account(account['id'])
 
 
-def test_balance_history_is_migrated_too(vault):
-    from services import accounts as accounts_service  # noqa: F401 — used below
-    account = make_account(name='Legacy', current_balance='100')
-    accounts_service.add_balance_entry(account['id'], '250', '2024-01-15')
-
+def test_a_forged_row_shows_no_forged_values(vault):
     with database.connect() as db:
-        entry_id = db.execute("SELECT id FROM balance_history").fetchone()['id']
-        db.execute("UPDATE balance_history SET balance = ? WHERE id = ?", ('250', entry_id))
+        db.execute("INSERT INTO accounts (category, name, website) VALUES (?, ?, ?)",
+                   ('Banking', 'Chase', 'https://evil.example'))
+    accounts_service.invalidate_cache()
 
-    auth.migrate_plaintext_fields()
-
-    with database.connect() as db:
-        stored = db.execute("SELECT balance FROM balance_history WHERE id = ?",
-                            (entry_id,)).fetchone()['balance']
-    assert encryption.decrypt(stored, accounts_service.BALANCE_AAD) == '250'
+    (forged,) = accounts_service.list_accounts()
+    assert encryption.is_unreadable(forged['name'])
+    assert encryption.is_unreadable(forged['website'])
 
 
-# -- what it must never touch ---------------------------------------------------
-
-def test_running_it_twice_changes_nothing_the_second_time(vault):
-    account = make_account(name='Legacy', notes='readable on disk')
-    store_plaintext(account['id'], 'notes', 'readable on disk')
-
-    auth.migrate_plaintext_fields()
-    once = snapshot_rows()
-    auth.migrate_plaintext_fields()
-
-    assert snapshot_rows() == once
+def test_a_locked_vault_raises_rather_than_reading_plaintext(vault):
+    encryption.release_key()
+    with pytest.raises(encryption.VaultLockedError):
+        encryption.safe_decrypt('https://evil.example')
 
 
-def test_an_already_encrypted_vault_is_left_exactly_as_it_was(vault):
-    make_account(name='Already Encrypted', notes='a note')
+# -- it is never encrypted ------------------------------------------------------
+
+def test_logging_in_leaves_it_as_it_was(vault):
+    """The laundering this exists to stop: the login used to encrypt plaintext
+    under the real key, after which it decrypted as genuine."""
+    account = make_account(name='Bank')
+    store_plaintext(account['id'], 'website', 'https://evil.example')
     before = snapshot_rows()
-
-    auth.migrate_plaintext_fields()
-
-    assert snapshot_rows() == before
-
-
-def test_a_broken_ciphertext_is_not_wrapped_a_second_time(vault):
-    """The one that would destroy data silently, on every login. The check asks
-    about the value's *shape*, not whether it decrypts — encrypting a field that
-    is already ciphertext but damaged buries the original beyond recovery."""
-    account = make_account(name='Broken', notes='a note')
-    broken = corrupt_column(account['id'], 'notes')
-
-    auth.migrate_plaintext_fields()
-
-    assert raw_column(account['id'], 'notes') == broken
-
-
-def test_an_empty_field_is_left_empty_rather_than_encrypted(vault):
-    account = make_account(name='Sparse')
-    store_plaintext(account['id'], 'notes', '')
-
-    auth.migrate_plaintext_fields()
-
-    assert raw_column(account['id'], 'notes') == ''
-
-
-# -- failure must not cost a login ---------------------------------------------
-
-def test_a_locked_vault_raises_rather_than_writing_nonsense(vault):
-    account = make_account(name='Legacy', notes='readable on disk')
-    store_plaintext(account['id'], 'notes', 'readable on disk')
-
-    encryption.release_key()
-    with pytest.raises(encryption.VaultLockedError):
-        auth.migrate_plaintext_fields()
-
-
-def test_a_locked_vault_is_reported_even_through_the_quiet_wrapper(vault):
-    """Everything else is swallowed, because by then the user is already in and
-    no caller of verify_master_password expects an exception on the way out. A
-    missing key is different: it is a fault in the caller, not a stubborn row."""
-    account = make_account(name='Legacy', notes='readable on disk')
-    store_plaintext(account['id'], 'notes', 'readable on disk')
-
-    encryption.release_key()
-    with pytest.raises(encryption.VaultLockedError):
-        auth._migrate_plaintext_fields_quietly()
-
-
-def test_a_database_error_does_not_escape_the_quiet_wrapper(vault, monkeypatch):
-    account = make_account(name='Legacy', notes='readable on disk')
-    store_plaintext(account['id'], 'notes', 'readable on disk')
-
-    def broken_connect(*args, **kwargs):
-        raise sqlite3.OperationalError('database is locked')
-
-    monkeypatch.setattr(auth, 'connect', broken_connect)
-    auth._migrate_plaintext_fields_quietly()   # must not raise
-
-    assert raw_column(account['id'], 'notes') == 'readable on disk'
-
-
-def test_a_failed_pass_is_retried_on_the_next_login(vault):
-    """Idempotent by design, so a table that could not be written this time is
-    simply picked up again — no state records that it was skipped.
-
-    The failure is injected by hand and put back in a finally, not with
-    monkeypatch.undo(): undo() is not selective, and would also revert the
-    vault fixture's redirect of database.DB_PATH — pointing the second half of
-    this test at the user's real vault."""
-    account = make_account(name='Legacy', notes='readable on disk')
-    store_plaintext(account['id'], 'notes', 'readable on disk')
-
-    def broken_connect(*args, **kwargs):
-        raise sqlite3.OperationalError('database is locked')
-
-    real_connect = auth.connect
-    try:
-        auth.connect = broken_connect
-        auth.migrate_plaintext_fields()
-    finally:
-        auth.connect = real_connect
-
-    auth.migrate_plaintext_fields()
-    assert decrypted_column(account['id'], 'notes') == 'readable on disk'
-
-
-def test_logging_in_migrates_without_being_asked(vault):
-    """The whole point: an upgrade from a version that encrypted fewer fields
-    repairs itself the next time the user opens the vault."""
-    account = make_account(name='Legacy', notes='readable on disk')
-    store_plaintext(account['id'], 'notes', 'readable on disk')
 
     auth.lock_app()
     assert auth.verify_master_password(MASTER) is True
 
-    assert decrypted_column(account['id'], 'notes') == 'readable on disk'
+    assert snapshot_rows() == before
+    assert raw_column(account['id'], 'website') == 'https://evil.example'
+
+
+def test_a_password_change_refuses_rather_than_encrypting_it(vault):
+    """Rotation re-encrypts every field, so it would launder the value too. It
+    refuses, as it does for a field that will not decrypt, and changes nothing."""
+    account = make_account(name='Bank')
+    store_plaintext(account['id'], 'notes', 'call 555-0100 for support')
+    before = snapshot_rows()
+
+    with pytest.raises(auth.ReencryptionError):
+        auth.change_master_password(MASTER, NEW_MASTER)
+
+    assert snapshot_rows() == before
+
+
+def test_a_work_factor_rekey_steps_over_it(vault, monkeypatch):
+    """The login-time re-key skips what it cannot vouch for rather than locking
+    the owner out, and the value stays plaintext, still unreadable."""
+    account = make_account(name='Bank', password='s3cret')
+    store_plaintext(account['id'], 'notes', 'forged')
+    auth.lock_app()
+
+    monkeypatch.setattr(encryption, 'ARGON2_TIME_COST', 2)
+    assert auth.verify_master_password(MASTER) is True
+
+    assert raw_column(account['id'], 'notes') == 'forged'
+    fresh = accounts_service.get_account(account['id'])
+    assert fresh['password'] == 's3cret'
+    assert encryption.is_unreadable(fresh['notes'])
+
+
+# -- it is counted, so the user can be told -------------------------------------
+
+def test_a_clean_vault_counts_nothing(vault):
+    make_account(name='Bank', notes='a note', current_balance='100')
+    assert auth.foreign_field_count() == 0
+
+
+def test_every_encrypted_column_is_counted(vault):
+    account = make_account(name='Bank', current_balance='100')
+    for column in ('name', 'username', 'password', 'website', 'notes', 'extra_data'):
+        store_plaintext(account['id'], column, f'plain {column}')
+    with database.connect() as db:
+        db.execute("UPDATE balance_history SET balance = ?", ('250',))
+
+    assert auth.foreign_field_count() == 7
+
+
+def test_an_empty_field_is_not_counted(vault):
+    account = make_account(name='Sparse')
+    store_plaintext(account['id'], 'notes', '')
+    assert auth.foreign_field_count() == 0
+
+
+def test_an_unreadable_database_counts_nothing(vault, monkeypatch):
+    def broken_connect(*args, **kwargs):
+        raise sqlite3.OperationalError('database is locked')
+
+    monkeypatch.setattr(auth, 'connect', broken_connect)
+    assert auth.foreign_field_count() == 0
 
 
 # -- the hardened-permissions flag has to report what is true ------------------

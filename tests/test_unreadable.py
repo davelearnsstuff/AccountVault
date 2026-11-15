@@ -40,9 +40,14 @@ def test_looks_encrypted_still_says_yes_to_broken_ciphertext(vault):
 
 # -- safe_decrypt -------------------------------------------------------------
 
-def test_safe_decrypt_passes_legacy_plaintext_through(vault):
-    assert encryption.safe_decrypt('a value from before field encryption') == \
-        'a value from before field encryption'
+def test_safe_decrypt_does_not_pass_plaintext_through(vault):
+    """Fields are only read once the vault is at the current format, where
+    plaintext can only have been written without the key."""
+    assert encryption.safe_decrypt('https://evil.example') == encryption.UNREADABLE
+
+
+def test_safe_decrypt_leaves_an_empty_field_empty(vault):
+    assert encryption.safe_decrypt('') == ''
 
 
 def test_safe_decrypt_marks_broken_ciphertext(vault):

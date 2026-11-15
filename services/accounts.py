@@ -15,21 +15,31 @@ from decimal import Decimal, InvalidOperation
 
 from core.auth import require_session
 from core.categories import (
-    FAVORITE_KEY, is_favorite, normalize_category, parse_iso_date, trim_number,
+    FAVORITE_KEY, SPLIT_FIELDS, active_splits, add_amounts, field_shown, get_config,
+    is_favorite, normalize_category, parse_iso_date, parse_money, schema_field,
+    trim_number,
 )
 from core.database import ENCRYPTED_FIELDS, connect
 from core.encryption import (
-    VaultLockedError, decrypt, encrypt, field_aad, is_unreadable,
-    looks_encrypted, on_key_change, safe_decrypt,
+    VaultLockedError, decrypt_field, encrypt_field, is_unreadable,
+    looks_encrypted, on_key_change, row_aad, safe_decrypt_field,
 )
 
-# Associated data for the two columns not addressed by name below. Every
-# encrypted field is bound to its column; see encryption.field_aad.
-EXTRA_AAD   = field_aad('accounts', 'extra_data')
-BALANCE_AAD = field_aad('balance_history', 'balance')
 
-# The encrypted text columns a caller supplies by name. 'category' is a column
-# but is not encrypted, and extra_data is a blob rather than a field.
+# Every encrypted field is bound to its column and its row, and padded; see
+# encryption.row_aad and encryption.pad. So a field is never encrypted before
+# its row has an id: new rows go in with empty fields first.
+def account_aad(column: str, account_id) -> bytes:
+    return row_aad('accounts', column, account_id)
+
+
+def balance_aad(account_id, entry_id) -> bytes:
+    return row_aad('balance_history', 'balance', account_id, entry_id)
+
+
+# The encrypted text columns a caller supplies by name. 'category' is encrypted
+# too but has rules of its own (see _category), and extra_data is a blob rather
+# than a field.
 COMMON_FIELDS = ('name', 'username', 'password', 'website', 'notes')
 
 # Flat keys that are account columns rather than extra_data entries. id and
@@ -128,14 +138,78 @@ def split_flat(flat: dict) -> tuple[dict, dict]:
     return columns, extra
 
 
-def _decode_extra(blob) -> dict:
+# The parts of current_balance on a Both account. A backdated figure files its
+# parts with it, and they wait on the same terms the figure does.
+BALANCE_PARTS = SPLIT_FIELDS['current_balance']
+
+
+def _part_amount(value, label: str) -> Decimal | None:
+    """One part of a split total as an exact amount, None when it is blank.
+    ValueError for an amount that is not one, or is negative: a part is money
+    in an account, and the total it makes becomes the balance."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    number = None if isinstance(value, bool) else parse_money(value)
+    if number is None:
+        raise ValueError(f"{label} must be an amount, like 2,501.99.")
+    if number < 0:
+        raise ValueError(f"{label} can't be negative.")
+    return Decimal(str(number))
+
+
+def _stored_amount(value) -> Decimal | None:
+    """A part as it was stored, or None when it was blank or unreadable."""
+    number = None if isinstance(value, bool) or value is None else parse_money(value)
+    return None if number is None else Decimal(str(number))
+
+
+def _settle_fields(category: str, extra: dict, stored: dict | None):
+    """Applies the rules between a category's fields to extra, in place,
+    before it is saved. stored is what the account held, None for a new one.
+
+    A field with shown_when or hidden_when is cleared once it stops applying:
+    switching a 401(k) from Both to Traditional clears its two amounts, and
+    changing its type to Brokerage clears its tax treatment as well. An Income
+    record made Social Security loses its annual pay, though not the history
+    that pay left. Only the category's own fields are touched; keys from
+    another schema are kept, as they are everywhere else.
+
+    On a Both account each total is the sum of its parts, worked out here so
+    the form, Quick Update and an import all agree. It is worked out only when
+    the parts change, or the account has just become split: parts left as they
+    were keep the total the caller sent. Balance History can move a balance
+    without its parts, and an unrelated edit must not then file the old parts'
+    sum as a new reading."""
+    category = normalize_category(category or '')
+    for field in get_config(category)['fields']:
+        if (field.get('shown_when') or field.get('hidden_when')) \
+                and not field_shown(category, field, extra):
+            extra.pop(field['key'], None)
+
+    was_split = active_splits(category, stored) if stored is not None else {}
+    for total, parts in active_splits(category, extra).items():
+        amounts = [_part_amount(extra.get(key), schema_field(category, key)['label'])
+                   for key in parts]
+        if None in amounts:
+            # Nothing to add up. The form insists on both; an import may not.
+            continue
+        for key, amount in zip(parts, amounts):
+            extra[key] = trim_number(float(amount))
+        unchanged = (total in was_split
+                     and [_stored_amount(stored.get(key)) for key in parts] == amounts)
+        if unchanged and extra.get(total) not in (None, ''):
+            continue
+        extra[total] = add_amounts(*amounts)
+
+
+def _decode_extra(blob, account_id) -> dict:
     """Decrypts an extra_data blob into a dict; {} when it is absent, unreadable
     or not an object. Pair with _extra_is_readable before writing: {} means
     "nothing to show", not "nothing was there"."""
     if not blob:
         return {}
     try:
-        parsed = json.loads(decrypt(blob, EXTRA_AAD))
+        parsed = json.loads(decrypt_field(blob, account_aad('extra_data', account_id)))
     except VaultLockedError:
         raise
     except Exception:
@@ -143,13 +217,13 @@ def _decode_extra(blob) -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def _extra_is_readable(blob) -> bool:
+def _extra_is_readable(blob, account_id) -> bool:
     """False only when extra_data holds ciphertext this key cannot open — the
     one case where overwriting it would destroy fields never shown to the user."""
     if not blob or not looks_encrypted(blob):
         return True
     try:
-        decrypt(blob, EXTRA_AAD)
+        decrypt_field(blob, account_aad('extra_data', account_id))
         return True
     except VaultLockedError:
         raise
@@ -166,9 +240,10 @@ def _decrypt_row(row) -> dict:
     record = dict(row)
     for field in ENCRYPTED_TEXT_FIELDS:
         if record.get(field):
-            record[field] = safe_decrypt(record[field], field_aad('accounts', field))
+            record[field] = safe_decrypt_field(record[field],
+                                               account_aad(field, record['id']))
 
-    extra = _decode_extra(record.pop('extra_data', None))
+    extra = _decode_extra(record.pop('extra_data', None), record['id'])
     record['closed'] = bool(record.get('closed', 0))
     # Columns win over the blob, so an extra_data key named after a column (an
     # 'id', say) can never redirect later writes to a different row.
@@ -176,10 +251,41 @@ def _decrypt_row(row) -> dict:
     return record
 
 
-def _record_balance(db, account_id: int, extra: dict, now: str, force: bool = False):
+def _entry_balance(entry, account_id) -> str:
+    """A history row's figure, decrypted, or the UNREADABLE placeholder. entry
+    needs its id and balance."""
+    return safe_decrypt_field(entry['balance'], balance_aad(account_id, entry['id']))
+
+
+def _insert_entry(db, account_id: int, balance: str, recorded_at: str) -> int:
+    """Files one history row and returns its id. The row goes in empty and the
+    figure follows: it is bound to the row's id, which only the insert makes."""
+    entry_id = db.execute(
+        "INSERT INTO balance_history (account_id, balance, recorded_at) VALUES (?, '', ?)",
+        (account_id, recorded_at),
+    ).lastrowid
+    db.execute("UPDATE balance_history SET balance = ? WHERE id = ?",
+               (encrypt_field(balance, balance_aad(account_id, entry_id)), entry_id))
+    return entry_id
+
+
+def _same_figure(entry, account_id, balance: str) -> bool:
+    """Whether a stored history row's figure is the same amount as balance."""
+    previous = _entry_balance(entry, account_id)
+    try:
+        # Decimal: '1.10' == '1.1' without float rounding collisions
+        return Decimal(previous.strip()) == Decimal(balance)
+    except (InvalidOperation, ValueError, TypeError, AttributeError):
+        return previous == balance
+
+
+def _record_balance(db, account_id: int, extra: dict, now: str, force: bool = False,
+                    confirm: bool = False):
     """Inserts an encrypted balance_history row if current_balance is present.
-    With force=True always inserts; otherwise skips when unchanged from the
-    newest entry."""
+
+    confirm=True inserts unless the day being filed already ends on the same
+    figure, and takes precedence over force. force=True always inserts.
+    Otherwise skips when unchanged from the newest entry."""
     value = (extra if isinstance(extra, dict) else {}).get('current_balance')
     if isinstance(value, bool) or not isinstance(value, (int, float, str)):
         return
@@ -192,25 +298,27 @@ def _record_balance(db, account_id: int, extra: dict, now: str, force: bool = Fa
     except (ValueError, TypeError):
         return
 
-    if not force:
+    if confirm:
+        # Against the last entry filed that day, not any of them: after 500 then
+        # 600, a 500 is a new reading, and skipping it would leave the account
+        # on 500 with history ending on 600.
+        last = db.execute(
+            "SELECT id, balance FROM balance_history "
+            "WHERE account_id = ? AND substr(recorded_at, 1, 10) = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (account_id, now[:10]),
+        ).fetchone()
+        if last is not None and _same_figure(last, account_id, balance):
+            return
+    elif not force:
         # Compared with the newest-dated entry, which is the figure the account
         # reads as current — not the last-inserted one, which after a backdated
         # save is an older figure.
         last = _newest_entry(db, account_id, _today())
-        if last is not None:
-            previous = safe_decrypt(last['balance'], BALANCE_AAD)
-            try:
-                # Decimal: '1.10' == '1.1' without float rounding collisions
-                if Decimal(previous.strip()) == Decimal(balance):
-                    return
-            except (InvalidOperation, ValueError, TypeError, AttributeError):
-                if previous == balance:
-                    return
+        if last is not None and _same_figure(last, account_id, balance):
+            return
 
-    db.execute(
-        "INSERT INTO balance_history (account_id, balance, recorded_at) VALUES (?, ?, ?)",
-        (account_id, encrypt(balance, BALANCE_AAD), now),
-    )
+    _insert_entry(db, account_id, balance, now)
 
 
 # -----------------------------------------------------------------------------
@@ -251,8 +359,12 @@ def list_accounts(category: str | None = None) -> list[dict]:
     global _account_cache
     if _account_cache is None:
         with connect() as db:
-            rows = db.execute("SELECT * FROM accounts ORDER BY category, id").fetchall()
-        _account_cache = [_decrypt_row(row) for row in rows]
+            rows = db.execute("SELECT * FROM accounts").fetchall()
+        # Sorted here, not in SQL: the category is ciphertext on disk. Python
+        # compares by code point, which is the order SQLite's BINARY collation
+        # gave on the UTF-8 text.
+        _account_cache = sorted((_decrypt_row(row) for row in rows),
+                                key=lambda a: (a.get('category') or '', a['id']))
 
     if category:
         # Compared normalized, as every other read path does, so a row written
@@ -298,19 +410,26 @@ def _insert_account(db, flat: dict, now: str, today: str) -> int:
     columns, extra = _without_placeholders(columns), _without_placeholders(extra)
     category = _category(columns.get('category'))
     columns['name'] = _require_name(columns)
+    _settle_fields(category, extra, None)
+    # Checked before the insert, so a value too long to store writes nothing.
+    values = {f: _checked(columns.get(f), f) for f in COMMON_FIELDS}
 
-    cursor = db.execute("""
-        INSERT INTO accounts (category, name, username, password, website, notes,
-                              extra_data, closed, last_updated, date_added)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    # In empty first: every field is bound to the id the insert hands back.
+    new_id = db.execute("""
+        INSERT INTO accounts (category, name, closed, last_updated, date_added)
+        VALUES ('', '', ?, ?, ?)
+    """, (int(bool(columns.get('closed'))), today, today)).lastrowid
+    db.execute("""
+        UPDATE accounts
+           SET category = ?, name = ?, username = ?, password = ?, website = ?,
+               notes = ?, extra_data = ?
+         WHERE id = ?
     """, (
-        category,
-        *(_encrypt_or_none(_checked(columns.get(f), f), f) for f in COMMON_FIELDS),
-        _encrypt_extra(extra),
-        int(bool(columns.get('closed'))),
-        today, today,
+        encrypt_field(category, account_aad('category', new_id)),
+        *(_encrypt_or_none(values[f], f, new_id) for f in COMMON_FIELDS),
+        _encrypt_extra(extra, new_id),
+        new_id,
     ))
-    new_id = cursor.lastrowid
     _record_balance(db, new_id, extra, now)
     return new_id
 
@@ -343,13 +462,19 @@ def create_accounts(flats) -> int:
     return len(flats)
 
 
-def update_account(account_id: int, flat: dict, balance_date: str | None = None) -> dict:
+def update_account(account_id: int, flat: dict, balance_date: str | None = None,
+                   confirm_balance: bool = False) -> dict:
     """Saves an account and snapshots its current_balance.
 
     balance_date is the date the balance figure is from. Today or None records
     it now. An earlier date files the figure under that date, where it counts
     exactly as a history entry does (see _sync_current_balance): if it is the
     newest on file, the account follows it; otherwise it only fills in the past.
+
+    confirm_balance files the figure even when it has not moved, as No Change
+    does, unless that day already ends on the same figure. Quick Update passes
+    it: saving there is a reading of the balance, where the full form is often
+    just a note or a password.
 
     The row and its history entry are written in one transaction."""
     require_session()
@@ -372,28 +497,39 @@ def update_account(account_id: int, flat: dict, balance_date: str | None = None)
         # showed for ciphertext this key cannot open, round-tripped by the form.
         # Keep the stored column: still unreadable, but not destroyed.
         keep = {f for f in COMMON_FIELDS if is_unreadable(columns.get(f))}
+        stored_category = (row['category'] if is_unreadable(category)
+                           else encrypt_field(category, account_aad('category', account_id)))
+
+        stored_extra = _decode_extra(row['extra_data'], account_id)
+        _settle_fields(category, extra, stored_extra)
 
         # snapshot is what reaches history; extra is what the account keeps.
         # They differ only when backdating, which files the new figure but
-        # leaves the account showing the one it had until the sync below.
+        # leaves the account showing the one it had until the sync below. The
+        # figure's Traditional and Roth parts wait with it.
         #
         # A backdated figure is always filed — the day is the point of it. An
         # ordinary save files only when the figure actually moved, so editing a
-        # note does not add a history entry.
+        # note does not add a history entry. A confirmed one (Quick Update) is
+        # filed either way, short of repeating the figure its day ends on.
         backdating = bool(balance_date and balance_date < today)
         snapshot, recorded_at, last_updated = extra, now, today
         if backdating:
             snapshot, recorded_at = dict(extra), balance_date
             last_updated = row['last_updated']
-            stored = _decode_extra(row['extra_data']).get('current_balance')
-            if stored is None:
-                extra.pop('current_balance', None)
-            else:
-                extra['current_balance'] = stored
+            # The parts only while the account is split: on any other account
+            # _settle_fields has just cleared them, and they stay cleared.
+            split = 'current_balance' in active_splits(category, extra)
+            for key in ('current_balance', *(BALANCE_PARTS if split else ())):
+                if stored_extra.get(key) is None:
+                    extra.pop(key, None)
+                else:
+                    extra[key] = stored_extra[key]
 
         # Unreadable extra_data decodes to {}, and writing that back would drop
         # every category-specific field at once.
-        extra_blob = (_encrypt_extra(extra) if _extra_is_readable(row['extra_data'])
+        extra_blob = (_encrypt_extra(extra, account_id)
+                      if _extra_is_readable(row['extra_data'], account_id)
                       else row['extra_data'])
 
         db.execute("""
@@ -402,24 +538,52 @@ def update_account(account_id: int, flat: dict, balance_date: str | None = None)
                    notes = ?, extra_data = ?, closed = ?, last_updated = ?
              WHERE id = ?
         """, (
-            category,
-            *(row[f] if f in keep else _encrypt_or_none(_checked(columns.get(f), f), f)
+            stored_category,
+            *(row[f] if f in keep else _encrypt_or_none(_checked(columns.get(f), f), f, account_id)
               for f in COMMON_FIELDS),
             extra_blob,
             int(bool(columns.get('closed'))),
             last_updated, account_id,
         ))
-        _record_balance(db, account_id, snapshot, recorded_at, force=backdating)
+        _record_balance(db, account_id, snapshot, recorded_at, force=backdating,
+                        confirm=confirm_balance)
         if backdating:
             _sync_current_balance(db, account_id)
+            _adopt_backdated_parts(db, account_id, category, snapshot, balance_date)
         row = db.execute("SELECT * FROM accounts WHERE id = ?", (account_id,)).fetchone()
 
     invalidate_cache()
     return _decrypt_row(row)
 
 
+def _adopt_backdated_parts(db, account_id: int, category: str, snapshot: dict,
+                           balance_date: str):
+    """Gives the account the Traditional and Roth parts filed with a backdated
+    figure, when that figure turned out to be the current one: the newest
+    entry on file is from that day and holds that figure. Behind a newer
+    entry, the parts describe the past and the account keeps its own."""
+    if 'current_balance' not in active_splits(category, snapshot):
+        return
+    parts = {key: snapshot[key] for key in BALANCE_PARTS if snapshot.get(key) is not None}
+    total = snapshot.get('current_balance')
+    if not parts or total is None:
+        return
+    newest = _newest_entry(db, account_id, _today())
+    if (newest is None or str(newest['recorded_at'])[:10] != balance_date
+            or not _same_figure(newest, account_id, str(total))):
+        return
+    row = db.execute("SELECT extra_data FROM accounts WHERE id = ?", (account_id,)).fetchone()
+    if not _extra_is_readable(row['extra_data'], account_id):
+        return
+    extra = _decode_extra(row['extra_data'], account_id)
+    extra.update(parts)
+    db.execute("UPDATE accounts SET extra_data = ? WHERE id = ?",
+               (_encrypt_extra(extra, account_id), account_id))
+
+
 def touch_account(account_id: int) -> str:
-    """Sets last_updated to today and records a balance snapshot if one exists.
+    """Sets last_updated to today and records a balance snapshot if one exists,
+    unless today already ends on the same figure, as Quick Update does.
     Returns the new last_updated date."""
     require_session()
     now, today = _now(), _today()
@@ -436,7 +600,8 @@ def touch_account(account_id: int) -> str:
         row = db.execute(
             "SELECT extra_data FROM accounts WHERE id = ?", (account_id,)
         ).fetchone()
-        _record_balance(db, account_id, _decode_extra(row['extra_data']), now, force=True)
+        _record_balance(db, account_id, _decode_extra(row['extra_data'], account_id), now,
+                        confirm=True)
 
     invalidate_cache()
     return today
@@ -519,18 +684,18 @@ def set_favorite(account_id: int, favorite: bool) -> bool:
         if row is None:
             raise AccountNotFound("Account not found")
 
-        if not _extra_is_readable(row['extra_data']):
+        if not _extra_is_readable(row['extra_data'], account_id):
             raise ValueError(
                 "This account's stored fields cannot be read, so it cannot be pinned")
 
-        extra = _decode_extra(row['extra_data'])
+        extra = _decode_extra(row['extra_data'], account_id)
         if favorite:
             extra[FAVORITE_KEY] = True
         else:
             extra.pop(FAVORITE_KEY, None)
 
         db.execute("UPDATE accounts SET extra_data = ? WHERE id = ?",
-                   (_encrypt_extra(extra), account_id))
+                   (_encrypt_extra(extra, account_id), account_id))
     invalidate_cache()
     return favorite
 
@@ -550,7 +715,7 @@ def favorite_count() -> int:
 
 # The only columns _bulk_update may write. The name is interpolated into the
 # statement (sqlite has no parameter form for an identifier), so it is checked.
-_BULK_COLUMNS = frozenset({'closed', 'category'})
+_BULK_COLUMNS = frozenset({'closed'})
 
 
 def _bulk_update(account_ids, column: str, value) -> int:
@@ -579,20 +744,33 @@ def set_closed(account_ids, closed: bool) -> int:
 def set_category(account_ids, category: str) -> int:
     """Moves several accounts to another category. Returns the number changed.
 
-    The category column is structure rather than content, so it is not
-    encrypted."""
+    Encrypted once per row, in one transaction. A single token written to every
+    row would show on disk which accounts share a category, which is what
+    encrypting the column is meant to hide."""
     require_session()
     if not category or not str(category).strip():
         raise ValueError("Category is required")
-    return _bulk_update(account_ids, 'category', _category(category))
+    category = _category(category)
+    ids = [int(i) for i in account_ids]
+    changed = 0
+    with connect() as db:
+        for account_id in ids:
+            changed += db.execute(
+                "UPDATE accounts SET category = ? WHERE id = ?",
+                (encrypt_field(category, account_aad('category', account_id)), account_id),
+            ).rowcount
+    invalidate_cache()
+    return changed
 
 
-def _encrypt_or_none(value, column: str):
-    return encrypt(value, field_aad('accounts', column)) if value else None
+def _encrypt_or_none(value, column: str, account_id):
+    return encrypt_field(value, account_aad(column, account_id)) if value else None
 
 
-def _encrypt_extra(extra: dict):
-    return encrypt(json.dumps(extra), EXTRA_AAD) if extra else None
+def _encrypt_extra(extra: dict, account_id):
+    if not extra:
+        return None
+    return encrypt_field(json.dumps(extra), account_aad('extra_data', account_id))
 
 
 # -----------------------------------------------------------------------------
@@ -639,14 +817,14 @@ def _newest_entry(db, account_id: int, today: str):
 def _clear_current_balance(db, account_id: int, row):
     """Drops the account's current_balance, leaving everything else — including
     last_updated — alone."""
-    if not _extra_is_readable(row['extra_data']):
+    if not _extra_is_readable(row['extra_data'], account_id):
         return
-    extra = _decode_extra(row['extra_data'])
+    extra = _decode_extra(row['extra_data'], account_id)
     if 'current_balance' not in extra:
         return
     extra.pop('current_balance')
     db.execute("UPDATE accounts SET extra_data = ? WHERE id = ?",
-               (_encrypt_extra(extra), account_id))
+               (_encrypt_extra(extra, account_id), account_id))
 
 
 def _sync_current_balance(db, account_id: int):
@@ -677,7 +855,7 @@ def _sync_current_balance(db, account_id: int):
         return
 
     try:
-        number = float(safe_decrypt(newest['balance'], BALANCE_AAD).strip())
+        number = float(_entry_balance(newest, account_id).strip())
         if not math.isfinite(number):
             return
     except (AttributeError, TypeError, ValueError):
@@ -686,9 +864,9 @@ def _sync_current_balance(db, account_id: int):
     balance = trim_number(number)
 
     # extra_data this key cannot open must not be overwritten.
-    if not _extra_is_readable(row['extra_data']):
+    if not _extra_is_readable(row['extra_data'], account_id):
         return
-    extra = _decode_extra(row['extra_data'])
+    extra = _decode_extra(row['extra_data'], account_id)
 
     # last_updated only moves forward: filing an old statement does not make the
     # account staler than it was.
@@ -699,7 +877,7 @@ def _sync_current_balance(db, account_id: int):
     extra['current_balance'] = balance
     db.execute(
         "UPDATE accounts SET extra_data = ?, last_updated = ? WHERE id = ?",
-        (_encrypt_extra(extra), last_updated, account_id),
+        (_encrypt_extra(extra, account_id), last_updated, account_id),
     )
 
 
@@ -712,7 +890,7 @@ def list_balance_history(account_id: int) -> list[dict]:
             (account_id,),
         ).fetchall()
     return [
-        {'id': row['id'], 'balance': safe_decrypt(row['balance'], BALANCE_AAD),
+        {'id': row['id'], 'balance': _entry_balance(row, account_id),
          'recorded_at': row['recorded_at']}
         for row in rows
     ]
@@ -724,10 +902,7 @@ def add_balance_entry(account_id: int, balance: str, recorded_at: str):
     with connect() as db:
         if db.execute("SELECT id FROM accounts WHERE id = ?", (account_id,)).fetchone() is None:
             raise AccountNotFound("Account not found")
-        db.execute(
-            "INSERT INTO balance_history (account_id, balance, recorded_at) VALUES (?, ?, ?)",
-            (account_id, encrypt(balance, BALANCE_AAD), recorded_at),
-        )
+        _insert_entry(db, account_id, balance, recorded_at)
         _sync_current_balance(db, account_id)
     # A history write can move the account's figure, so it is an account write.
     invalidate_cache()
@@ -747,11 +922,8 @@ def add_balance_entries(account_id: int, entries) -> int:
     with connect() as db:
         if db.execute("SELECT id FROM accounts WHERE id = ?", (account_id,)).fetchone() is None:
             raise AccountNotFound("Account not found")
-        db.executemany(
-            "INSERT INTO balance_history (account_id, balance, recorded_at) VALUES (?, ?, ?)",
-            [(account_id, encrypt(balance, BALANCE_AAD), recorded_at)
-             for balance, recorded_at in prepared],
-        )
+        for balance, recorded_at in prepared:
+            _insert_entry(db, account_id, balance, recorded_at)
         _sync_current_balance(db, account_id)
     invalidate_cache()
     return len(prepared)
@@ -769,7 +941,8 @@ def update_balance_entry(account_id: int, entry_id: int, balance: str, recorded_
             raise AccountNotFound("Entry not found")
         db.execute(
             "UPDATE balance_history SET balance = ?, recorded_at = ? WHERE id = ? AND account_id = ?",
-            (encrypt(balance, BALANCE_AAD), recorded_at, entry_id, account_id),
+            (encrypt_field(balance, balance_aad(account_id, entry_id)), recorded_at, entry_id,
+             account_id),
         )
         _sync_current_balance(db, account_id)
     invalidate_cache()

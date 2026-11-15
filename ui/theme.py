@@ -32,28 +32,69 @@ THEMES = {
         'level_warn':    '#e0a44a',
         'level_danger':  '#e88080',
         'level_good':    '#5cc98a',
+        # Chart series for the retirement planner; see RETIREMENT_SERIES.
+        'series_1': '#3987e5', 'series_2': '#d95926', 'series_3': '#199e70',
+        'series_4': '#c98500', 'series_5': '#d55181',
     },
+    # Neutral greys, as Dark's are, with the violet kept for the accent only.
+    # The surfaces and the secondary text used to carry the violet too, which
+    # tinted every panel lavender.
     'light': {
         'label':         'Light',
-        'bg_primary':    '#f0f0f8',
+        'bg_primary':    '#f3f4f7',
         'bg_secondary':  '#ffffff',
-        'bg_tertiary':   '#e4e4f4',
+        'bg_tertiary':   '#eceef2',
         'bg_input':      '#ffffff',
         'accent':        '#7c6af7',
         'accent_hover':  '#6a59e0',
         'danger':        '#d94040',
         'danger_hover':  '#b83030',
-        'text_primary':  '#1a1a2e',
-        'text_secondary': '#6060a0',
-        'text_placeholder': '#9090c0',
-        'border':        '#d0d0e8',
+        'text_primary':  '#1c1f26',
+        'text_secondary': '#5c6270',
+        'text_placeholder': '#9aa0ac',
+        'border':        '#d9dce3',
         # Darker than Dark's amber and red on purpose. That pair reaches only
         # 2.19:1 and 3.26:1 on white — the colours whose one job is to catch
         # the eye were the least legible thing on the panel.
         'level_warn':    '#8a5a00',
         'level_danger':  '#b71c1c',
         'level_good':    '#1b6e3a',
+        'series_1': '#2a78d6', 'series_2': '#eb6834', 'series_3': '#1baf7a',
+        'series_4': '#eda100', 'series_5': '#e87ba4',
     },
+}
+
+# What each series_<n> colour stands for in the retirement planner's charts.
+# The same source keeps its colour in every chart, and stacks are drawn in this
+# order from the baseline: the order money is drawn in.
+#
+# The hexes are the first four slots of a categorical palette checked for
+# colour-blind separation. Neighbours are at least 9.1 apart on the Light card
+# and 8.4 on the Dark one under protanopia and deuteranopia (OKLab x100, target
+# 8), and 22.9 and 19.8 for normal vision (floor 15).
+#
+# A year with nothing from one source lets the sources either side of it touch.
+# The first three pass that test against each other too. Taxable and Roth & HSA
+# do not (as little as 13.7 apart for normal vision, 4.8 colour-blind), and
+# they only touch for a household with no 401(k) or IRA money at all, since
+# Taxable is drawn before it; the gap between segments, the legend and the
+# table carry them there.
+#
+# Four series rather than six: part-time work failed against the sources it
+# could sit on whatever colour it took, and fewer series is the fix for that.
+# Several slots sit under 3:1 against the Light card, so every chart using them
+# also has a legend and a table of the same figures. Re-check before changing
+# any of them, or the order.
+#
+# The What-if and Scenarios line charts use series_1 to series_5 in order, the
+# plan first: lines only promise that neighbours are told apart, and the first
+# five pass that (9.1 and 8.4 colour-blind, 19.6 and 19.3 normal), with a
+# legend and a table naming every line.
+RETIREMENT_SERIES = {
+    'income':  'series_1',   # Social Security and part-time work
+    'taxable': 'series_2',
+    'pretax':  'series_3',   # 401(k) / Traditional IRA
+    'taxfree': 'series_4',   # Roth and HSA
 }
 
 DEFAULT_THEME = 'dark'
@@ -91,18 +132,21 @@ CATEGORY_COLORS = {
     'Loans':        '#ff9800',
     'Utilities':    '#9c27b0',
     'Income':       '#00bfa5',
-    'Websites':     '#5c6bc0',
+    # Pink rather than the indigo it was, which sat beside Investments' blue
+    # and the accent and read as a third shade of the same colour.
+    'Websites':     '#ec407a',
     'Secure Notes': '#8d6e63',
 }
 
 # Drawn from for categories the user invented, which have no entry above.
-# Deliberately hues the nine built-ins leave spare — pink, cyan, lime, violet,
+# Deliberately hues the nine built-ins leave spare — cyan, lime, violet,
 # amber — rather than more of the same: a custom category sitting next to Loans
 # in the tab bar wants to be told apart from it, and an earlier ring that
 # included another orange put two near-identical dots side by side. Slate left
-# the ring when Property took it, so no custom category can share its dot.
+# the ring when Property took it, and pink when Websites did, so no custom
+# category can share a built-in's dot.
 _CUSTOM_COLORS = (
-    '#ec407a', '#26c6da', '#d4e157', '#7e57c2', '#ffca28',
+    '#26c6da', '#d4e157', '#7e57c2', '#ffca28',
 )
 
 
@@ -303,6 +347,27 @@ QToolTip {{
     font-size: {caption_pt}pt;
 }}
 
+/* A group heading in the detail view (Account, Money, Login, Notes), with a
+   hairline under it: quieter than the title, louder than a field label. */
+#DetailSection {{
+    color: {text_secondary};
+    font-weight: bold;
+    border-bottom: 1px solid {border};
+    padding-bottom: 4px;
+}}
+
+/* The net worth at the head of the dashboard: the one figure most people open
+   it for, so it is the largest number on the page. */
+#HeroValue {{
+    font-size: {display_pt}pt;
+    font-weight: bold;
+}}
+
+/* The hairline between the tab bar's groups: views, lists, categories. */
+#TabDivider {{
+    background-color: {border};
+}}
+
 #DetailTitle, #FormTitle {{
     font-size: {heading_pt}pt;
     font-weight: bold;
@@ -317,12 +382,13 @@ QToolTip {{
     color: {accent};
 }}
 
+/* Small enough to sit inside the nav bar, where it is shown. */
 #Toast {{
     background-color: {bg_tertiary};
     color: {text_primary};
     border: 1px solid {border};
     border-radius: 8px;
-    padding: 10px 16px;
+    padding: 7px 16px;
 }}
 
 #ToastText {{
@@ -387,6 +453,32 @@ QToolTip {{
     font-size: {caption_pt}pt;
 }}
 
+/* --- Retirement planner -------------------------------------------------- */
+
+/* The verdict beside the odds ring, in the colour the ring is drawn in. */
+#VerdictGood, #VerdictWarn, #VerdictBad {{
+    font-size: {section_pt}pt;
+    font-weight: bold;
+}}
+
+#VerdictGood {{
+    color: {level_good};
+}}
+
+#VerdictWarn {{
+    color: {level_warn};
+}}
+
+#VerdictBad {{
+    color: {level_danger};
+}}
+
+/* A figure on a Plan page tile. */
+#StatValue {{
+    font-size: {heading_pt}pt;
+    font-weight: bold;
+}}
+
 /* --- Menus --------------------------------------------------------------- */
 
 /* A menu is a top-level window of its own, so neither QMainWindow nor QDialog
@@ -447,6 +539,15 @@ QComboBox:disabled, QDateEdit:disabled, QSpinBox:disabled {{
     color: {text_placeholder};
 }}
 
+/* A total the form works out from other fields (a Both account's balance, from
+   its Traditional and Roth parts). Raised like a button rather than recessed
+   like an input, since it cannot be typed into. By name: a read-only selector
+   would also catch the password generator's preview. */
+QLineEdit#ComputedValue {{
+    background-color: {bg_tertiary};
+    color: {text_primary};
+}}
+
 QComboBox QAbstractItemView {{
     background-color: {bg_input};
     color: {text_primary};
@@ -454,6 +555,29 @@ QComboBox QAbstractItemView {{
     selection-background-color: {accent};
     selection-color: #ffffff;
     outline: none;
+}}
+
+/* The What-if sliders: a thin plain track with a round accent handle, and
+   a hairline between one slider and the next. */
+#Divider {{
+    background-color: {border};
+}}
+
+QSlider::groove:horizontal {{
+    height: 4px;
+    background: {border};
+    border-radius: 2px;
+}}
+
+QSlider::handle:horizontal {{
+    background: {accent};
+    width: 16px;
+    margin: -6px 0;
+    border-radius: 8px;
+}}
+
+QSlider::handle:horizontal:hover {{
+    background: {accent_hover};
 }}
 
 QCheckBox {{
@@ -663,8 +787,26 @@ QPushButton#Small {{
     font-size: {caption_pt}pt;
 }}
 
-QPushButton#Small:hover {{
+/* Edit in the detail pane: Small with more padding either side. */
+QPushButton#SmallWide {{
+    padding: 4px 20px;
+    font-size: {caption_pt}pt;
+}}
+
+QPushButton#Small:hover, QPushButton#SmallWide:hover {{
     background-color: {accent};
+    color: #ffffff;
+}}
+
+/* Delete in the detail pane: Small until hovered, then red. A standing red
+   outline made it the loudest button in the row. */
+QPushButton#SmallDanger {{
+    padding: 4px 10px;
+    font-size: {caption_pt}pt;
+}}
+
+QPushButton#SmallDanger:hover {{
+    background-color: {danger};
     color: #ffffff;
 }}
 

@@ -75,6 +75,8 @@ def test_a_format_0_vault_opens_and_is_upgraded_at_login(vault):
 
     account = accounts_service.get_account(row_id)
     assert account['name'] == 'Legacy Bank'
+    assert account['category'] == 'Banking'
+    assert encryption.looks_encrypted(raw_column(row_id, 'category'))
     assert account['password'] == 's3cret'
     assert account['notes'] == 'a note'
     assert accounts_service.list_balance_history(row_id)[0]['balance'] == '1200'
@@ -85,14 +87,33 @@ def test_a_format_0_vault_opens_and_is_upgraded_at_login(vault):
 
 
 def test_the_upgrade_binds_the_fields_it_rewrites(vault):
-    """Not just readable — readable only as the column it lives in."""
+    """Not just readable — readable only as the column and row it lives in, and
+    padded."""
     row_id = build_format_0_vault()
     auth.verify_master_password(MASTER)
 
     on_disk = raw_column(row_id, 'password')
-    assert encryption.decrypt(on_disk, encryption.field_aad('accounts', 'password')) == 's3cret'
-    with pytest.raises(Exception):
-        encryption.decrypt(on_disk)
+    assert encryption.decrypt_field(
+        on_disk, accounts_service.account_aad('password', row_id)) == 's3cret'
+    for wrong in (b'', encryption.field_aad('accounts', 'password'),
+                  accounts_service.account_aad('password', row_id + 1)):
+        with pytest.raises(Exception):
+            encryption.decrypt(on_disk, wrong)
+
+
+def test_the_upgrade_encrypts_plaintext_a_format_0_vault_held(vault):
+    """The one place plaintext is legitimate, and now the only place it is
+    encrypted: a format-0 vault may hold fields an older build never encrypted."""
+    row_id = build_format_0_vault()
+    with database.connect() as db:
+        db.execute("UPDATE accounts SET website = ? WHERE id = ?",
+                   ('bank.example', row_id))
+
+    assert auth.verify_master_password(MASTER) is True
+
+    assert encryption.looks_encrypted(raw_column(row_id, 'website'))
+    assert accounts_service.get_account(row_id)['website'] == 'bank.example'
+    assert auth.foreign_field_count() == 0
 
 
 def test_a_second_login_rewrites_nothing(vault):

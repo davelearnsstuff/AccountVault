@@ -186,9 +186,13 @@ def test_bulk_update_refuses_a_column_it_does_not_own(vault):
 # -- dashboard ----------------------------------------------------------------
 
 def _set_category(account_id: int, category: str):
-    """Writes a raw category string, including a pre-rename slug."""
+    """Writes a raw category string, including a pre-rename slug. Encrypted,
+    as the format 2 upgrade leaves a slug an older vault stored in the clear."""
     with database.connect() as db:
-        db.execute("UPDATE accounts SET category = ? WHERE id = ?", (category, account_id))
+        db.execute("UPDATE accounts SET category = ? WHERE id = ?",
+                   (accounts_service.encrypt_field(
+                       category, accounts_service.account_aad('category', account_id)),
+                    account_id))
     accounts_service.invalidate_cache()
 
 
@@ -349,8 +353,8 @@ def test_saving_a_row_carrying_view_bookkeeping_does_not_store_it(vault):
 
     accounts_service.update_account(account['id'], row)
 
-    stored = json.loads(encryption.decrypt(raw_column(account['id'], 'extra_data'),
-                                          accounts_service.EXTRA_AAD))
+    stored = json.loads(encryption.decrypt_field(raw_column(account['id'], 'extra_data'),
+                                                accounts_service.account_aad('extra_data', account['id'])))
     assert '_match' not in stored
     assert '_category' not in stored
     assert stored['current_balance'] == 250
@@ -386,17 +390,18 @@ def test_a_record_already_carrying_bookkeeping_sheds_it_on_the_next_save(vault):
     with database.connect() as db:
         db.execute("UPDATE accounts SET extra_data = ? WHERE id = ?",
                    (accounts_service._encrypt_extra({'_match': {'key': 'name'},
-                                                     'current_balance': 7}),
+                                                     'current_balance': 7},
+                                                    account['id']),
                     account['id']))
     accounts_service.invalidate_cache()
     assert '_match' in json.loads(
-        encryption.decrypt(raw_column(account['id'], 'extra_data'),
-                           accounts_service.EXTRA_AAD))
+        encryption.decrypt_field(raw_column(account['id'], 'extra_data'),
+                                 accounts_service.account_aad('extra_data', account['id'])))
 
     accounts_service.update_account(
         account['id'], dict(accounts_service.get_account(account['id'])))
 
-    after = json.loads(encryption.decrypt(raw_column(account['id'], 'extra_data'),
-                                          accounts_service.EXTRA_AAD))
+    after = json.loads(encryption.decrypt_field(raw_column(account['id'], 'extra_data'),
+                                                accounts_service.account_aad('extra_data', account['id'])))
     assert '_match' not in after
     assert after['current_balance'] == 7   # the real field survived the cleanup

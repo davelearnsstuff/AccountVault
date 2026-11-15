@@ -240,6 +240,12 @@ def describe(status: str, path) -> str:
         'empty': f"{name} is empty — there is no vault in it.",
         'not-sqlite': f"{name} is not an AccountVault vault.",
         'not-vault': f"{name} is a database, but not an AccountVault vault.",
+        'altered': f"{name} has been changed by another program. It holds database "
+                   f"code AccountVault never adds, which could change your data "
+                   f"every time you save, so it won't be opened. Restore it from a "
+                   f"backup.",
+        'damaged': f"{name}'s password record isn't valid, so it can't be checked "
+                   f"safely and won't be opened. Restore it from a backup.",
         'unreadable': f"{name} could not be read. Another program may have it "
                       f"open, or the file may be damaged.",
         'newer': f"{name} was written by a newer version of AccountVault. "

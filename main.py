@@ -23,6 +23,7 @@ from core import database
 from core import vaultfile
 from core.version import VERSION
 from ui.main_window import MainWindow
+from ui.vault_session import warn_if_unprotected
 from ui.widgets import plain_text
 
 # Anchored to this file: AccountVault_Windows.bat, a shortcut and a shell all
@@ -39,25 +40,35 @@ _ERROR_LOG_MAX_BYTES = 256 * 1024
 
 _reporting_error = False
 
+# Set to 1 to have unexpected errors printed to stderr in full, message
+# included, as Python normally prints them. For development only: see
+# _install_excepthook for why the default leaves the message out.
+DEBUG_ENV = 'ACCOUNTVAULT_DEBUG'
+
 
 def error_log_path() -> Path:
     return database.app_data_dir() / ERROR_LOG_NAME
 
 
-def log_error(exc_type, tb) -> Path | None:
-    """Appends an unexpected error to the error log. Returns its path, or None
-    if it could not be written.
-
-    Records the exception type and the stack — file, line and function — and
+def redacted_traceback(exc_type, tb) -> str:
+    """The exception type and the stack — file, line and function — and
     deliberately not the exception's message or any frame locals. Messages can
     carry values (float('hunter2') says "could not convert string to float:
-    'hunter2'"), and this file sits outside the vault in plain text."""
-    path = error_log_path()
-    # Frames only — not format_tb, which also prints each frame's source line.
+    'hunter2'"), and both places this goes are outside the vault in plain text.
+
+    Frames only — not format_tb, which also prints each frame's source line."""
     stack = ''.join(f'  File "{frame.filename}", line {frame.lineno}, in {frame.name}\n'
                     for frame in traceback.extract_tb(tb)) if tb is not None else ''
+    return f"{stack}{exc_type.__qualname__}\n"
+
+
+def log_error(exc_type, tb) -> Path | None:
+    """Appends an unexpected error to the error log, redacted (see
+    redacted_traceback). Returns its path, or None if it could not be
+    written."""
+    path = error_log_path()
     entry = (f"--- {datetime.datetime.now().isoformat(timespec='seconds')} "
-             f"AccountVault {VERSION}\n{stack}{exc_type.__qualname__}\n")
+             f"AccountVault {VERSION}\n{redacted_traceback(exc_type, tb)}")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         created = not path.exists()
@@ -102,35 +113,25 @@ def _install_excepthook():
 
     The master password is a live local in derive_key and
     verify_master_password; owning the hook keeps a richer traceback renderer
-    from ever writing it out."""
+    from ever writing it out.
+
+    stderr gets the same redacted text as the log. It is not the terminal it
+    looks like: launched from a desktop shortcut on Linux or macOS, it goes to
+    the system journal or ~/.xsession-errors, a plain-text file outside the
+    vault. DEBUG_ENV puts the full traceback back for development."""
     def handle(exc_type, exc, tb):
         if issubclass(exc_type, KeyboardInterrupt):
             sys.__excepthook__(exc_type, exc, tb)
             return
         # pythonw.exe runs with sys.stderr set to None.
         if sys.stderr is not None:
-            sys.stderr.write(''.join(traceback.format_exception(exc_type, exc, tb)))
+            if os.environ.get(DEBUG_ENV) == '1':
+                sys.stderr.write(''.join(traceback.format_exception(exc_type, exc, tb)))
+            else:
+                sys.stderr.write(redacted_traceback(exc_type, tb))
         _report_error(exc_type, log_error(exc_type, tb))
 
     sys.excepthook = handle
-
-
-def _warn_if_unhardened():
-    """Warns when the vault file could not be restricted to the owner — most
-    likely a USB stick or network share that cannot express permissions."""
-    if database.permissions_hardened:
-        return
-    QMessageBox.warning(
-        None, 'AccountVault',
-        plain_text(
-            "The vault file's permissions could not be restricted to your account, "
-            "so other users of this machine may be able to read it.\n\n"
-            "Your data is still encrypted. This is most likely because the vault is "
-            "on a drive that cannot express file permissions, such as a USB stick or "
-            "a network share.\n\n"
-            f"Vault location: {database.DB_PATH}"
-        ),
-    )
 
 
 def _claim_taskbar_identity():
@@ -195,7 +196,7 @@ def main() -> int:
     # After QApplication, so anything it has to say can be shown.
     notice = _open_startup_vault()
     if database.DB_PATH is not None:
-        _warn_if_unhardened()
+        warn_if_unprotected()
 
     window = MainWindow()
     window.start(notice)

@@ -1,8 +1,8 @@
 """Generate hash-pinned lock files from requirements*.txt.
 
-Covers win_amd64 and manylinux x86_64 across the Python versions
-AccountVault_Windows.bat might find, so --require-hashes does not turn into
-"works only on the machine that generated it".
+Covers win_amd64, manylinux x86_64 and macOS on Apple silicon across the
+Python versions the launchers might find, so --require-hashes does not turn
+into "works only on the machine that generated it".
 """
 import hashlib
 import pathlib
@@ -19,6 +19,11 @@ PLATFORM_SETS = [
     ['win_amd64'],
     ['manylinux_2_34_x86_64', 'manylinux_2_28_x86_64',
      'manylinux2014_x86_64', 'manylinux_2_17_x86_64'],
+    # macOS on Apple silicon. pip widens the tag to every older macOS version
+    # and to universal2, so one covers the wheels packages actually publish.
+    # Not Intel Macs: cryptography publishes no x86_64 macOS wheel, and one
+    # package missing fails that platform's whole download.
+    ['macosx_15_0_arm64'],
 ]
 # What AccountVault_Windows.bat might find. Most wheels here are abi3 or pure
 # Python and cover all four with one artifact; cffi builds per version, hence
@@ -44,12 +49,17 @@ def collect(reqs, dest):
     for tags in PLATFORM_SETS:
         for version in PYTHONS:
             flags = sum((['--platform', tag] for tag in tags), [])
-            subprocess.run(
+            result = subprocess.run(
                 [PY, '-m', 'pip', 'download', *sum((['-r', str(r)] for r in reqs), []),
                  '-d', str(dest), '--only-binary=:all:', '--no-deps',
                  *flags, '--python-version', version, '-q'],
                 check=False, capture_output=True, text=True,
             )
+            # One package with no wheel for a platform fails that platform's
+            # whole download, so the lock quietly stops covering it. Say so.
+            if result.returncode != 0:
+                print(f'warning: {tags[0]} / Python {version}: '
+                      f'{result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "failed"}')
 
 
 def sha256(path):
@@ -102,11 +112,11 @@ RUNTIME_HEADER = '''# Hash-pinned install list — generated, do not edit by han
 # one dependency check worth having: a substituted cryptography or
 # argon2-cffi wheel runs inside the process that holds the master password.
 #
-# Every hash under one entry is an alternative — the wheels for win_amd64 and
-# manylinux x86_64 across Python 3.11 to 3.14, so this is not a lock that only
-# works on the machine that produced it. A platform outside that set has no
-# matching hash and will be refused rather than silently unverified; install
-# from requirements.txt there, knowingly.
+# Every hash under one entry is an alternative — the wheels for win_amd64,
+# manylinux x86_64 and macOS arm64 across Python 3.11 to 3.14, so this is not
+# a lock that only works on the machine that produced it. A platform outside
+# that set has no matching hash and will be refused rather than silently
+# unverified; install from requirements.txt there, knowingly.
 #
 # Regenerate after any version bump (Dependabot edits requirements.txt, not
 # this file), from a machine with network access:

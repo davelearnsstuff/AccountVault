@@ -3,15 +3,17 @@
 # The application window.
 #
 # The coordinator: the widget tree, the account form's lifecycle, the
-# unsaved-changes guard, the dashboard toggle, and the things that span the
-# mixins — a save writes through the service, reloads the list, and puts the
-# selection back. The mixins are the rest, each stating which slice of the
+# unsaved-changes guard, the Dashboard and Retirement panels, and the things
+# that span the mixins — a save writes through the service, reloads the list,
+# and puts the selection back. The mixins are the rest, each stating which slice of the
 # window's state it owns:
 #
 #   ui/actions.py        commands, shortcuts, the vault menu, appearance
 #   ui/vault_session.py  which vault, locked or not, and everything on a clock
 #   ui/account_list.py   the list, the tab bar, search, sort, bulk actions
 # -----------------------------------------------------------------------------
+
+import sys
 
 from PySide6.QtCore import QEvent, Qt, QTimer
 from PySide6.QtWidgets import (
@@ -27,7 +29,8 @@ from services import accounts as accounts_service
 from ui import dialogs
 from ui.account_form import AccountForm
 from ui.account_list import (
-    AGGREGATE_TABS, ALL, SIDEBAR_MAX, SIDEBAR_MIN, SORT_OPTIONS, AccountListMixin,
+    AGGREGATE_TABS, ALL, DASHBOARD, RETIREMENT, SIDEBAR_MAX, SIDEBAR_MIN, SORT_OPTIONS,
+    AccountListMixin,
 )
 from ui.actions import _FAILED, ActionsMixin
 from ui.auth_screens import ChooserScreen, LoginScreen, SetupScreen
@@ -35,8 +38,11 @@ from ui.dashboard_view import DashboardView
 from ui.detail_view import (
     DETAIL_MIN_WIDTH, BulkView, DetailView, PlaceholderView,
 )
+from ui import screen_capture
+from ui.retirement_view import RetirementView
 from ui.vault_session import (
-    VaultSessionMixin, _ActivityFilter, is_session_lock, unwatch_session_lock,
+    LOCKED_BY_SLEEP, LOCKED_BY_SYSTEM, LinuxLockWatcher, VaultSessionMixin,
+    _ActivityFilter, is_session_lock, is_suspend, unwatch_session_lock,
     watch_session_lock,
 )
 from ui.widgets import (
@@ -65,6 +71,9 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
 
         # --- session state ---
         self.settings = preferences.get_settings()
+        # The settings as they stood when the seal last vouched for them, or
+        # None until this vault has been unlocked. See _reload_settings.
+        self._verified_settings = None
         self.current_category = ALL
         self.accounts: list[dict] = []
         self.selected_id = None
@@ -100,6 +109,9 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
         # The window handle registered for Windows session-lock notifications:
         # None until first shown, 0 if registration was not possible.
         self._session_watch = None
+        # The D-Bus watcher for a Linux desktop's screen lock and sleep. None
+        # until first shown, and on every other platform.
+        self._linux_watch = None
 
         # Before the screens: the vault menu shows these very actions.
         self._build_actions()
@@ -153,6 +165,15 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
         self.apply_appearance(self.settings['theme'], self.settings['font_size'])
         self._build_shortcuts()
         QApplication.instance().installEventFilter(_ActivityFilter(self))
+        # Before the window is first shown, so it is never on screen unprotected.
+        QApplication.instance().installEventFilter(screen_capture.CaptureFilter(self))
+        # closeEvent clears a copied secret, but not every exit passes through
+        # it: logging off or shutting down ends the session, and a quit can come
+        # from elsewhere. Windows keeps clipboard data after the program that
+        # put it there has gone, so the clear has to happen on the way out.
+        QApplication.instance().aboutToQuit.connect(self._clear_clipboard)
+        QApplication.instance().commitDataRequest.connect(self._clear_clipboard_for_logoff)
+        self._apply_capture_setting()
 
     def _restore_geometry(self):
         """Puts the window back where it was last closed, or a default size when
@@ -182,10 +203,20 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
 
         self.dashboard_view = DashboardView(self.settings['theme'])
         self.dashboard_view.category_activated.connect(self._open_category_from_dashboard)
-        self.dashboard_view.account_activated.connect(self._open_account_from_dashboard)
+        self.dashboard_view.account_activated.connect(self._open_account_from_panel)
         self.dashboard_panel = self._wrap_panel(
             self.dashboard_view, 'Dashboard', self.dashboard_view.section_links)
         self.dashboard_panel.hide()
+
+        self.retirement_view = RetirementView()
+        self.retirement_view.account_activated.connect(self._open_account_from_panel)
+        self.retirement_view.locked.connect(self._handle_vault_locked)
+        self.retirement_panel = self._wrap_panel(
+            self.retirement_view, 'Retirement', self.retirement_view.view_buttons)
+        self.retirement_panel.hide()
+
+        # Each panel tab and the panel it opens in place of the list.
+        self._panels = {DASHBOARD: self.dashboard_panel, RETIREMENT: self.retirement_panel}
 
         self.content_area = self._build_content_area()
 
@@ -193,6 +224,7 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
         body.setContentsMargins(12, 12, 12, 12)
         body.setSpacing(0)
         body.addWidget(self.dashboard_panel)
+        body.addWidget(self.retirement_panel)
         body.addWidget(self.content_area)
         layout.addLayout(body, 1)
 
@@ -221,6 +253,12 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
         self.lock_chip = NavChip('alert')
         self.lock_chip.clicked.connect(self._extend_session)
 
+        # Up for as long as a demo vault is open: its password is public.
+        self.demo_chip = NavChip('alert', role='warn')
+        self.demo_chip.setProperty('level', 'warn')
+        self.demo_chip.update_text('Demo vault', preferences.DEMO_NOTICE)
+        self.demo_chip.clicked.connect(lambda: self.show_toast(preferences.DEMO_NOTICE, 6000))
+
         manage_button = IconButton(
             'gear', 'Manage vault — settings, backups, password',
             size=NAV_ICON_PX, label='Manage vault',
@@ -246,6 +284,7 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
         layout.setSpacing(10)
         layout.addLayout(brand)
         layout.addStretch(1)
+        layout.addWidget(self.demo_chip)
         layout.addWidget(self.clipboard_chip)
         layout.addWidget(self.lock_chip)
         layout.addSpacing(4)
@@ -301,7 +340,6 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
         self.list_title.setObjectName('ListTitle')
 
         self.add_button = QPushButton('+ Add New')
-        self.add_button.setObjectName('Primary')
         self.add_button.setAccessibleName('Add new account')
         self.add_button.clicked.connect(self._start_add)
 
@@ -379,6 +417,7 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
         self.detail_view = DetailView(self.settings['theme'])
         self.detail_view.edit_requested.connect(self._start_edit)
         self.detail_view.delete_requested.connect(self._delete_account)
+        self.detail_view.close_requested.connect(self._set_account_closed)
         self.detail_view.favorite_toggled.connect(self._toggle_favorite)
         self.detail_view.quick_update_requested.connect(self._quick_update)
         self.detail_view.touch_requested.connect(self._touch_account)
@@ -547,6 +586,10 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
         config = get_config(account.get('_category') or self.current_category)
         name = account.get(config['name_field']) or f"this {config['item_label'].lower()}"
 
+        # The pane offers Delete only on a closed account.
+        if not account.get('closed'):
+            return
+
         confirmed = QMessageBox.question(
             self, 'Delete Account',
             plain_text(f"Delete {name}?\n\nIt and its balance history go immediately. "
@@ -573,6 +616,41 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
             f'{name} deleted.', UNDO_WINDOW_MS,
             action_text='Undo', on_action=lambda: self._undo_last_delete(token),
         )
+
+    def _set_account_closed(self, account: dict, closed: bool):
+        """Closes or reopens the account on screen. Closing asks first, since
+        the account then leaves the list it was on; reopening does not."""
+        config = get_config(account.get('_category') or self.current_category)
+        name = account.get(config['name_field']) or f"This {config['item_label'].lower()}"
+
+        if closed and not self._confirm_close(name):
+            return
+        if self._attempt(accounts_service.set_closed, [account['id']], closed) is _FAILED:
+            return
+        self.show_toast(f'{name} closed. It is on the Closed tab.' if closed else
+                        f'{name} reopened.', 4000)
+        self._reload_view()
+        # Either way moves it between a category's list and Closed; it stays in
+        # Favorites', where it is shown again.
+        if any(a['id'] == account['id'] for a in self.accounts):
+            self._select_account(account['id'], account.get('_category'))
+        else:
+            self.selected_id = None
+            self.selected_category = None
+            self._show_placeholder()
+
+    def _confirm_close(self, name: str) -> bool:
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle('Close Account')
+        box.setText(plain_text(
+            f"Close {name}?\n\nIt moves to the Closed tab and out of the dashboard. "
+            f"It can be reopened or deleted from there."))
+        close = box.addButton('Close Account', QMessageBox.AcceptRole)
+        box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(QMessageBox.Cancel)
+        box.exec()
+        return box.clickedButton() is close
 
     def _undo_last_delete(self, token: dict):
         """Puts back the account the toast is still offering.
@@ -621,7 +699,7 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
         if self._attempt(accounts_service.touch_account, account['id'],
                          prefix='Failed') is _FAILED:
             return
-        self.show_toast('Updated date refreshed.')
+        self.show_toast('Marked as checked.')
         self._refresh_selected(account)
 
     def _quick_update(self, account: dict):
@@ -636,8 +714,11 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
         # The 'as of' date only describes an amount, so it applies only when
         # one was entered.
         as_of = dialog.balance_date() if 'current_balance' in changes else None
+        # Confirmed: a Quick Update is a reading of the balance, so it reaches
+        # history even unchanged, including when only the due date moved.
         if self._attempt(lambda: accounts_service.update_account(
-                account['id'], updated, balance_date=as_of)) is _FAILED:
+                account['id'], updated, balance_date=as_of,
+                confirm_balance=True)) is _FAILED:
             return
         self._refresh_selected(account)
 
@@ -740,10 +821,10 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
             if account is not None:
                 self._start_edit(account)
         elif kind == 'category':
-            self._hide_dashboard()
+            self._hide_panels()
             self.load_category(value)
-        elif kind == 'dashboard':
-            self._show_dashboard()
+        elif kind == 'panel':
+            self._show_panel(value)
         elif kind == 'add':
             self._start_add()
         elif kind == 'quit':
@@ -751,24 +832,39 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
             QTimer.singleShot(0, self.close)
 
     # -----------------------------------------------------------------
-    # Dashboard
+    # Panels: the Dashboard and Retirement tabs
     # -----------------------------------------------------------------
-    def _dashboard_open(self) -> bool:
-        # Whether the panel is the chosen view, not whether it is painted —
-        # the whole main screen is hidden while the login screen is up.
-        return not self.dashboard_panel.isHidden()
+    def _open_panel(self) -> str | None:
+        """The tab whose panel is the chosen view, or None for the list. Chosen,
+        not painted: the whole main screen is hidden while the login screen is
+        up."""
+        return next((key for key, panel in self._panels.items() if not panel.isHidden()),
+                    None)
 
-    def _show_dashboard(self):
+    def _dashboard_open(self) -> bool:
+        return self._open_panel() == DASHBOARD
+
+    def _show_panel(self, key: str):
+        """Puts one panel in place of the list, freshly read: either can show
+        figures an edit elsewhere has changed since."""
         self.content_area.hide()
-        self.dashboard_panel.show()
+        for panel_key, panel in self._panels.items():
+            panel.setVisible(panel_key == key)
         self._check_current_tab()
         try:
-            self.dashboard_view.reload()
+            if key == DASHBOARD:
+                self.dashboard_view.reload()
+            else:
+                self.retirement_view.reload()
         except VaultLockedError:
             self._handle_vault_locked()
 
-    def _hide_dashboard(self):
-        self.dashboard_panel.hide()
+    def _show_dashboard(self):
+        self._show_panel(DASHBOARD)
+
+    def _hide_panels(self):
+        for panel in self._panels.values():
+            panel.hide()
         self.content_area.show()
         self._check_current_tab()
 
@@ -778,16 +874,17 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
         if category in self._category_tabs:
             self._on_tab_selected(category)
 
-    def _open_account_from_dashboard(self, account_id: int, category: str):
-        """Clicking a name in the investing section opens that account in its
-        category's list, with the row highlighted and its details showing."""
+    def _open_account_from_panel(self, account_id: int, category: str):
+        """Clicking an account's name on the dashboard or the Retirement tab
+        opens it in its category's list, with the row highlighted and its
+        details showing."""
         if category not in self._category_tabs:
             return
-        # Reaching the dashboard already settled any dirty form, so this only
-        # ever prompts if something reopened one since.
+        # Reaching a panel already settled any dirty form, so this only ever
+        # prompts if something reopened one since.
         if not self._confirm_leaving_form(('category', category, None)):
             return
-        self._hide_dashboard()
+        self._hide_panels()
         self.load_category(category, select_first=False, select=(account_id, category))
         if any(a['id'] == account_id for a in self.accounts):
             self._select_account(account_id, category)
@@ -814,12 +911,17 @@ class MainWindow(VaultSessionMixin, AccountListMixin, ActionsMixin, QMainWindow)
         if self._session_watch is None:
             hwnd = int(self.winId())
             self._session_watch = hwnd if watch_session_lock(hwnd) else 0
+        if sys.platform.startswith('linux') and self._linux_watch is None:
+            self._linux_watch = LinuxLockWatcher(self)
+            self._linux_watch.locked.connect(self._on_session_locked)
 
     def nativeEvent(self, event_type, message):
+        # Deferred: the lock tears down widgets, which is not something to do
+        # inside native message dispatch.
         if is_session_lock(event_type, message):
-            # Deferred: the lock tears down widgets, which is not something to
-            # do inside native message dispatch.
-            QTimer.singleShot(0, self._on_session_locked)
+            QTimer.singleShot(0, lambda: self._on_session_locked(LOCKED_BY_SYSTEM))
+        elif is_suspend(event_type, message):
+            QTimer.singleShot(0, lambda: self._on_session_locked(LOCKED_BY_SLEEP))
         return super().nativeEvent(event_type, message)
 
     def closeEvent(self, event):

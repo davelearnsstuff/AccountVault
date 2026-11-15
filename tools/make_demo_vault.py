@@ -4,10 +4,12 @@
 #
 #   python tools/make_demo_vault.py [path]
 #
-# The vault chooser's Create Demo Vault… button runs the same build_vault.
+# The vault chooser's Create Demo Vault… button runs the same build_vault,
+# after asking for the household's figures (see Household). The script uses
+# the defaults.
 #
 # Everything in it is fictional and deliberately recognisable as such: it is a
-# middle-aged Springfield household, one main income, a mortgage most of the way
+# Springfield household, one or two incomes, a mortgage most of the way
 # through its life, two car loans, credit-card balances coming down, retirement
 # savings going up, and one crypto experiment that went the way they do. The
 # figures are the point — they are sized so the dashboard has something real to
@@ -16,7 +18,8 @@
 # What it exercises, on purpose:
 #
 #   * all nine built-in categories, with at least six accounts in each but
-#     Property, which holds the house and the two cars the loans are against
+#     Property, which holds the house and the two cars the loans are against,
+#     and Income, which holds a job or two and the closed ones before them
 #   * 31 months of balance history per money account, so the net-worth trend,
 #     the per-category sparklines and every dashboard range, 2Y included, have
 #     a run of readings behind them rather than two points
@@ -28,6 +31,12 @@
 #   * every contribution period, one amount left without a period, and two
 #     accounts nobody pays into, so the dashboard's investing section shows
 #     every kind of row it has
+#   * every Tax Treatment: Traditional, Roth, Both with its two amounts, and one
+#     left blank for the planner to assume, plus types it leaves out
+#   * the children's accounts ticked Exclude from Retirement, and one account
+#     that is somebody else's money ticked out of the dashboard as well
+#   * a saved retirement plan, so the Retirement tab opens on this household
+#     rather than the sample one
 #
 # It is a tool, not a fixture: the tests build their own vaults and never touch
 # this. Re-running it against an existing path refuses rather than overwrites,
@@ -40,16 +49,23 @@
 # -----------------------------------------------------------------------------
 
 import datetime
+import math
 import random
 import sys
+from dataclasses import astuple, dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core import auth                                       # noqa: E402
 from core import database                                   # noqa: E402
-from core.categories import trim_number                # noqa: E402
+from core import preferences                                # noqa: E402
+from core import retirement                                 # noqa: E402
+from core.categories import (                               # noqa: E402
+    BOTH, CHECKED, CONTRIBUTIONS_PER_YEAR, SPLIT_FIELDS, TRADITIONAL, trim_number,
+)
 from services import accounts as accounts_service  # noqa: E402
+from services import retirement as retirement_service  # noqa: E402
 
 PASSWORD = 'EatMyShorts123!@#'
 # Relative, so a run with no path writes to the current directory. The vault
@@ -68,6 +84,288 @@ MONTHS = 31
 SEED = 1989
 
 TODAY = datetime.date.today()
+
+
+# -----------------------------------------------------------------------------
+# The household's figures
+#
+# They size the money accounts: the jobs in Income, every Investments account,
+# the household's own bank accounts, and the saved retirement plan. Everything
+# else in Springfield is the same whatever they are.
+#
+# Each figure lands near what was asked rather than on it. 145,000 invested
+# comes out as accounts holding 148,316.27 between them, because no real
+# household's statements add up to a round number. The randomness is seeded
+# from the figures, so the same answers build the same vault.
+# -----------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Household:
+    """The defaults are about where the Springfield demo always was."""
+    two_incomes: bool = False   # False: Homer works and Marge does not
+    income: int = 58000         # yearly pay, both jobs together
+    age: int = 39               # Homer's
+    partner_age: int = 36       # Marge's
+    invested: int = 145000      # every Investments account together
+    saving_pct: int = 15        # every contribution together, as a % of pay
+
+    def check(self):
+        """ValueError for a figure outside LIMITS."""
+        if not isinstance(self.two_incomes, bool):
+            raise ValueError('two_incomes must be True or False.')
+        for key, (low, high) in LIMITS.items():
+            value = getattr(self, key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                    or not low <= value <= high:
+                raise ValueError(f'{key} must be from {low:,} to {high:,}.')
+
+
+# What each figure may be. The ages stop at 80, the planner's latest retirement
+# age: the household is still working.
+LIMITS = {
+    'income':      (10_000, 2_000_000),
+    'age':         (18, 80),
+    'partner_age': (18, 80),
+    'invested':    (0, 20_000_000),
+    'saving_pct':  (0, 50),
+}
+
+# The pay the bank balances below were written for. A household earning twice
+# as much keeps about twice as much in the bank.
+_BASE_PAY = Household().income
+
+# Each Investments account's share of the total invested and of the yearly
+# contributions, as (single income, two incomes). Only their sizes relative to
+# each other matter. An account missing from the contributions is one nobody
+# pays into; a zero is one the household does not have.
+_BALANCE_SHARES = {
+    '401k':      (0.46, 0.34),
+    'roth_ira':  (0.13, 0.11),
+    '403b':      (0,    0.15),
+    'hsa':       (0.04, 0.04),
+    '529':       (0.06, 0.06),
+    'ugma':      (0.015, 0.015),
+    'brokerage': (0.07, 0.07),
+    'espp':      (0.025, 0.025),
+    'crypto':    (0.005, 0.005),
+    'index_ira': (0.11, 0.09),
+    'rollover':  (0.07, 0.06),
+}
+_CONTRIBUTION_SHARES = {
+    '401k':      (0.55, 0.36),
+    'roth_ira':  (0.14, 0.12),
+    '403b':      (0,    0.24),
+    'hsa':       (0.07, 0.07),
+    '529':       (0.06, 0.06),
+    'brokerage': (0.06, 0.06),
+    'index_ira': (0.12, 0.09),
+}
+
+# How often each contribution goes in, and what one payment is rounded to:
+# paycheck deductions to the cent, the ones a person types to something round.
+_PAYMENTS = {
+    '401k':      ('Every 2 Weeks', 0.01),
+    'roth_ira':  ('Monthly', 25),
+    '403b':      ('Every 2 Weeks', 0.01),
+    'hsa':       ('Every 2 Weeks', 0.01),
+    '529':       ('Monthly', 10),
+    'brokerage': ('Weekly', 5),
+    'index_ira': ('Yearly', 100),
+}
+
+# Marge's accounts, whose limits go by her age. The rest go by Homer's.
+_MARGES = {'roth_ira', '403b'}
+
+# Approximate 2026 yearly limits on what one person pays in, as (limit,
+# catch-up, age the catch-up starts). They need replacing each year, as the
+# planner's tax tables do. Whatever a limit turns away goes to the brokerage
+# account instead, as it would in life.
+_LIMITS = {
+    '401k':      (24500, 8000, 50),
+    '403b':      (24500, 8000, 50),
+    'roth_ira':  (7500, 1100, 50),
+    'index_ira': (7500, 1100, 50),
+    'hsa':       (8750, 1000, 55),
+}
+
+# How an investment history is worked back from today's balance: this return
+# a year over the months it covers, with the contributions going in on the way.
+_HISTORY_RETURN = 0.06
+
+# Approximate 2026 Social Security figures: the most pay a year that counts,
+# and the benefit formula's two bend points, monthly. They need replacing
+# each year too.
+SS_WAGE_BASE = 184_500
+SS_BEND_POINTS = (1286, 7749)
+
+# Payroll tax: Social Security up to the wage base, Medicare on all of it. And
+# a flat stand-in for state income tax, Springfield's state never being named.
+_SS_TAX, _MEDICARE_TAX = 0.062, 0.0145
+_STATE_TAX = 0.05
+
+
+def _round_to(amount: float, step: float, down: bool = False):
+    """amount to the nearest step, or the step below it."""
+    steps = math.floor(amount / step) if down else round(amount / step)
+    return trim_number(round(steps * step, 2))
+
+
+def _cents(amount: float) -> str:
+    """An amount as it is stored: to the cent, with no trailing zeros."""
+    return str(trim_number(round(amount, 2)))
+
+
+def _spread(total: float, shares: dict, column: int, rng, drift: float) -> dict:
+    """total divided by the shares in one column, each part moved by up to
+    ±12%, and the lot then scaled to add up to within ±drift of the total:
+    near it, but not on it. Left to the parts' own movement, the biggest one
+    would carry the sum 5% or more off by itself."""
+    weights = {key: pair[column] * rng.uniform(0.88, 1.12)
+               for key, pair in shares.items() if pair[column]}
+    scale = total * rng.uniform(1 - drift, 1 + drift) / sum(weights.values())
+    return {key: weight * scale for key, weight in weights.items()}
+
+
+def _split(total: float, share: float) -> tuple[str, str]:
+    """total as Traditional and Roth parts that add up to it to the cent."""
+    cents = round(total * 100)
+    traditional = round(cents * share)
+    return _cents(traditional / 100), _cents((cents - traditional) / 100)
+
+
+def figures(household: Household, rng) -> dict:
+    """Every generated amount: each job's pay, each Investments account's
+    balance and payment, the 401(k)'s Traditional and Roth parts, and how far
+    the bank balances are scaled.
+
+    The payments add up to about saving_pct of pay, and the balances to about
+    the total invested. A payment a limit holds back is rounded down, so it
+    never lands a few cents over."""
+    column = 1 if household.two_incomes else 0
+
+    total = household.income * rng.uniform(0.97, 1.03)
+    if household.two_incomes:
+        homer = _round_to(total * rng.uniform(0.55, 0.65), 10)
+        pays = {'homer': homer, 'marge': _round_to(total - homer, 10)}
+    else:
+        pays = {'homer': _round_to(total, 10)}
+    # Rounded to tens, pay lands on the figure asked about one time in 350.
+    # Near it is the point, so that one time it moves.
+    if sum(pays.values()) == household.income:
+        pays['homer'] += 10
+    pay = sum(pays.values())
+
+    balances = {key: round(value, 2) for key, value in
+                _spread(household.invested, _BALANCE_SHARES, column, rng, 0.03).items()}
+    yearly = _spread(pay * household.saving_pct / 100, _CONTRIBUTION_SHARES, column, rng, 0.03)
+    capped = set()
+    for key, (limit, catch_up, from_age) in _LIMITS.items():
+        if key not in yearly:
+            continue
+        age = household.partner_age if key in _MARGES else household.age
+        cap = limit + (catch_up if age >= from_age else 0)
+        if yearly[key] > cap:
+            yearly['brokerage'] += yearly[key] - cap
+            yearly[key] = cap
+            capped.add(key)
+
+    payments = {}
+    for key, value in yearly.items():
+        period, step = _PAYMENTS[key]
+        payments[key] = _round_to(value / CONTRIBUTIONS_PER_YEAR[period], step,
+                                  down=key in capped)
+
+    return {
+        'pays': pays,
+        'balances': balances,
+        'payments': payments,
+        # Most of a 401(k) went in before the Roth option arrived; a younger
+        # share of what goes in now is Roth.
+        'balance_parts': _split(balances['401k'], rng.uniform(0.78, 0.88)),
+        'payment_parts': _split(payments['401k'], rng.uniform(0.6, 0.75)),
+        'scale': pay / _BASE_PAY,
+    }
+
+
+def yearly_payments(money: dict) -> dict:
+    """Each account's payment as a yearly figure, as the dashboard counts it."""
+    return {key: amount * CONTRIBUTIONS_PER_YEAR[_PAYMENTS[key][0]]
+            for key, amount in money['payments'].items()}
+
+
+def _history_start(balance: float, yearly: float) -> float:
+    """Where an Investments account stood when its history begins: today's
+    balance less what was paid in since and what the market added to it.
+
+    Never below a fifth of today's, so an account that is mostly new money
+    still draws a line rather than starting from nothing."""
+    years = (MONTHS - 1) / 12
+    growth = (1 + _HISTORY_RETURN) ** years
+    # Paid in all the way through, so on average each payment grew for half.
+    paid_in = yearly * years * (1 + (growth - 1) / 2)
+    return max((balance - paid_in) / growth, balance * 0.2)
+
+
+def social_security(pay: float) -> int:
+    """A rough monthly benefit at 67 for someone paid `pay` a year.
+
+    The real formula averages the best 35 years of pay, indexed for wage
+    growth. Here today's pay stands in for every one of them, which is as
+    close as a demo needs."""
+    monthly = min(pay, SS_WAGE_BASE) / 12
+    low, high = SS_BEND_POINTS
+    return math.floor(0.9 * min(monthly, low)
+                      + 0.32 * max(0.0, min(monthly, high) - low)
+                      + 0.15 * max(0.0, monthly - high))
+
+
+def benefits(pays: dict) -> tuple[int, int]:
+    """Homer's and Marge's monthly Social Security at 67: each one's own
+    rough benefit, or half the other's where that is more, as a spouse's
+    benefit pays."""
+    homer = social_security(pays['homer'])
+    marge = social_security(pays.get('marge', 0))
+    return max(homer, marge // 2), max(marge, homer // 2)
+
+
+def take_home(pays, pretax: float) -> float:
+    """A year's pay after tax, before any of it is saved. Married filing
+    jointly, with pre-tax contributions kept out of income tax but not payroll
+    tax, as a 401(k)'s are."""
+    gross = sum(pays)
+    table = retirement.TAX_TABLES['joint']
+    taxed = max(0.0, gross - pretax)
+    federal = retirement.ordinary_tax(max(0.0, taxed - table.standard), table)
+    payroll = sum(min(pay, SS_WAGE_BASE) * _SS_TAX + pay * _MEDICARE_TAX for pay in pays)
+    return gross - federal - payroll - taxed * _STATE_TAX
+
+
+def plan_details(household: Household, rng, money: dict) -> dict:
+    """The retirement plan's details for the household.
+
+    Spending is take-home pay less everything saved: what the household lives
+    on now, carried into retirement. Social Security is not here: the plan
+    reads it from the Income records (see benefits). Birth months are picked
+    at random, and the years follow from the ages."""
+    pays = money['pays']
+    yearly = yearly_payments(money)
+    per_year = CONTRIBUTIONS_PER_YEAR[_PAYMENTS['401k'][0]]
+    pretax = (float(money['payment_parts'][0]) * per_year
+              + yearly.get('403b', 0) + yearly.get('hsa', 0))
+    spending = take_home(pays.values(), pretax) - sum(yearly.values())
+    # A household saving half its pay on a big salary can come out with
+    # almost nothing left; nobody lives on that.
+    spending = max(spending, 0.1 * sum(pays.values()))
+
+    details = {
+        'partner': True,
+        'spending': _round_to(spending, 100),
+    }
+    for prefix, age in (('', household.age), ('partner_', household.partner_age)):
+        month = rng.randint(1, 12)
+        details[f'{prefix}birth_month'] = month
+        details[f'{prefix}birth_year'] = TODAY.year - age - (1 if TODAY.month < month else 0)
+    return details
 
 
 # -----------------------------------------------------------------------------
@@ -96,7 +394,8 @@ def _days_in_month(year: int, month: int) -> int:
 
 
 def series(rng, start: float, end: float, shape: str = 'linear',
-           wobble: float = 0.0, day: int = 12, stop_before_days: int = 0):
+           wobble: float = 0.0, day: int = 12, stop_before_days: int = 0,
+           finish: float | None = None):
     """(amount, YYYY-MM-DD) readings, oldest first.
 
     `wobble` is a fraction of the value, so a checking account swings by
@@ -106,6 +405,10 @@ def series(rng, start: float, end: float, shape: str = 'linear',
     `stop_before_days` ends the series that many days before today, which is
     how an account is made to look stale without pretending anything else about
     it changed.
+
+    `finish` is what the newest reading says, exactly, whatever the shape and
+    wobble made of it. The Investments accounts end on theirs, so they add up
+    to the total the household asked for.
     """
     cutoff = TODAY - datetime.timedelta(days=stop_before_days)
     readings = []
@@ -148,6 +451,9 @@ def series(rng, start: float, end: float, shape: str = 'linear',
             continue
         readings.append((str(trim_number(round(max(value, 0.0), 2))), stamp.isoformat()))
 
+    if finish is not None and readings:
+        readings[-1] = (_cents(finish), readings[-1][1])
+
     # An account whose reading day falls after today loses this month's entry
     # and starts the demo looking a month stale — which is the right behaviour
     # and the wrong data. Anything not deliberately left to age gets a closing
@@ -166,6 +472,16 @@ def flat_series(rng, values: list[tuple[str, str]]):
     return [(str(trim_number(float(amount))), date) for amount, date in values]
 
 
+def _raises(rng, pay: int, days_back) -> list[tuple[str, str]]:
+    """Yearly pay readings ending on `pay`, taken that many days back, with a
+    raise of 2.5 to 4% between each. Oldest first."""
+    readings = []
+    for days in sorted(days_back):
+        readings.append((str(pay), behind(days)))
+        pay = _round_to(pay / rng.uniform(1.025, 1.04), 10)
+    return list(reversed(readings))
+
+
 def ahead(days: int) -> str:
     return (TODAY + datetime.timedelta(days=days)).isoformat()
 
@@ -182,29 +498,38 @@ def behind(days: int) -> str:
 # readings given outright.
 # -----------------------------------------------------------------------------
 
-def build() -> list[tuple[dict, object]]:
+def build(household: Household, rng, money: dict) -> list[tuple[dict, object]]:
+    """The accounts, with `money` (see figures) in the ones the household's
+    figures size."""
     rows = []
 
     def add(category, history=None, **fields):
         rows.append(({'category': category, **fields}, history))
 
     # -- Banking --------------------------------------------------------------
-    add('Banking', {'start': 2400, 'end': 3150, 'shape': 'saw', 'day': 4},
+    # The household's own accounts follow its pay; the children's do not.
+    def cash(start, end):
+        factor = money['scale'] * rng.uniform(0.9, 1.1)
+        return {'start': round(start * factor, 2), 'end': round(end * factor, 2)}
+
+    paychecks = 'Both paychecks land' if household.two_incomes else 'Paycheck lands'
+    add('Banking', {**cash(2400, 3150), 'shape': 'saw', 'day': 4},
         name='Springfield National — Joint Checking', bank_name='Springfield National Bank',
         account_number='4404102938', routing_number='061000227', account_type='Checking',
         username='homer.j.simpson', password='D0ughnut-Fri4y-Checking!',
         website='https://springfieldnational.example.com',
-        notes="Paycheck lands here on the 1st and the 15th. Marge moves the rest out "
-              "before Homer notices it.", favorite=True)
+        notes=f"{paychecks} here on the 1st and the 15th. Marge moves the rest out "
+              f"before Homer notices it.", favorite=True)
 
-    add('Banking', {'start': 3200, 'end': 9800, 'shape': 'linear', 'wobble': 0.03, 'day': 6},
+    transfer = max(5, _round_to(180 * money['scale'], 5))
+    add('Banking', {**cash(3200, 9800), 'shape': 'linear', 'wobble': 0.03, 'day': 6},
         name='Springfield National — Family Savings', bank_name='Springfield National Bank',
         account_number='4404102946', routing_number='061000227', account_type='Savings',
         username='marge.simpson', password='Blue-H4ir-Savings-Plan!',
         website='https://springfieldnational.example.com',
-        notes='Automatic transfer of $180 every payday. Do not mention to Homer.')
+        notes=f'Automatic transfer of ${transfer:,} every payday. Do not mention to Homer.')
 
-    add('Banking', {'start': 180, 'end': 540, 'shape': 'saw', 'day': 9,
+    add('Banking', {**cash(180, 540), 'shape': 'saw', 'day': 9,
                     'stop_before_days': 62},
         name="First Bank of Springfield — Homer's Duff Money",
         bank_name='First Bank of Springfield', account_number='7781204455',
@@ -213,7 +538,7 @@ def build() -> list[tuple[dict, object]]:
         website='https://firstbankofspringfield.example.com',
         notes='"Discretionary." Not reconciled since the summer.')
 
-    add('Banking', {'start': 850, 'end': 2150, 'shape': 'linear', 'wobble': 0.06, 'day': 11},
+    add('Banking', {**cash(850, 2150), 'shape': 'linear', 'wobble': 0.06, 'day': 11},
         name='Springfield Credit Union — Household Account',
         bank_name='Springfield Credit Union', account_number='2200198374',
         routing_number='271070801', account_type='Money Market',
@@ -227,29 +552,42 @@ def build() -> list[tuple[dict, object]]:
         account_number='4404880021', routing_number='061000227', account_type='Savings',
         username='elbarto', password='Ay-Carumb4-Savings!',
         website='https://springfieldnational.example.com',
-        notes='Birthday money and the proceeds of at least one scheme.')
+        notes='Birthday money and the proceeds of at least one scheme.',
+        exclude_retirement=CHECKED)
 
     add('Banking', {'start': 110, 'end': 830, 'shape': 'linear', 'wobble': 0.04, 'day': 20},
         name="Lisa's Saxophone Fund", bank_name='Springfield National Bank',
         account_number='4404880039', routing_number='061000227', account_type='Savings',
         username='lisa.m.simpson', password='Baritone-R33d-Fund!',
         website='https://springfieldnational.example.com',
-        notes='Saving for a Yamaha. Tracks every cent of it herself.')
+        notes='Saving for a Yamaha. Tracks every cent of it herself.',
+        exclude_retirement=CHECKED)
 
     add('Banking', {'start': 60, 'end': 385, 'shape': 'steps', 'day': 22},
         name="Maggie's Passbook", bank_name='Springfield Credit Union',
         account_number='2200440117', routing_number='271070801', account_type='Savings',
         username='marge.simpson', password='P4cifier-Passbook-2019!',
         website='https://springfieldcu.example.com',
-        notes='Opened the week she was born. Grandparents top it up at Christmas.')
+        notes='Opened the week she was born. Grandparents top it up at Christmas.',
+        exclude_retirement=CHECKED)
 
-    add('Banking', {'start': 1200, 'end': 5600, 'shape': 'linear', 'wobble': 0.02, 'day': 15},
+    add('Banking', {**cash(1200, 5600), 'shape': 'linear', 'wobble': 0.02, 'day': 15},
         name='Nuclear Plant CU — Emergency Fund',
         bank_name='Springfield Nuclear Employees Credit Union',
         account_number='9903441266', routing_number='271071140', account_type='Savings',
         username='hjs.employee', password='Sector-7G-Emergency!',
         website='https://sncecu.example.com',
         notes='Three months of expenses is the target. Currently about six weeks.')
+
+    # Somebody else's money: off the dashboard and out of the plan both.
+    add('Banking', {'start': 4100, 'end': 3350, 'shape': 'saw', 'day': 3},
+        name="Grampa's Pension Account", bank_name='Springfield Credit Union',
+        account_number='2200071953', routing_number='271070801', account_type='Checking',
+        username='abe.simpson', password='Back-In-My-D4y-Pension!',
+        website='https://springfieldcu.example.com',
+        notes="Marge pays the Retirement Castle out of it. It's his money, not "
+              "theirs, so it stays off the dashboard and out of the plan.",
+        exclude_dashboard=CHECKED, exclude_retirement=CHECKED)
 
     add('Banking', {'start': 2100, 'end': 0, 'shape': 'linear', 'day': 14,
                     'stop_before_days': 300},
@@ -399,49 +737,89 @@ def build() -> list[tuple[dict, object]]:
         notes='Boat sold. Loan closed. Nobody discusses the boat.')
 
     # -- Investments ----------------------------------------------------------
-    add('Investments', {'start': 52000, 'end': 71400, 'shape': 'vol', 'day': 28},
+    # Every balance and payment here comes from the household's figures. Each
+    # history is worked back from today's balance and ends on it exactly.
+    balances, payments = money['balances'], money['payments']
+    yearly = yearly_payments(money)
+
+    def invested(key, day, start=None, **spec):
+        balance = balances[key]
+        if start is None:
+            start = _history_start(balance, yearly.get(key, 0))
+        return {'start': start, 'end': balance, 'shape': 'vol', 'day': day,
+                'finish': balance, **spec}
+
+    def paid(key):
+        return {'contribution_amount': _cents(payments[key]),
+                'contribution_period': _PAYMENTS[key][0]}
+
+    traditional, roth = money['balance_parts']
+    traditional_paid, roth_paid = money['payment_parts']
+    add('Investments', invested('401k', 28),
         name='Nuclear Plant 401(k)', institution='Springfield Nuclear Power Plant',
-        account_number='401K-7G-0042', account_type='401k', contribution_amount='102',
-        contribution_period='Every 2 Weeks',
+        account_number='401K-7G-0042', account_type='401k', tax_treatment=BOTH,
+        traditional_balance=traditional, roth_balance=roth,
+        traditional_contribution=traditional_paid, roth_contribution=roth_paid,
+        contribution_period=_PAYMENTS['401k'][0],
         username='hjs.employee', password='Sector-7G-R3tirement!',
         website='https://sncplan.example.com',
-        notes='6% with a 3% match. Vested. The single biggest thing they own.',
+        notes='Part Traditional, part Roth, out of every paycheck. Vested. '
+              'The biggest account they have.',
         favorite=True)
 
-    add('Investments', {'start': 16500, 'end': 24800, 'shape': 'vol', 'day': 27},
+    since = ('Contributed to every month since.' if household.two_incomes else
+             "A spousal IRA now, paid in from Homer's pay every month.")
+    add('Investments', invested('roth_ira', 27),
         name="Marge's Roth IRA", institution='Springfield Mutual',
-        account_number='IRA-558820', account_type='Roth IRA', contribution_amount='200',
-        contribution_period='Monthly',
+        account_number='IRA-558820', account_type='Roth IRA', **paid('roth_ira'),
         username='marge.b.simpson', password='Roth-IRA-Bouff4nt-2020!',
         website='https://springfieldmutual.example.com',
-        notes='Opened with pretzel-wagon money. Contributed to every month since.')
+        notes=f'Opened with pretzel-wagon money. {since}')
 
-    add('Investments', {'start': 8200, 'end': 15600, 'shape': 'vol', 'day': 25},
+    if household.two_incomes:
+        add('Investments', invested('403b', 26),
+            name='Springfield Elementary 403(b)', institution='Springfield School District',
+            account_number='403B-SE-1187', account_type='403b', tax_treatment=TRADITIONAL,
+            **paid('403b'),
+            username='marge.b.simpson', password='Sch00l-District-403b!',
+            website='https://springfieldschools.example.com',
+            notes='Through the school district, Traditional only. The district has '
+                  'been "looking into" a Roth option for years.')
+
+    add('Investments', invested('hsa', 21),
+        name='Nuclear Plant HSA', institution='Springfield Mutual',
+        account_number='HSA-7G-0042', account_type='HSA', **paid('hsa'),
+        username='hjs.employee', password='Health-S4vings-Sector7G!',
+        website='https://sncplan.example.com',
+        notes='Family coverage through the plant. Invested, not spent: the '
+              'receipts are in a shoebox.')
+
+    add('Investments', invested('529', 25),
         name="Lisa's 529 College Savings", institution='Springfield Education Trust',
-        account_number='529-LMS-0008', account_type='Other', contribution_amount='150',
-        contribution_period='Monthly',
+        account_number='529-LMS-0008', account_type='Other', **paid('529'),
         username='marge.b.simpson', password='529-Saxoph0ne-Scholar!',
         website='https://springfieldedtrust.example.com',
-        notes='Target is an out-of-state private university. Current pace: not that.')
+        notes='Target is an out-of-state private university. Current pace: not that.',
+        exclude_retirement=CHECKED)
 
-    add('Investments', {'start': 1100, 'end': 2300, 'shape': 'vol', 'day': 24},
+    add('Investments', invested('ugma', 24),
         name="Bart's UGMA Custodial Account", institution='Springfield Mutual',
         account_number='UGMA-BJS-0010', account_type='Brokerage',
         contribution_amount='40', username='marge.b.simpson',
         password='Custodial-Und3rachiever!',
         website='https://springfieldmutual.example.com',
-        notes='He gets control of it at 21. Marge is not looking forward to it.')
+        notes='He gets control of it at 21. Marge is not looking forward to it.',
+        exclude_retirement=CHECKED)
 
-    add('Investments', {'start': 5800, 'end': 9400, 'shape': 'vol', 'wobble': 0.05, 'day': 14},
+    add('Investments', invested('brokerage', 14, wobble=0.05),
         name='Springfield Mutual Brokerage', institution='Springfield Mutual',
-        account_number='BRK-441002', account_type='Brokerage', contribution_amount='25',
-        contribution_period='Weekly',
+        account_number='BRK-441002', account_type='Brokerage', **paid('brokerage'),
         username='homer.j.simpson', password='Br0kerage-Hold-The-Line!',
         website='https://springfieldmutual.example.com',
         notes='Taxable account. Three funds and one very bad stock tip from Lenny.')
 
-    add('Investments', {'start': 2100, 'end': 3600, 'shape': 'vol', 'day': 16,
-                        'stop_before_days': 77},
+    add('Investments', invested('espp', 16, start=balances['espp'] * 0.6,
+                                stop_before_days=77),
         name='Duff Corp Employee Stock', institution='Duff Corporation',
         account_number='ESPP-DUFF-0199', account_type='Brokerage',
         contribution_amount='0', username='duffman.fan1',
@@ -449,22 +827,33 @@ def build() -> list[tuple[dict, object]]:
         website='https://duffcorp.example.com',
         notes='From the taste-tester stipend years. Statement not opened since July.')
 
-    add('Investments', {'start': 900, 'end': 210, 'shape': 'vol', 'wobble': 0.2, 'day': 11,
-                        'stop_before_days': 113},
+    bought_at = rng.uniform(4.0, 4.6)
+    add('Investments', invested('crypto', 11, start=balances['crypto'] * bought_at,
+                                wobble=0.2, stop_before_days=113),
         name="Homer's Crypto Experiment", institution='CoinDuff Exchange',
         account_number='WALLET-0xD0H', account_type='Other', contribution_amount='0',
         username='chunkylover53', password='D0h-Coin-To-The-Moon!',
         website='https://coinduff.example.com',
-        notes='Down 77%. Homer describes this as "a long-term position". '
-              'Not looked at since the spring.')
+        notes=f'Down {round(100 * (1 - 1 / bought_at))}%. Homer describes this as '
+              f'"a long-term position". Not looked at since the spring.')
 
-    add('Investments', {'start': 12000, 'end': 19200, 'shape': 'vol', 'day': 29},
+    add('Investments', invested('index_ira', 29),
         name='Springfield Index Fund', institution='Springfield Mutual',
-        account_number='IDX-770033', account_type='IRA', contribution_amount='1500',
-        contribution_period='Yearly',
+        account_number='IDX-770033', account_type='IRA', tax_treatment=TRADITIONAL,
+        **paid('index_ira'),
         username='marge.b.simpson', password='Index-Fund-Bor1ng-Good!',
         website='https://springfieldmutual.example.com',
         notes="Marge's idea. Quietly the best-performing thing in the house.")
+
+    # Tax Treatment left blank on purpose: the planner counts it as
+    # Traditional and says it assumed so.
+    add('Investments', invested('rollover', 19),
+        name="Rollover IRA — Bowlarama Job", institution='Springfield Mutual',
+        account_number='IRA-RO-330917', account_type='IRA',
+        username='homer.j.simpson', password='Pin-M0nkey-Rollover!',
+        website='https://springfieldmutual.example.com',
+        notes="Rolled over from the pin-monkey job at Barney's Bowlarama. Nobody "
+              "wrote down whether it was Traditional, so the planner assumes it is.")
 
     # -- Property -------------------------------------------------------------
     # Revalued a few times a year rather than monthly, as a house or a car is.
@@ -493,48 +882,59 @@ def build() -> list[tuple[dict, object]]:
         notes='Twelve yards long, two lanes wide. Depreciating at about the same scale.')
 
     # -- Income ---------------------------------------------------------------
-    add('Income', flat_series(None, [
-            ('41500', behind(900)), ('42800', behind(540)), ('44200', behind(160))]),
-        name='Springfield Nuclear Power Plant — Safety Inspector',
+    # The jobs are the only pay still open, so the income the dashboard counts
+    # is the pay the household's figures asked for. The rest are closed:
+    # income that was.
+    pays = money['pays']
+    add('Income', _raises(rng, pays['homer'], (900, 540, 160)),
+        name='Springfield Nuclear Power Plant — Safety Inspector', income_type='Pay',
         username='hjs.employee', password='Payroll-Sector-7G-2026!',
         website='https://sncpayroll.example.com',
         notes='Grade 4 technician, Sector 7-G. Last raise in April. '
               'Mr. Burns still does not know his name.')
 
+    if household.two_incomes:
+        add('Income', _raises(rng, pays['marge'], (700, 130)),
+            name='Springfield Elementary — Front Office', income_type='Pay',
+            username='marge.b.simpson',
+            password='Hall-P4ss-Front-Office!',
+            website='https://springfieldelementary.example.com',
+            notes="Started when Maggie went to daycare. Has now read Bart's "
+                  "permanent record in full.")
+
+    # Social Security still to come: a future figure, not a current one, so
+    # it is ticked off the dashboard. The retirement plan reads it, Homer's as
+    # yours and Marge's as your partner's, as the plan has them.
+    homer_ss, marge_ss = benefits(pays)
+    add('Income', name='Social Security — Homer', income_type='Social Security',
+        monthly_benefit=str(homer_ss), whose='You', exclude_dashboard=CHECKED,
+        username='homer.j.simpson',
+        password='My-SSA-D0h-742!', website='https://ssa.example.gov',
+        notes='Benefit at 67 from the last statement. Has asked twice whether '
+              'it can be paid in donuts.')
+    add('Income', name='Social Security — Marge', income_type='Social Security',
+        monthly_benefit=str(marge_ss), whose='Partner', exclude_dashboard=CHECKED,
+        username='marge.b.simpson',
+        password='Blue-Hair-SSA-742!', website='https://ssa.example.gov',
+        notes='Benefit at 67, or half of Homer\'s if that is more.')
+
     add('Income', flat_series(None, [
-            ('3200', behind(880)), ('4100', behind(500)), ('5400', behind(120))]),
-        name="Marge's Pretzel Wagon", username='marge.b.simpson',
+            ('3200', behind(880)), ('4100', behind(620)), ('5400', behind(400))]),
+        name="Marge's Pretzel Wagon", income_type='Other', username='marge.b.simpson',
         password='Pretzel-Wag0n-Books!', website='https://springfieldcu.example.com',
-        notes='Seasonal, cash-heavy, and growing every year.')
+        notes='Sold when the franchise war started. Kept for the tax records.',
+        closed=True)
 
-    add('Income', flat_series(None, [('2800', behind(300))]),
-        name='Mr. Plow — Winter Income', username='mrplow.homer',
+    add('Income', flat_series(None, [('2800', behind(640))]),
+        name='Mr. Plow — Winter Income', income_type='Other', username='mrplow.homer',
         password='Call-Mr-Pl0w-3550!', website='https://springfieldshopper.example.com',
-        notes='"That\'s my name, that name again is Mr. Plow." Winter only.')
-
-    add('Income', flat_series(None, [('520', behind(400)), ('640', behind(90))]),
-        name="Bart's Paper Route", username='elbarto', password='Paper-R0ute-Springfield!',
-        website='https://springfieldshopper.example.com',
-        notes='Springfield Shopper, six mornings a week. Mostly delivered.')
-
-    add('Income', flat_series(None, [('800', behind(420)), ('1100', behind(70))]),
-        name="Lisa's Saxophone Lessons", username='lisa.m.simpson',
-        password='Teaching-Sc4les-Lisa!',
-        notes='Four students, Tuesday and Thursday afternoons.')
-
-    add('Income', flat_series(None, [('2200', behind(430)), ('2400', behind(120))]),
-        name='Grampa — Household Contribution', username='—', password='—',
-        notes='His pension, towards groceries. Arrives with a story attached.')
+        notes='"That\'s my name, that name again is Mr. Plow." Ended when the '
+              'Plow King came to town.', closed=True)
 
     add('Income', flat_series(None, [('1800', behind(600))]),
-        name='Duff Taste-Tester Stipend', username='duffman.fan1',
+        name='Duff Taste-Tester Stipend', income_type='Other', username='duffman.fan1',
         password='T4ste-Tester-Stipend!', website='https://duffcorp.example.com',
         notes='Ended when the programme did. Kept for the tax records.', closed=True)
-
-    add('Income', flat_series(None, [('750', behind(330)), ('900', behind(95))]),
-        name='Springfield Shopper — Freelance Column', username='marge.b.simpson',
-        password='Freel4nce-Column-Pay!', website='https://springfieldshopper.example.com',
-        notes='Occasional household-tips column. Paid per piece.')
 
     # -- Utilities ------------------------------------------------------------
     add('Utilities', {'start': 168, 'end': 196, 'shape': 'seasonal', 'day': 24},
@@ -770,14 +1170,27 @@ def build() -> list[tuple[dict, object]]:
 # Writing
 # -----------------------------------------------------------------------------
 
-def _apply_history(rng, account_id: int, spec):
-    """Files an account's readings. Returns the date of the newest one."""
+def _apply_history(rng, account_id: int, spec, parts: dict):
+    """Files an account's readings. Returns the date of the newest one.
+
+    A Both account's Traditional and Roth parts go on with its newest reading,
+    saved as a dated balance through the same path the form uses, so the
+    account ends up holding the parts of the balance it shows. Given at
+    creation, they would file their sum as a reading dated today instead."""
     if spec is None:
         return None
     entries = spec if isinstance(spec, list) else series(rng, **spec)
     if not entries:
         return None
-    accounts_service.add_balance_entries(account_id, entries)
+    if parts:
+        *earlier, (_, newest) = entries
+        if earlier:
+            accounts_service.add_balance_entries(account_id, earlier)
+        account = accounts_service.get_account(account_id)
+        accounts_service.update_account(account_id, {**account, **parts},
+                                        balance_date=newest)
+    else:
+        accounts_service.add_balance_entries(account_id, entries)
     return max(date for _, date in entries)
 
 
@@ -797,13 +1210,16 @@ def _backdate(account_id: int, last_updated: str, date_added: str):
     accounts_service.invalidate_cache()
 
 
-def build_vault(path) -> dict:
-    """Builds the demo vault at `path` and leaves it open and unlocked, as
-    creating a vault does. Returns how many accounts went into each category,
-    and how many of them are pinned and closed.
+def build_vault(path, household: Household | None = None) -> dict:
+    """Builds the demo vault at `path` for `household` (the defaults when
+    None), and leaves it open and unlocked, as creating a vault does. Returns
+    how many accounts went into each category, and how many of them are
+    pinned and closed.
 
-    Raises FileExistsError for a path already in use. The check is here rather
-    than in either caller, so the script and the app's button both keep it.
+    Raises FileExistsError for a path already in use, and ValueError for a
+    household figure outside LIMITS, both before any file is made. The checks
+    are here rather than in either caller, so the script and the app's button
+    both keep them.
     """
     global TODAY
     # Re-read on every build, not trusted from import time: the app imports
@@ -811,6 +1227,8 @@ def build_vault(path) -> dict:
     # of step has every due date and stale account one day off.
     TODAY = datetime.date.today()
 
+    household = household or Household()
+    household.check()
     path = Path(path)
     if path.exists():
         raise FileExistsError(f'{path} already exists. Delete it first, or name another file.')
@@ -818,9 +1236,15 @@ def build_vault(path) -> dict:
     path.parent.mkdir(parents=True, exist_ok=True)
     database.open_vault(path, create=True)
     auth.setup_master_password(PASSWORD)
+    # PASSWORD is public, so the app warns whenever this vault is in use.
+    preferences.mark_demo_vault()
 
-    rng = random.Random(SEED)
-    rows = build()
+    # Seeded from the figures as well as SEED: the same answers build the same
+    # vault, and different ones a different scatter around their totals.
+    rng = random.Random(f'{SEED}:{astuple(household)}')
+    money = figures(household, rng)
+    rows = build(household, rng, money)
+    details = plan_details(household, rng, money)
 
     counts = {}
     pinned = []
@@ -829,13 +1253,15 @@ def build_vault(path) -> dict:
         fields = dict(fields)
         favorite = fields.pop('favorite', False)
         is_closed = fields.pop('closed', False)
+        parts = {key: fields.pop(key) for key in SPLIT_FIELDS['current_balance']
+                 if key in fields}
         # current_balance is deliberately not set here for anything with a
         # history. create_account would file a snapshot dated today, which would
         # then outrank every reading below it and hold the account on a figure
         # the series never produced. The readings are what set the balance —
         # _sync_current_balance points the account at its newest entry.
         account = accounts_service.create_account(fields)
-        newest = _apply_history(rng, account['id'], history)
+        newest = _apply_history(rng, account['id'], history, parts)
 
         # date_added sits a little before the first reading, so an account that
         # has been going for years does not claim to have been filed today.
@@ -855,6 +1281,8 @@ def build_vault(path) -> dict:
         accounts_service.set_favorite(account_id, True)
     if closed:
         accounts_service.set_closed(closed, True)
+
+    retirement_service.save_plan({**retirement.empty_plan(), 'details': details})
 
     return {'categories': counts, 'pinned': len(pinned), 'closed': len(closed)}
 

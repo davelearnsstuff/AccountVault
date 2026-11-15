@@ -17,14 +17,29 @@
 #   copy         — gets a copy button. On a sensitive field it copies the real
 #                  value while it is still masked
 #   link         — rendered as a clickable link
+#   last4        — on a sensitive field, the masked value still shows its last
+#                  four characters ('•••• 4821'), so two cards can be told apart
+#   no_search    — kept out of search without being masked: a security question
+#                  is not a secret, but it sits beside one
 #   hide_in_form — shown in the detail view but not editable directly
 #   default      — value a *new* record starts on. Select fields only, and never
 #                  applied to an existing one
+#   shown_when   — (key, values): the field applies only while the field named
+#                  by key is itself shown and holds one of values. Hidden in the
+#                  form and the detail view otherwise, and cleared on save
+#   hidden_when  — (key, values): the reverse. The field applies unless the
+#                  field named by key holds one of values, so a value nobody
+#                  listed (blank, or an import's own spelling) keeps it
+#
+# Select options may be reordered or added to, never renamed or removed: the
+# edit form shows a stored value it has no option for as blank, and saving the
+# account then writes that blank over it.
 # -----------------------------------------------------------------------------
 
 import datetime
 import math
 import re
+from decimal import Decimal
 
 # -----------------------------------------------------------------------------
 # Field schemas
@@ -81,6 +96,76 @@ CONTRIBUTIONS_PER_YEAR = {
     'Yearly':        1,
 }
 
+# Whether a retirement account's money is taxed when withdrawn (Traditional),
+# not at all (Roth), or some of each (Both). No default, for the reason the
+# contribution period has none: a treatment nobody picked would be counted as
+# if someone had.
+TAX_TREATMENT_KEY = 'tax_treatment'
+TRADITIONAL = 'Traditional'
+ROTH = 'Roth'
+BOTH = 'Both'
+TAX_TREATMENTS = [TRADITIONAL, ROTH, BOTH]
+
+# The account types a tax treatment is asked for. The rest decide it
+# themselves: a Roth IRA is Roth, an HSA an HSA, and a brokerage account taxable.
+TAX_TREATMENT_TYPES = ('401k', '403b', '457b', 'IRA', 'SEP IRA', 'SIMPLE IRA')
+
+# On a Both account, each of these totals is the sum of its (Traditional, Roth)
+# parts, entered in dollars the way a statement or pay stub shows them. The
+# total is what the rest of the app reads; only the retirement planner reads
+# the parts.
+SPLIT_FIELDS = {
+    'current_balance':     ('traditional_balance', 'roth_balance'),
+    'contribution_amount': ('traditional_contribution', 'roth_contribution'),
+}
+
+_BOTH_ONLY = (TAX_TREATMENT_KEY, (BOTH,))
+
+# Checkbox fields. A ticked one is stored as 'Yes', as Auto Pay is, so an
+# export carries it as text and its re-import reads it back; unticked, it is
+# blank. is_checked is the one test of whether a value is ticked.
+CHECKED = 'Yes'
+
+# Ticked, an account is left out of every figure on the dashboard (balances,
+# net worth, trends, the investing rate), or out of the retirement planner:
+# a child's 529, or money looked after for someone else. Each is independent
+# of the other, and neither hides the account anywhere else.
+EXCLUDE_DASHBOARD_KEY = 'exclude_dashboard'
+EXCLUDE_RETIREMENT_KEY = 'exclude_retirement'
+_EXCLUDE_DASHBOARD = {'key': EXCLUDE_DASHBOARD_KEY, 'label': 'Exclude from Dashboard',
+                      'type': 'checkbox', 'text': 'Leave out of every dashboard figure'}
+_EXCLUDE_RETIREMENT = {'key': EXCLUDE_RETIREMENT_KEY, 'label': 'Exclude from Retirement',
+                       'type': 'checkbox', 'text': "Not for retirement, like a child's 529"}
+
+
+# What an Income record is. Blank reads as Pay, so records written before the
+# field existed keep counting as they did. Social Security and a pension are
+# kept as a monthly benefit rather than annual pay, belong to one of the
+# household, and count as income on the dashboard only while they are being
+# received. The retirement planner reads them for Your details.
+INCOME_TYPE_KEY = 'income_type'
+PAY = 'Pay'
+SOCIAL_SECURITY = 'Social Security'
+PENSION = 'Pension'
+INCOME_TYPES = [PAY, SOCIAL_SECURITY, PENSION, 'Other']
+BENEFIT_TYPES = (SOCIAL_SECURITY, PENSION)
+
+MONTHLY_BENEFIT_KEY = 'monthly_benefit'
+RECEIVING_KEY = 'receiving_now'
+# Whose benefit it is, or whose Investments account. Blank reads as yours.
+WHOSE_KEY = 'whose'
+YOURS = 'You'
+PARTNERS = 'Partner'
+
+_BENEFIT_ONLY = (INCOME_TYPE_KEY, BENEFIT_TYPES)
+
+
+def is_checked(value) -> bool:
+    """Whether a checkbox field's stored value is ticked. True counts as well,
+    for a record written by hand or by another tool."""
+    return value is True or (isinstance(value, str)
+                             and value.strip().lower() == CHECKED.lower())
+
 
 CATEGORY_CONFIG = {
     'Credit Cards': {
@@ -91,7 +176,7 @@ CATEGORY_CONFIG = {
         'stale_after': (21, 28),
         'fields': [
             {'key': 'name',            'label': 'Account Name',    'type': 'text',     'required': True},
-            {'key': 'card_number',     'label': 'Card Number',     'type': 'text',     'sensitive': True, 'copy': True},
+            {'key': 'card_number',     'label': 'Card Number',     'type': 'text',     'sensitive': True, 'copy': True, 'last4': True},
             {'key': 'cardholder_name', 'label': 'Cardholder Name', 'type': 'text'},
             {'key': 'credit_limit',    'label': 'Credit Limit',    'type': 'number',   'money': True},
             {'key': 'current_balance', 'label': 'Current Balance', 'type': 'number',   'money': True},
@@ -103,6 +188,7 @@ CATEGORY_CONFIG = {
             {'key': 'username',        'label': 'Username',        'type': 'text',     'copy': True},
             {'key': 'password',        'label': 'Password',        'type': 'password', 'sensitive': True, 'copy': True},
             {'key': 'website',         'label': 'Website',         'type': 'url',      'link': True, 'copy': True},
+            {**_EXCLUDE_DASHBOARD},
             {'key': 'last_updated',    'label': 'Last Updated',    'type': 'date',     'hide_in_form': True},
             {'key': 'notes',           'label': 'Notes',           'type': 'textarea'},
         ],
@@ -116,14 +202,16 @@ CATEGORY_CONFIG = {
         'fields': [
             {'key': 'name',            'label': 'Account Name',    'type': 'text',     'required': True},
             {'key': 'bank_name',       'label': 'Bank Name',       'type': 'text'},
-            {'key': 'account_number',  'label': 'Account Number',  'type': 'text',     'sensitive': True, 'copy': True},
-            {'key': 'routing_number',  'label': 'Routing Number',  'type': 'text',     'sensitive': True, 'copy': True},
+            {'key': 'account_number',  'label': 'Account Number',  'type': 'text',     'sensitive': True, 'copy': True, 'last4': True},
+            {'key': 'routing_number',  'label': 'Routing Number',  'type': 'text',     'sensitive': True, 'copy': True, 'last4': True},
             {'key': 'account_type',    'label': 'Account Type',    'type': 'select',
              'options': ['Checking', 'Savings', 'Money Market', 'Other']},
             {'key': 'current_balance', 'label': 'Current Balance', 'type': 'number',   'money': True},
             {'key': 'username',        'label': 'Username',        'type': 'text',     'copy': True},
             {'key': 'password',        'label': 'Password',        'type': 'password', 'sensitive': True, 'copy': True},
             {'key': 'website',         'label': 'Website',         'type': 'url',      'link': True, 'copy': True},
+            {**_EXCLUDE_DASHBOARD},
+            {**_EXCLUDE_RETIREMENT},
             {'key': 'last_updated',    'label': 'Last Updated',    'type': 'date',     'hide_in_form': True},
             {'key': 'notes',           'label': 'Notes',           'type': 'textarea'},
         ],
@@ -139,7 +227,7 @@ CATEGORY_CONFIG = {
         'fields': [
             {'key': 'name',            'label': 'Account Name',   'type': 'text',     'required': True},
             {'key': 'lender',          'label': 'Lender',         'type': 'text'},
-            {'key': 'account_number',  'label': 'Account Number', 'type': 'text',     'sensitive': True, 'copy': True},
+            {'key': 'account_number',  'label': 'Account Number', 'type': 'text',     'sensitive': True, 'copy': True, 'last4': True},
             {'key': 'loan_type',       'label': 'Loan Type',      'type': 'select',
              'options': ['Auto', 'Mortgage', 'Personal', 'Student', 'Home Equity', 'Other']},
             {'key': 'original_amount', 'label': 'Original Amount', 'type': 'number',  'money': True},
@@ -154,6 +242,7 @@ CATEGORY_CONFIG = {
             {'key': 'username',        'label': 'Username',        'type': 'text',     'copy': True},
             {'key': 'password',        'label': 'Password',        'type': 'password', 'sensitive': True, 'copy': True},
             {'key': 'website',         'label': 'Website',         'type': 'url',      'link': True, 'copy': True},
+            {**_EXCLUDE_DASHBOARD},
             {'key': 'last_updated',    'label': 'Last Updated',    'type': 'date',     'hide_in_form': True},
             {'key': 'notes',           'label': 'Notes',           'type': 'textarea'},
         ],
@@ -168,18 +257,38 @@ CATEGORY_CONFIG = {
         'fields': [
             {'key': 'name',                'label': 'Account Name',        'type': 'text',   'required': True},
             {'key': 'institution',         'label': 'Institution',         'type': 'text'},
-            {'key': 'account_number',      'label': 'Account Number',      'type': 'text',   'sensitive': True, 'copy': True},
+            {'key': 'account_number',      'label': 'Account Number',      'type': 'text',   'sensitive': True, 'copy': True, 'last4': True},
             {'key': 'account_type',        'label': 'Account Type',        'type': 'select',
-             'options': ['401k', 'IRA', 'Roth IRA', 'HSA', 'Brokerage', 'Other']},
+             'options': ['401k', '403b', '457b', 'IRA', 'Roth IRA', 'SEP IRA',
+                         'SIMPLE IRA', 'HSA', 'Brokerage', 'Other']},
+            {'key': TAX_TREATMENT_KEY,     'label': 'Tax Treatment',       'type': 'select',
+             'options': TAX_TREATMENTS,
+             'shown_when': ('account_type', TAX_TREATMENT_TYPES)},
+            # Ordered so the form's two-column grid pairs each total with
+            # what sits beside it and each Traditional part with its Roth one.
             {'key': 'current_balance',     'label': 'Current Balance',     'type': 'number', 'money': True},
+            {'key': 'traditional_balance', 'label': 'Traditional Balance', 'type': 'number', 'money': True,
+             'shown_when': _BOTH_ONLY},
+            {'key': 'roth_balance',        'label': 'Roth Balance',        'type': 'number', 'money': True,
+             'shown_when': _BOTH_ONLY},
             {'key': 'contribution_amount', 'label': 'Contribution Amount', 'type': 'number', 'money': True},
             # No default: a period nobody picked would be counted on the
             # dashboard as if someone had.
             {'key': CONTRIBUTION_PERIOD_KEY, 'label': 'Contribution Period', 'type': 'select',
              'options': list(CONTRIBUTIONS_PER_YEAR)},
+            {'key': 'traditional_contribution', 'label': 'Traditional Contribution',
+             'type': 'number', 'money': True, 'shown_when': _BOTH_ONLY},
+            {'key': 'roth_contribution',   'label': 'Roth Contribution',   'type': 'number', 'money': True,
+             'shown_when': _BOTH_ONLY},
+            # Whose account it is, so the retirement planner stops its
+            # contributions when that person retires. Blank reads as yours.
+            {'key': WHOSE_KEY,             'label': 'Whose',               'type': 'select',
+             'options': [YOURS, PARTNERS], 'default': YOURS},
             {'key': 'username',           'label': 'Username',            'type': 'text',   'copy': True},
             {'key': 'password',            'label': 'Password',            'type': 'password', 'sensitive': True, 'copy': True},
             {'key': 'website',             'label': 'Website',             'type': 'url',    'link': True, 'copy': True},
+            {**_EXCLUDE_DASHBOARD},
+            {**_EXCLUDE_RETIREMENT},
             {'key': 'last_updated',        'label': 'Last Updated',        'type': 'date',   'hide_in_form': True},
             {'key': 'notes',               'label': 'Notes',               'type': 'textarea'},
         ],
@@ -203,6 +312,7 @@ CATEGORY_CONFIG = {
             {'key': 'username',        'label': 'Username',        'type': 'text',     'copy': True},
             {'key': 'password',        'label': 'Password',        'type': 'password', 'sensitive': True, 'copy': True},
             {'key': 'website',         'label': 'Website',         'type': 'url',      'link': True, 'copy': True},
+            {**_EXCLUDE_DASHBOARD},
             {'key': 'last_updated',    'label': 'Last Updated',    'type': 'date',     'hide_in_form': True},
             {'key': 'notes',           'label': 'Notes',           'type': 'textarea'},
         ],
@@ -219,10 +329,22 @@ CATEGORY_CONFIG = {
         'stale_after': (180, 365),
         'fields': [
             {'key': 'name',            'label': 'Source',       'type': 'text',     'required': True},
-            {'key': 'current_balance', 'label': 'Annual Pay',   'type': 'number',   'money': True},
+            {'key': INCOME_TYPE_KEY,   'label': 'Income Type',  'type': 'select',
+             'options': INCOME_TYPES, 'default': PAY},
+            {'key': 'current_balance', 'label': 'Annual Pay',   'type': 'number',   'money': True,
+             'hidden_when': _BENEFIT_ONLY},
+            # A Social Security benefit not yet received is the one at 67 from
+            # the statement; once received, what is paid.
+            {'key': MONTHLY_BENEFIT_KEY, 'label': 'Monthly Benefit', 'type': 'number', 'money': True,
+             'shown_when': _BENEFIT_ONLY},
+            {'key': WHOSE_KEY,         'label': 'Whose',        'type': 'select',
+             'options': [YOURS, PARTNERS], 'default': YOURS, 'shown_when': _BENEFIT_ONLY},
+            {'key': RECEIVING_KEY,     'label': 'Receiving Now', 'type': 'checkbox',
+             'text': 'Paid now, so the dashboard counts it', 'shown_when': _BENEFIT_ONLY},
             {'key': 'username',        'label': 'Username',     'type': 'text',     'copy': True},
             {'key': 'password',        'label': 'Password',     'type': 'password', 'sensitive': True, 'copy': True},
             {'key': 'website',         'label': 'Website',      'type': 'url',      'link': True, 'copy': True},
+            {**_EXCLUDE_DASHBOARD},
             {'key': 'last_updated',    'label': 'Last Updated', 'type': 'date',     'hide_in_form': True},
             {'key': 'notes',           'label': 'Notes',        'type': 'textarea'},
         ],
@@ -236,7 +358,7 @@ CATEGORY_CONFIG = {
         'fields': [
             {'key': 'name',            'label': 'Account Name',   'type': 'text',   'required': True},
             {'key': 'provider',        'label': 'Provider',       'type': 'text'},
-            {'key': 'account_number',  'label': 'Account Number', 'type': 'text',   'sensitive': True, 'copy': True},
+            {'key': 'account_number',  'label': 'Account Number', 'type': 'text',   'sensitive': True, 'copy': True, 'last4': True},
             {'key': 'service_type',    'label': 'Service Type',   'type': 'select',
              'options': ['Electric', 'Gas', 'Water', 'Internet', 'Phone', 'Trash', 'Other']},
             {'key': 'current_balance', 'label': 'Current Balance', 'type': 'number', 'money': True},
@@ -264,7 +386,7 @@ CATEGORY_CONFIG = {
             {'key': 'username',          'label': 'Username',          'type': 'text',     'copy': True},
             {'key': 'email',             'label': 'Email',             'type': 'email'},
             {'key': 'password',          'label': 'Password',          'type': 'password', 'sensitive': True, 'copy': True},
-            {'key': 'security_question', 'label': 'Security Question', 'type': 'text',     'sensitive': True},
+            {'key': 'security_question', 'label': 'Security Question', 'type': 'text',     'no_search': True},
             {'key': 'security_answer',   'label': 'Security Answer',   'type': 'text',     'sensitive': True},
             {'key': 'last_updated',      'label': 'Last Updated',      'type': 'date',     'hide_in_form': True},
             {'key': 'notes',             'label': 'Notes',             'type': 'textarea'},
@@ -303,6 +425,12 @@ GENERIC_CONFIG = {
     ],
 }
 
+# Every checkbox field any schema declares, for an import to read as yes or no.
+CHECKBOX_KEYS = frozenset(
+    field['key'] for config in [*CATEGORY_CONFIG.values(), GENERIC_CONFIG]
+    for field in config['fields'] if field['type'] == 'checkbox'
+)
+
 
 # Slug-style category keys stored by versions predating the rename.
 CATEGORY_ALIASES = {
@@ -332,6 +460,14 @@ def has_field(category: str | None, key: str) -> bool:
     return any(field['key'] == key for field in get_config(category)['fields'])
 
 
+def has_balance(category: str | None, account: dict) -> bool:
+    """Whether this record keeps a balance: its category has the field and it
+    applies to the record, which an Income record of Social Security's does
+    not. Quick Update, the list row's figure and Balance History go by this."""
+    field = schema_field(category, 'current_balance')
+    return field is not None and field_shown(category, field, account)
+
+
 def searchable_fields(category: str | None) -> list[dict]:
     """The fields a search query may be matched against.
 
@@ -346,7 +482,9 @@ def searchable_fields(category: str | None) -> list[dict]:
     still carry its old card_number with nothing marking it sensitive."""
     return [
         field for field in get_config(category)['fields']
-        if not field.get('sensitive') and field['type'] not in ('password', 'textarea')
+        # A checkbox is left out too: searching "yes" would list every ticked one.
+        if not field.get('sensitive') and not field.get('no_search')
+        and field['type'] not in ('password', 'textarea', 'checkbox')
     ]
 
 
@@ -366,6 +504,57 @@ def value_noun(category: str | None) -> str:
     """What this category calls the amount current_balance tracks, so Income's
     history reads 'Annual Pay' rather than 'Balance'."""
     return get_config(category).get('value_noun', DEFAULT_VALUE_NOUN)
+
+
+def schema_field(category: str | None, key: str) -> dict | None:
+    """The category's definition of one field, or None if it has no such field.
+    A pre-rename slug ('investments') finds the current category's."""
+    fields = get_config(normalize_category(category))['fields']
+    return next((f for f in fields if f['key'] == key), None)
+
+
+def field_shown(category: str | None, field: dict, values: dict) -> bool:
+    """Whether a field applies to a record holding `values`.
+
+    A field without shown_when always does. One with it applies while the field
+    it names is itself shown and holds one of the listed values, so changing a
+    401(k) to Brokerage hides its tax treatment, and with it the two amounts
+    that only a Both account has. One with hidden_when applies unless the field
+    it names holds one of its values, so Social Security hides Annual Pay."""
+    hidden = field.get('hidden_when')
+    if hidden and values.get(hidden[0]) in hidden[1]:
+        return False
+    rule = field.get('shown_when')
+    if not rule:
+        return True
+    key, allowed = rule
+    controller = schema_field(category, key)
+    if controller is not None and not field_shown(category, controller, values):
+        return False
+    return values.get(key) in allowed
+
+
+def active_splits(category: str | None, values: dict) -> dict:
+    """{total key: (Traditional key, Roth key)} for each SPLIT_FIELDS total
+    that a record holding `values` works out from its parts: the category has
+    the total and both parts, and the parts are shown."""
+    result = {}
+    for total, parts in SPLIT_FIELDS.items():
+        if schema_field(category, total) is None:
+            continue
+        fields = [schema_field(category, key) for key in parts]
+        if all(field is not None and field_shown(category, field, values)
+               for field in fields):
+            result[total] = parts
+    return result
+
+
+def add_amounts(*amounts) -> float:
+    """The sum of some amounts, without the binary rounding that makes
+    1000.10 + 2000.20 come to 3000.3000000000002. Whole sums come back whole,
+    as trim_number spells them."""
+    total = sum((Decimal(str(amount)) for amount in amounts), Decimal(0))
+    return trim_number(float(total))
 
 
 # -----------------------------------------------------------------------------
@@ -395,21 +584,79 @@ def format_money_compact(value) -> str:
     return f"${number:.0f}"
 
 
+_MONTH_ABBR = ('Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+               'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec')
+
+
 def format_date(value) -> str | None:
-    """YYYY-MM-DD → MM-DD-YYYY. Returns None if the value isn't a date."""
-    if not value:
+    """YYYY-MM-DD → 'Oct 24, 2026', which no reader can take two ways. Returns
+    None if the value isn't a date."""
+    date = parse_iso_date(value)
+    if date is None:
         return None
-    parts = str(value)[:10].split('-')
-    if len(parts) != 3:
+    return f"{_MONTH_ABBR[date.month - 1]} {date.day}, {date.year}"
+
+
+def format_short_date(value) -> str | None:
+    """'Nov 16' for a date this year, 'Nov 16, 2027' otherwise: the list row's
+    spelling, where the year is nearly always this one."""
+    date = parse_iso_date(value)
+    if date is None:
         return None
-    year, month, day = parts
-    return f"{month}-{day}-{year}"
+    if date.year == datetime.date.today().year:
+        return f"{_MONTH_ABBR[date.month - 1]} {date.day}"
+    return format_date(value)
 
 
 def format_month(value) -> str:
-    """YYYY-MM → MM-YY."""
+    """YYYY-MM → "May '26". The month by name, so an axis label cannot be read
+    as a day."""
     parts = str(value).split('-')
-    return f"{parts[1]}-{parts[0][2:]}" if len(parts) >= 2 else str(value)
+    try:
+        month = int(parts[1])
+    except (IndexError, ValueError):
+        return str(value)
+    if not 1 <= month <= 12:
+        return str(value)
+    return f"{_MONTH_ABBR[month - 1]} '{parts[0][2:]}"
+
+
+def format_age(value) -> str | None:
+    """How long ago a stored date was, in the largest whole unit: 'today',
+    'yesterday', '5 days ago', '3 weeks ago', '4 months ago', '2 years ago'.
+    None if the value isn't a date."""
+    date = parse_iso_date(value)
+    if date is None:
+        return None
+    days = (datetime.date.today() - date).days
+    if days <= 0:
+        # A date ahead of today is a clock that moved; say today rather than
+        # 'in 3 days' for something that already happened.
+        return 'today'
+    if days == 1:
+        return 'yesterday'
+    for size, unit in ((365, 'year'), (30, 'month'), (7, 'week')):
+        # Two of a unit before switching to it: '10 days ago' reads better
+        # than '1 week ago' for a figure 10 days old.
+        if days >= 2 * size or (unit == 'year' and days >= size):
+            count = days // size
+            return f"{count} {unit}{'s' if count != 1 else ''} ago"
+    return f"{days} days ago"
+
+
+# The shortest value a masked field shows the end of. Below it, four
+# characters would be most of the secret.
+_LAST4_MIN = 8
+
+
+def last_four(value) -> str | None:
+    """The last four letters or digits of a card or account number, or None
+    when the value is too short for them to stay a hint. Spaces and dashes
+    are skipped, so '4111 1111 1111 1234' ends in '1234'."""
+    characters = [c for c in str(value or '') if c.isalnum()]
+    if len(characters) < _LAST4_MIN:
+        return None
+    return ''.join(characters[-4:])
 
 
 def format_value(value, field: dict) -> str:
@@ -428,6 +675,9 @@ def format_value(value, field: dict) -> str:
 
     if field.get('type') == 'date':
         return format_date(value) or str(value)
+
+    if field.get('type') == 'checkbox':
+        return CHECKED if is_checked(value) else 'No'
 
     return str(value)
 

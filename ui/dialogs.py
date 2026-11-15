@@ -1,9 +1,9 @@
 # -----------------------------------------------------------------------------
 # ui/dialogs.py
 # Modal dialogs: settings, warnings, the readme and design document viewer,
-# about, the demo vault's password, CSV warning, change master password, the
-# quick balance/due-date update, the history entry editor, the account and
-# history imports, and the per-account export.
+# about, the demo household and the demo vault's password, CSV warning, change
+# master password, the quick balance/due-date update, the history entry
+# editor, the account and history imports, and the per-account export.
 # -----------------------------------------------------------------------------
 
 from pathlib import Path
@@ -25,13 +25,14 @@ from core import auth
 from core import categories
 from core import preferences
 from core.categories import (
-    CATEGORY_CONFIG, DEFAULT_VALUE_NOUN, DUE_CYCLE_KEY, advance_cycle, cycle_noun,
-    format_date, format_money, get_config,
-    has_field, next_due_date, parse_money, trim_number, value_noun,
+    CATEGORY_CONFIG, DEFAULT_VALUE_NOUN, DUE_CYCLE_KEY, active_splits, add_amounts,
+    advance_cycle, cycle_noun, format_date, format_money, get_config,
+    has_balance, has_field, next_due_date, parse_money, schema_field, trim_number, value_noun,
 )
 from core.urls import normalize_url
 from core.version import VERSION
 from services import account_export, account_import, history_io
+from ui import screen_capture
 from ui.theme import THEMES, palette
 from ui.widgets import (
     NO_DATE, ThemedIcon, date_edit, field_label, password_field,
@@ -42,7 +43,10 @@ from ui.widgets import (
 class _BaseDialog(QDialog):
     """Shared frame: a title, a body layout, an error line, and a button row."""
 
-    def __init__(self, parent, title: str, width: int = 460):
+    def __init__(self, parent, title: str, width: int = 460,
+                 scrollable: bool = False):
+        """scrollable puts the body in a scroll area, for a dialog that can be
+        taller than the screen; the title and buttons stay in view."""
         super().__init__(parent)
         self.setWindowTitle(title)
         self.setModal(True)
@@ -67,12 +71,61 @@ class _BaseDialog(QDialog):
         self._outer.setContentsMargins(22, 20, 22, 20)
         self._outer.setSpacing(12)
         self._outer.addWidget(heading)
-        self._outer.addLayout(self.body)
+        self._scroll = None
+        if scrollable:
+            inner = QWidget()
+            # A gap on the right, so fields stop short of the scroll bar.
+            self.body.setContentsMargins(0, 0, 10, 0)
+            inner.setLayout(self.body)
+            self.body.addStretch(1)
+            self._scroll = QScrollArea()
+            self._scroll.setWidgetResizable(True)
+            self._scroll.setFrameShape(QFrame.NoFrame)
+            self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            self._scroll.setWidget(inner)
+            self._outer.addWidget(self._scroll, 1)
+        else:
+            self._outer.addLayout(self.body)
         self._outer.addWidget(self.error)
         # Keeps short forms pinned to the top; expand_body() drops it.
         self._filler = QSpacerItem(0, 0, QSizePolicy.Minimum, QSizePolicy.Expanding)
-        self._outer.addItem(self._filler)
+        if not scrollable:
+            self._outer.addItem(self._filler)
         self._outer.addLayout(self.buttons)
+        self._fitted = False
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self._scroll is not None and not self._fitted:
+            self._fitted = True
+            self._fit_to_screen()
+
+    def _fit_to_screen(self):
+        """As tall as the whole body, unless that is more than the screen has
+        room for, when the body scrolls instead. A QScrollArea's own size hint
+        is capped well short of its contents, so the height is worked out here."""
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        # availableGeometry leaves out the taskbar.
+        available = screen.availableGeometry()
+        room = int(available.height() * 0.9)
+        inner = self._scroll.widget().sizeHint()
+        bar = self._scroll.verticalScrollBar().sizeHint().width()
+        self._scroll.setMinimumWidth(inner.width() + bar)
+        chrome = self.sizeHint().height() - self._scroll.sizeHint().height()
+        self.resize(max(self.width(), self.sizeHint().width()),
+                    min(chrome + inner.height(), room))
+
+        # Qt centred the dialog at its height before the resize, so it grew
+        # downwards, under the taskbar. Centred again, title bar included, and
+        # kept on the available area.
+        frame = self.frameGeometry()
+        title_bar = frame.height() - self.height()
+        width, height = frame.width(), self.height() + title_bar
+        parent = self.parentWidget()
+        centre = parent.window().frameGeometry().center() if parent else available.center()
+        x = min(max(centre.x() - width // 2, available.left()), available.right() - width)
+        y = min(max(centre.y() - height // 2, available.top()), available.bottom() - height)
+        self.move(x, y)
 
     def expand_body(self):
         """Gives the body the spare height, for bodies holding a scrollable view."""
@@ -89,6 +142,14 @@ class _BaseDialog(QDialog):
             button.setObjectName(object_name)
         button.clicked.connect(slot)
         self.buttons.addWidget(button)
+        # Enter answers with the Primary button. Left to Qt, the default is the
+        # first button after the focused field in tab order: "+1 month" in
+        # Quick Update, Delete in the entry editor, Cancel in most others. Set
+        # after addWidget, since setDefault only registers once the button is
+        # in the dialog. Dialogs without a Primary (a Danger confirmation) keep
+        # Qt's pick, which there is Cancel.
+        if object_name == 'Primary':
+            button.setDefault(True)
         return button
 
     def fail(self, message: str):
@@ -148,7 +209,7 @@ class SettingsDialog(_BaseDialog):
     preview_requested = Signal(str, str, str)   # theme, font_size, list_density
 
     def __init__(self, parent, settings: dict):
-        super().__init__(parent, 'Settings', width=520)
+        super().__init__(parent, 'Settings', width=520, scrollable=True)
         # Exactly what preview_requested carries, so reject() can undo a preview.
         self._original = (settings['theme'], settings['font_size'],
                           settings.get('list_density', 'compact'))
@@ -209,6 +270,12 @@ class SettingsDialog(_BaseDialog):
         density_row.addStretch(1)
         self.body.addLayout(density_row)
 
+        self._start_tab = self._combo(preferences.START_TAB_CHOICES,
+                                      settings.get('start_tab', 'all'))
+        self._start_tab.setToolTip('The tab shown after you log in. Needs Attention '
+                                   'and Favorites fall back to All while empty.')
+        self.add_field('Open On', self._start_tab)
+
         # --- Timeouts ---
         self._lock = self._combo(
             [(v, f"{v} minutes" + (' (default)' if v == 15 else '')) for v in preferences.VALID_LOCK_TIMEOUTS],
@@ -230,10 +297,38 @@ class SettingsDialog(_BaseDialog):
         )
         self.add_field('Auto-Shutdown (after lock)', self._shutdown)
 
+        self._build_privacy_section(settings)
         self._build_backup_section(settings)
 
         self.add_button('Cancel', self.reject)
         self.add_button('Save', self.accept, 'Primary')
+
+    # -----------------------------------------------------------------
+    # Privacy
+    # -----------------------------------------------------------------
+
+    def _build_privacy_section(self, settings: dict):
+        """Whether other programs may capture the app's windows. Off keeps them
+        out of screenshots, recordings, screen sharing and Windows Recall."""
+        self.body.addSpacing(6)
+        self.body.addWidget(field_label('Privacy'))
+
+        self._allow_capture = QCheckBox('Allow screenshots and screen sharing')
+        self._allow_capture.setChecked(bool(settings.get('allow_screen_capture')))
+        self.body.addWidget(self._allow_capture)
+
+        if screen_capture.supported():
+            text = ('Off by default, so a capture shows a blank window where '
+                    'AccountVault is. Turn on for a screenshot or a call, then turn '
+                    'it off again.')
+        else:
+            self._allow_capture.setEnabled(False)
+            text = ("This system has no way to keep a window out of screenshots, so "
+                    "AccountVault can always be captured here.")
+        hint = plain_label(text)
+        hint.setObjectName('FieldHint')
+        hint.setWordWrap(True)
+        self.body.addWidget(hint)
 
     # -----------------------------------------------------------------
     # Backups
@@ -375,6 +470,8 @@ class SettingsDialog(_BaseDialog):
             'backup_frequency':            self._frequency.currentData(),
             'backup_retention_months':     self._retention.currentData(),
             'backup_location':             self._location,
+            'allow_screen_capture':        int(self._allow_capture.isChecked()),
+            'start_tab':                   self._start_tab.currentData(),
         }
 
     def reject(self):
@@ -598,7 +695,7 @@ class DocumentDialog(_BaseDialog):
         # Not setOpenExternalLinks, which would hand any anchor straight to the
         # OS without normalize_url in front of it.
         self.view.setOpenLinks(False)
-        self.view.anchorClicked.connect(self._follow)
+        self.view.anchorClicked.connect(self._anchor_clicked)
         self.view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         try:
             self.view.setMarkdown(Path(path).read_text(encoding='utf-8'))
@@ -727,9 +824,24 @@ class DocumentDialog(_BaseDialog):
 
     # -- links and size ----------------------------------------------------
 
-    @staticmethod
-    def _follow(url: QUrl):
-        """Opens a link from the README, through normalize_url."""
+    # The only links handed to the desktop. Anything else is relative to the
+    # document, and normalize_url would turn 'docs/x.md' into https://docs/x.md.
+    _EXTERNAL_SCHEMES = ('http', 'https', 'mailto')
+
+    def _anchor_clicked(self, url: QUrl):
+        """A link clicked in the document: an in-page anchor scrolls to it, and
+        everything else goes to _follow."""
+        if not url.scheme() and url.hasFragment() and not url.path():
+            self.view.scrollToAnchor(url.fragment())
+            return
+        self._follow(url)
+
+    @classmethod
+    def _follow(cls, url: QUrl):
+        """Opens a full web or mail link on the desktop, through normalize_url.
+        Anything else, a relative link included, is ignored."""
+        if url.scheme().lower() not in cls._EXTERNAL_SCHEMES:
+            return
         target = normalize_url(url.toString())
         if target:
             QDesktopServices.openUrl(QUrl(target))
@@ -791,6 +903,76 @@ class AboutDialog(_BaseDialog):
         self.body.addLayout(grid)
 
         self.add_button('Close', self.accept)
+
+
+class DemoHouseholdDialog(_BaseDialog):
+    """Asks what the demo household earns, holds and saves, before a demo
+    vault is built. The answers size its money accounts and its retirement
+    plan; every other account in it is the same whatever they are.
+
+    The starting figures and their limits come from the caller as plain dicts,
+    so this needs nothing from the demo builder itself. values() hands the
+    answers back in the same keys."""
+
+    def __init__(self, parent, defaults: dict, limits: dict):
+        super().__init__(parent, 'Demo Household', width=440)
+
+        intro = plain_label('The Simpsons, sized to your figures. The accounts add up '
+                            'to close to these rather than exactly, as real ones do.')
+        intro.setWordWrap(True)
+        self.body.addWidget(intro)
+
+        self.incomes = QComboBox()
+        self.incomes.addItem('Single income: Homer works', False)
+        self.incomes.addItem('Two incomes: Homer and Marge', True)
+        self.incomes.setCurrentIndex(self.incomes.findData(defaults['two_incomes']))
+
+        self.age = self._spin(limits['age'], defaults['age'])
+        self.partner_age = self._spin(limits['partner_age'], defaults['partner_age'])
+        self.income = self._spin(limits['income'], defaults['income'], prefix='$', step=1000)
+        self.invested = self._spin(limits['invested'], defaults['invested'], prefix='$',
+                                   step=5000)
+        self.saving = self._spin(limits['saving_pct'], defaults['saving_pct'], suffix='%')
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(16)
+        grid.setVerticalSpacing(8)
+        rows = [('Household', self.incomes), ("Homer's age", self.age),
+                ("Marge's age", self.partner_age), ('Yearly income', self.income),
+                ('Total invested', self.invested), ('Retirement saving', self.saving)]
+        for row, (text, widget) in enumerate(rows):
+            label = field_label(text)
+            label.setBuddy(widget)
+            grid.addWidget(label, row, 0, Qt.AlignLeft | Qt.AlignVCenter)
+            grid.addWidget(widget, row, 1)
+        grid.setColumnStretch(1, 1)
+        self.body.addLayout(grid)
+
+        hint = plain_label("Retirement saving is every contribution together, as a share "
+                           "of income, so the dashboard's investing rate comes out near it.")
+        hint.setObjectName('Subtle')
+        hint.setWordWrap(True)
+        self.body.addWidget(hint)
+
+        self.add_button('Cancel', self.reject)
+        self.add_button('Continue', self.accept, 'Primary')
+
+    @staticmethod
+    def _spin(limits, value, prefix='', suffix='', step=1) -> QSpinBox:
+        spin = QSpinBox()
+        spin.setRange(*limits)
+        spin.setValue(value)
+        spin.setSingleStep(step)
+        spin.setPrefix(prefix)
+        spin.setSuffix(suffix)
+        spin.setGroupSeparatorShown(True)
+        return spin
+
+    def values(self) -> dict:
+        return {'two_incomes': self.incomes.currentData(),
+                'income': self.income.value(), 'age': self.age.value(),
+                'partner_age': self.partner_age.value(),
+                'invested': self.invested.value(), 'saving_pct': self.saving.value()}
 
 
 class DemoVaultDialog(_BaseDialog):
@@ -946,7 +1128,10 @@ class QuickUpdateDialog(_BaseDialog):
 
     The 'as of' date lets a statement be filed under the day it covers. It
     defaults to today and cannot run ahead of it: a balance from the future is
-    always a typo."""
+    always a typo.
+
+    A Both account is updated by its Traditional and Roth amounts, as its
+    statement gives them, and its new balance is their sum."""
 
     def __init__(self, parent, account: dict):
         super().__init__(parent, 'Quick Update', width=380)
@@ -954,20 +1139,28 @@ class QuickUpdateDialog(_BaseDialog):
         # backdated.
         self._opened_on = QDate.currentDate()
         category = account.get('_category') or account.get('category')
-        self.has_balance = has_field(category, 'current_balance')
+        self.has_balance = has_balance(category, account)
         self.has_due = has_field(category, 'due_date')
 
         self._balance = None
+        # On a Both account: each part's input by key, and the sum they make.
+        self._parts: dict[str, QLineEdit] = {}
+        self._part_labels: dict[str, str] = {}
+        self._total = None
         self._as_of = None
         self._due = None
 
         if self.has_balance:
-            self._balance = QLineEdit()
-            self._balance.setPlaceholderText('0.00')
-            value = account.get('current_balance')
-            self._balance.setText('' if value is None else str(value))
-            self.add_field(f'New {value_noun(category)}', self._balance)
-            self._balance.returnPressed.connect(self._submit)
+            parts = active_splits(category, account).get('current_balance')
+            if parts:
+                self._build_parts(category, account, parts)
+            else:
+                self._balance = QLineEdit()
+                self._balance.setPlaceholderText('0.00')
+                value = account.get('current_balance')
+                self._balance.setText('' if value is None else str(value))
+                self.add_field(f'New {value_noun(category)}', self._balance)
+                self._balance.returnPressed.connect(self._submit)
 
             self._as_of = date_edit(self._opened_on, maximum=self._opened_on)
             self._as_of.setToolTip(
@@ -1004,11 +1197,58 @@ class QuickUpdateDialog(_BaseDialog):
         self.add_button('Cancel', self.reject)
         self.add_button('Save', self._submit, 'Primary')
 
-        if self._balance:
-            self._balance.selectAll()
-            self._balance.setFocus()
+        first = self._balance or next(iter(self._parts.values()), None)
+        if first:
+            first.selectAll()
+            first.setFocus()
         elif self._due:
             self._due.setFocus()
+
+    def _build_parts(self, category: str, account: dict, parts: tuple):
+        """The Traditional and Roth inputs, then the new balance they add up to."""
+        for key in parts:
+            edit = QLineEdit()
+            edit.setPlaceholderText('0.00')
+            value = account.get(key)
+            edit.setText('' if value is None else str(value))
+            edit.textChanged.connect(self._refresh_total)
+            label = schema_field(category, key)['label']
+            self.add_field(f'New {label}', edit)
+            self._parts[key] = edit
+            self._part_labels[key] = label
+
+        # Enter in the first amount moves to the second. Saving from there
+        # would file the second as the dialog opened, which is rarely the
+        # reading being entered.
+        first, second = self._parts.values()
+        first.installEventFilter(self)
+        second.returnPressed.connect(self._submit)
+
+        self._total = QLineEdit()
+        self._total.setReadOnly(True)
+        self._total.setFocusPolicy(Qt.NoFocus)
+        self._total.setObjectName('ComputedValue')
+        self.add_field(f'New {value_noun(category)}', self._total)
+        self._refresh_total()
+
+    def eventFilter(self, watched, event):
+        """Enter in the first of two amounts moves on to the second. The line
+        edit passes Enter up to the dialog, which would press Save, so it is
+        taken here instead."""
+        first, second = (list(self._parts.values()) or [None, None])[:2]
+        if (watched is first and event.type() == QEvent.KeyPress
+                and event.key() in (Qt.Key_Return, Qt.Key_Enter)):
+            second.setFocus()
+            second.selectAll()
+            return True
+        return super().eventFilter(watched, event)
+
+    def _part_amounts(self) -> list:
+        return [parse_money(edit.text()) for edit in self._parts.values()]
+
+    def _refresh_total(self, *_args):
+        amounts = [amount for amount in self._part_amounts() if amount is not None]
+        self._total.setText(format_money(add_amounts(*amounts)) if amounts else '')
 
     def _advance(self):
         # From an empty field, one period from today.
@@ -1024,7 +1264,25 @@ class QuickUpdateDialog(_BaseDialog):
             if parse_money(self._balance.text()) is None:
                 self.fail('Enter a valid number (e.g. 2,501.99 or $2,501.99).')
                 return
+        if self._parts:
+            problem = self._parts_problem()
+            if problem:
+                self.fail(problem)
+                return
         self.accept()
+
+    def _parts_problem(self) -> str | None:
+        """Why the two amounts cannot be saved, or None. Both are needed: the
+        balance is their sum, and a blank one is no reading of anything."""
+        for (key, edit), amount in zip(self._parts.items(), self._part_amounts()):
+            label = self._part_labels[key]
+            if not edit.text().strip():
+                return 'Enter both amounts. 0 is fine.'
+            if amount is None:
+                return f'{label}: enter a valid number (e.g. 2,501.99 or $2,501.99).'
+            if amount < 0:
+                return f"{label} can't be negative."
+        return None
 
     def changes(self) -> dict:
         """The edited values, keyed to match the flat account dict."""
@@ -1035,6 +1293,11 @@ class QuickUpdateDialog(_BaseDialog):
                 # trim_number, so a whole figure is stored as 1200, the same
                 # spelling every other path writes.
                 result['current_balance'] = trim_number(parse_money(text))
+        if self._parts and self._parts_problem() is None:
+            amounts = self._part_amounts()
+            for key, amount in zip(self._parts, amounts):
+                result[key] = trim_number(amount)
+            result['current_balance'] = add_amounts(*amounts)
         if self._due:
             # None, not a missing key, so an emptied field clears the stored date.
             result['due_date'] = (None if self._due_is_empty()
