@@ -63,9 +63,10 @@ rem
 rem Actually run python instead of using "where": Windows ships an app-execution
 rem alias in WindowsApps that answers "where python" even when nothing is
 rem installed, and only fails once you try to run it.
-python.exe -c "" >nul 2>nul
-if errorlevel 1 goto no_python
+call :find_python
+if not defined BASE_PY goto no_python
 
+:python_ready
 echo.
 echo AccountVault needs a few Python packages:
 type requirements\requirements.txt
@@ -78,7 +79,7 @@ choice /c YN /n /m "Set that up now? [Y/N] "
 if errorlevel 2 goto declined
 echo.
 echo Creating .venv ...
-python.exe -m venv .venv
+"%BASE_PY%" -m venv .venv
 if errorlevel 1 goto venv_failed
 
 :install
@@ -126,7 +127,7 @@ echo The packages failed to install - see the messages above.
 echo.
 echo A network connection is required. If the error mentions hashes, this
 echo machine is on a platform requirements.lock does not cover - it holds the
-echo 64-bit Windows wheels for Python 3.11 to 3.14.
+echo 64-bit Windows wheels for Python 3.11 to 3.15.
 echo.
 echo Once the problem is fixed, run AccountVault_Windows.bat again to retry.
 echo.
@@ -134,18 +135,72 @@ pause
 exit /b 1
 
 :no_python
+rem What python.exe is, if it runs at all, so the message can say why it is
+rem not being used.
+set "OTHER_PY="
+for /f "delims=" %%V in ('python.exe -V 2^>nul') do set "OTHER_PY=%%V"
+
 echo.
+if defined OTHER_PY goto python_unsupported
 echo Python was not found on this computer.
-echo AccountVault needs Python 3 installed before it can start.
+goto offer_python
+:python_unsupported
+echo AccountVault needs Python 3.11 to 3.15; this computer has %OTHER_PY%.
+echo requirements.lock only holds checked packages for those versions.
+
+:offer_python
+rem winget ships with Windows 10 and 11 through App Installer, but can be
+rem missing on older or stripped-down installs; then only the manual route.
+winget --version >nul 2>nul
+if errorlevel 1 goto manual_python
 echo.
-echo Download it from:
+echo AccountVault can install Python 3.14 from python.org now, using winget.
+echo It installs for your Windows account only and needs no administrator rights.
+if defined OTHER_PY echo Your current %OTHER_PY% is left as it is.
+echo.
+choice /c YN /n /m "Install Python 3.14 now? [Y/N] "
+if errorlevel 2 goto manual_python
+echo.
+echo Installing Python 3.14 ...
+
+rem --scope user puts it at a known path under LOCALAPPDATA, which matters: the
+rem installer adds Python to PATH, but this window keeps the PATH it started
+rem with, so find_python has to look there rather than on PATH. The exit code
+rem is not trusted either way (winget also fails when it is already
+rem installed); whether a usable Python now exists is what counts.
+winget install -e --id Python.Python.3.14 --scope user --silent --accept-package-agreements --accept-source-agreements
+call :find_python
+if defined BASE_PY goto python_ready
+echo.
+echo Python 3.14 did not install - see the messages above.
+
+:manual_python
+echo.
+echo Download Python 3.14 from:
 echo     https://www.python.org/downloads/
 echo.
 echo Or paste this command into a terminal to install it:
-echo     winget install -e --id Python.Python.3.13 --accept-package-agreements --accept-source-agreements
+echo     winget install -e --id Python.Python.3.14 --scope user --accept-package-agreements --accept-source-agreements
 echo.
 echo During a manual install, tick "Add python.exe to PATH" on the first screen.
 echo After installing, close this window and run AccountVault_Windows.bat again.
 echo.
 pause
 exit /b 1
+
+rem Sets BASE_PY to a Python that requirements.lock covers, or leaves it empty.
+rem PATH first, then the folders the python.org installer uses, newest first:
+rem those catch an install made without "Add to PATH" and one made a moment
+rem ago by :offer_python, which this window's PATH does not include yet.
+:find_python
+set "BASE_PY="
+call :try_python python.exe
+for %%V in (315 314 313 312 311) do if not defined BASE_PY call :try_python "%LOCALAPPDATA%\Programs\Python\Python%%V\python.exe"
+for %%V in (315 314 313 312 311) do if not defined BASE_PY call :try_python "%ProgramFiles%\Python%%V\python.exe"
+exit /b
+
+:try_python
+if defined BASE_PY exit /b
+"%~1" -c "import sys; sys.exit(not (3, 11) <= sys.version_info[:2] <= (3, 15))" >nul 2>nul
+if not errorlevel 1 set "BASE_PY=%~1"
+exit /b

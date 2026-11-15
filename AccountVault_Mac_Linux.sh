@@ -25,6 +25,88 @@ ask_yes() {
     [[ "$answer" =~ ^[Yy] ]]
 }
 
+# Sets BASE_PY to the Python to build the .venv from: one requirements.lock
+# covers (3.11-3.15) if there is one, else any 3.11 or later, which gets the
+# unverified install offered further down. Versioned names too: a Python
+# installed beside the system one (Homebrew, deadsnakes) is often only
+# reachable as python3.14.
+find_python() {
+    local candidate
+    BASE_PY=""
+    for candidate in python3 python3.15 python3.14 python3.13 python3.12 python3.11; do
+        if command -v "$candidate" >/dev/null 2>&1 && "$candidate" -c \
+                'import sys; sys.exit(not (3, 11) <= sys.version_info[:2] <= (3, 15))' 2>/dev/null; then
+            BASE_PY="$candidate"
+            return 0
+        fi
+    done
+    if command -v python3 >/dev/null 2>&1 \
+            && python3 -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null; then
+        BASE_PY=python3
+        return 0
+    fi
+    return 1
+}
+
+# Offers to install Python with the package manager this machine has, then
+# looks again. Succeeds only if a usable Python exists afterwards: on an older
+# distribution the packaged python3 can still be older than 3.11.
+offer_python_install() {
+    local manager="" command_text=""
+    if [ "$(uname -s)" = "Darwin" ]; then
+        if command -v brew >/dev/null 2>&1; then
+            manager=brew
+            command_text="brew install python@3.14"
+        fi
+    elif command -v apt-get >/dev/null 2>&1; then
+        manager=apt
+        command_text="sudo apt-get update && sudo apt-get install -y python3 python3-venv"
+    elif command -v dnf >/dev/null 2>&1; then
+        manager=dnf
+        command_text="sudo dnf install -y python3"
+    elif command -v pacman >/dev/null 2>&1; then
+        manager=pacman
+        command_text="sudo pacman -S --needed --noconfirm python"
+    fi
+    [ -n "$manager" ] || return 1
+
+    echo
+    echo "AccountVault can install Python now by running:"
+    echo "    $command_text"
+    if [ "$manager" != brew ]; then
+        echo "This uses sudo, so it will ask for your password."
+    fi
+    echo
+    ask_yes "Install Python now?" || return 1
+    echo
+    case "$manager" in
+        brew)   brew install python@3.14 ;;
+        apt)    sudo apt-get update && sudo apt-get install -y python3 python3-venv ;;
+        dnf)    sudo dnf install -y python3 ;;
+        pacman) sudo pacman -S --needed --noconfirm python ;;
+    esac || { echo; echo "Python did not install - see the messages above."; return 1; }
+    hash -r
+    find_python
+}
+
+python_help() {
+    echo
+    if command -v python3 >/dev/null 2>&1; then
+        echo "AccountVault needs Python 3.11 or later; this computer has $(python3 -V 2>&1)."
+    else
+        echo "Python 3 was not found on this computer."
+        echo "AccountVault needs Python 3.11 or later installed before it can start."
+    fi
+    echo
+    echo "Install it with your package manager, for example:"
+    echo "    Fedora:          sudo dnf install python3"
+    echo "    Debian/Ubuntu:   sudo apt install python3 python3-venv"
+    echo "    macOS:           brew install python@3.14"
+    echo "                     or https://www.python.org/downloads/"
+    echo
+    echo "Then run ./AccountVault_Mac_Linux.sh again."
+}
+
 # Always the project's own .venv, never a system Python that happens to have
 # the packages: only the .venv was installed with --require-hashes, so only it
 # is known to hold the checked files.
@@ -50,25 +132,12 @@ elif [ -x "$VENV_PY" ]; then
     # There but incomplete (an interrupted install): finish the install into it.
     NEED_VENV=0
 else
-    if ! command -v python3 >/dev/null 2>&1; then
-        echo
-        echo "Python 3 was not found on this computer."
-        echo "AccountVault needs Python 3.11 or later installed before it can start."
-        echo
-        echo "Install it with your package manager, for example:"
-        echo "    Fedora:          sudo dnf install python3"
-        echo "    Debian/Ubuntu:   sudo apt install python3 python3-venv"
-        echo "    macOS:           https://www.python.org/downloads/"
-        echo
-        echo "Then run ./AccountVault_Mac_Linux.sh again."
-        exit 1
-    fi
-
-    if ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 11))'; then
-        echo
-        echo "AccountVault needs Python 3.11 or later; this computer has $(python3 -V 2>&1)."
-        echo "Install a newer Python 3, then run ./AccountVault_Mac_Linux.sh again."
-        exit 1
+    # Asking needs a terminal; launched from a file manager there may be none.
+    if ! find_python; then
+        if [ ! -t 0 ] || ! offer_python_install; then
+            python_help
+            exit 1
+        fi
     fi
     NEED_VENV=1
 fi
@@ -83,17 +152,18 @@ if [ ! -t 0 ]; then
 fi
 
 # requirements.lock holds hashes for 64-bit Linux (x86-64), macOS on Apple
-# silicon, and Windows, on Python 3.11-3.14. Not Intel Macs: cryptography
+# silicon, and Windows, on Python 3.11-3.15. Not Intel Macs: cryptography
 # publishes no wheel for them. Anywhere else pip would
 # refuse every package, so check up front and offer the unverified install
 # knowingly instead of failing midway.
-if [ "$NEED_VENV" = 1 ]; then BASE_PY=python3; else BASE_PY="$VENV_PY"; fi
+# BASE_PY was set by find_python when the .venv is still to be created.
+if [ "$NEED_VENV" = 0 ]; then BASE_PY="$VENV_PY"; fi
 LOCK_COVERED=0
 SYSTEM="$(uname -s)"
 MACHINE="$(uname -m)"
 if { { [ "$SYSTEM" = "Linux" ] && [ "$MACHINE" = "x86_64" ]; } \
         || { [ "$SYSTEM" = "Darwin" ] && [ "$MACHINE" = "arm64" ]; }; } \
-    && "$BASE_PY" -c 'import sys; sys.exit(not (3, 11) <= sys.version_info[:2] <= (3, 14))'; then
+    && "$BASE_PY" -c 'import sys; sys.exit(not (3, 11) <= sys.version_info[:2] <= (3, 15))'; then
     LOCK_COVERED=1
 fi
 
@@ -114,7 +184,7 @@ if [ "$NEED_VENV" = 1 ]; then
 
     echo
     echo "Creating .venv ..."
-    if ! python3 -m venv .venv; then
+    if ! "$BASE_PY" -m venv .venv; then
         rm -rf .venv
         echo
         echo "Could not create the .venv folder."
@@ -148,7 +218,7 @@ else
     echo
     echo "This computer ($SYSTEM $MACHINE, $("$BASE_PY" -V 2>&1)) is not covered by"
     echo "requirements.lock, which holds verified fingerprints for 64-bit Linux (x86-64),"
-    echo "macOS on Apple silicon, and Windows, on Python 3.11-3.14 only. The packages can"
+    echo "macOS on Apple silicon, and Windows, on Python 3.11-3.15 only. The packages can"
     echo "still be installed at the pinned versions, but the downloaded files won't be"
     echo "checked against known fingerprints."
     echo

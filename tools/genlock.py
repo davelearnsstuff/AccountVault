@@ -26,9 +26,9 @@ PLATFORM_SETS = [
     ['macosx_15_0_arm64'],
 ]
 # What AccountVault_Windows.bat might find. Most wheels here are abi3 or pure
-# Python and cover all four with one artifact; cffi builds per version, hence
+# Python and cover all of them with one artifact; cffi builds per version, hence
 # the sweep.
-PYTHONS = ['3.11', '3.12', '3.13', '3.14']
+PYTHONS = ['3.11', '3.12', '3.13', '3.14', '3.15']
 PY = sys.executable
 REQUIREMENTS = pathlib.Path(__file__).resolve().parent.parent / 'requirements'
 
@@ -113,7 +113,7 @@ RUNTIME_HEADER = '''# Hash-pinned install list — generated, do not edit by han
 # argon2-cffi wheel runs inside the process that holds the master password.
 #
 # Every hash under one entry is an alternative — the wheels for win_amd64,
-# manylinux x86_64 and macOS arm64 across Python 3.11 to 3.14, so this is not
+# manylinux x86_64 and macOS arm64 across Python 3.11 to 3.15, so this is not
 # a lock that only works on the machine that produced it. A platform outside
 # that set has no matching hash and will be refused rather than silently
 # unverified; install from requirements.txt there, knowingly.

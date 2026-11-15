@@ -224,13 +224,13 @@ These are kept readable because sorting, **Needs Attention**, and the login scre
 
 ## Requirements
 
-- Python 3.11 or later. The verified install described in **Installation** supports 3.11 through 3.14.
+- Python 3.11 or later. The verified install described in **Installation** supports 3.11 through 3.15.
 - pip
 - A computer running Windows, macOS, or Linux with a desktop (X11 or Wayland).
 
 ## Installation
 
-**Windows:** run `AccountVault_Windows.bat`. The first time, it offers to install the packages it needs into a `.venv` folder inside the app's folder, without touching your system Python, and checks each one against a known fingerprint. If Python itself isn't installed, it tells you where to download it and gives you a command that installs it.
+**Windows:** run `AccountVault_Windows.bat`. The first time, it offers to install the packages it needs into a `.venv` folder inside the app's folder, without touching your system Python, and checks each one against a known fingerprint. If Python isn't installed, or its version is outside 3.11 through 3.15, it offers to install Python 3.14 from python.org using `winget`. That install is for your Windows account only, needs no administrator rights, and leaves any other Python in place. Answer no, or have no `winget`, and it tells you where to download Python instead.
 
 The app always runs from that `.venv`, even if your system Python already has the packages, because only the `.venv` was installed with the fingerprint check. When a newer version of the app changes the package list, the script offers to update the `.venv` before starting.
 
@@ -244,7 +244,9 @@ cd AccountVault2-PySide
 
 The script works the same way as the Windows one: it always runs the app from a `.venv` folder inside the app's folder, offers to set that up the first time, and offers to update it when the package list changes. Run it from a terminal the first time, because it needs to ask before installing. Started without a terminal, it runs whatever is already installed.
 
-The script checks every downloaded file against a known fingerprint (`--require-hashes`). Those fingerprints cover Windows and Linux on x86-64 and macOS on Apple silicon, with Python 3.11 through 3.14. On an Intel Mac (`cryptography` publishes no wheel for it), ARM Linux, or a newer Python, the script says so and asks before installing the same pinned versions without the check.
+The script checks every downloaded file against a known fingerprint (`--require-hashes`). Those fingerprints cover Windows and Linux on x86-64 and macOS on Apple silicon, with Python 3.11 through 3.15. On an Intel Mac (`cryptography` publishes no wheel for it), ARM Linux, or a newer Python, the script says so and asks before installing the same pinned versions without the check.
+
+If Python 3.11 or later isn't installed, the script shows the command it would run and asks before running it: `brew install python@3.14` on macOS with Homebrew, or the `apt-get`, `dnf`, or `pacman` install of `python3` on Linux. The Linux commands use `sudo`, so they ask for your password. Without one of those package managers, or if you answer no, it tells you how to install Python yourself. On an older Linux whose packaged Python is still below 3.11, it says so after installing.
 
 On Debian and Ubuntu, creating the `.venv` needs the `python3-venv` package (`sudo apt install python3-venv`). The script tells you if it's missing.
 
@@ -404,7 +406,7 @@ Most of `ui/` isn't tested, because bugs there are cosmetic and testing widgets 
 
 `tests/test_layers.py` keeps the code layers apart. It fails if anything in `core/` imports Qt, `services/`, or `ui/`, even from inside a function.
 
-The tests run on every push and pull request, on Windows with Python 3.11 and 3.14, the oldest and newest versions the lock covers (see `.github/workflows/tests.yml`). That's what makes Dependabot's version bumps safe to accept: Dependabot opens the pull request, and the tests decide whether it gets merged.
+The tests run on every push and pull request, on Windows with Python 3.11 and 3.15, the oldest and newest versions the lock covers (see `.github/workflows/tests.yml`). That's what makes Dependabot's version bumps safe to accept: Dependabot opens the pull request, and the tests decide whether it gets merged.
 
 ### File structure
 
